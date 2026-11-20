@@ -1,0 +1,52 @@
+# dependencies
+node_modules/
+.pnpm-store/
+
+# builds
+dist/
+build/
+.next/
+out/
+coverage/
+playwright-report/
+test-results/
+
+# environment & secrets
+.env
+.env.*
+!.env.example
+.freeholder-do-app*.yaml
+
+# local media, written by the dev-only storage adapter (§18: production media
+# lives in object storage, never on instance disk — this directory only ever
+# exists on a developer's machine and in test runs)
+.data/
+
+# logs & OS noise
+*.log
+.DS_Store
+Thumbs.db
+
+# editors
+.idea/
+.vscode/
+*.swp
+
+# local agent/session state (never product source or planning truth)
+.claude/
+.codex/
+.work/
+
+# typescript / next
+*.tsbuildinfo
+next-env.d.ts
+
+# Python host-tool bytecode
+__pycache__/
+
+# Private launch credentials and owner claim link
+.freeholder-launch/
+
+# Copied from deploy/digitalocean-droplet/infra at build time (packages/cli/scripts/copy-recipe.mjs).
+packages/cli/recipes/
+.tools/

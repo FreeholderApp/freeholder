@@ -1,0 +1,755 @@
+// Copyright (C) 2026 Tony Aly
+// SPDX-License-Identifier: Apache-2.0
+// Newsletters, double-opt-in, RFC 8058 unsubscribe, public archive (C9.04).
+
+import { randomBytes } from "node:crypto";
+import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
+import { z } from "zod";
+import { isUniqueViolation } from "@/core/db";
+import { listed, row, timestamp, uuid } from "@/core/contract";
+import { defineService, permits, ServiceError, type Tx } from "@/core/service";
+import { consumeAccepted, rateLimitKey } from "@/core/security/rate-limit";
+import { registerContactReference, resolveContact } from "@/core/contacts/service";
+import { recordConsent, registerContactPrivacySource } from "@/core/privacy/service";
+import { assertMailReady, sendMail } from "@/core/mail/service";
+import { siteOrigin } from "@/core/seo/origin";
+import {
+  newsletterIssues,
+  newsletterSubscriptions,
+  newsletters,
+} from "./schema";
+import { syncNewsletterIssuePage } from "./public-pages";
+import "./blocks";
+
+const id = z.string().uuid();
+const slug = z
+  .string()
+  .trim()
+  .toLowerCase()
+  .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/)
+  .max(180);
+const expectedVersion = z.number().int().positive();
+const subscriptionConsent = z.object({
+  termsVersion: z.string().trim().min(1).max(100),
+  sourceUrl: z.string().trim().max(2_048).nullable(),
+  evidence: z.object({
+    popup: z.string().trim().min(1).max(180),
+    statement: z.string().trim().min(1).max(500),
+  }),
+});
+
+const newsletterRow = row({
+  id: uuid,
+  name: z.string(),
+  slug: z.string(),
+  description: z.string().nullable(),
+  status: z.enum(["active", "paused"]),
+  createdAt: timestamp,
+  updatedAt: timestamp,
+});
+
+const newsletterIssueRow = row({
+  id: uuid,
+  newsletterId: uuid,
+  slug: z.string(),
+  title: z.string(),
+  excerpt: z.string().nullable(),
+  body: z.string(),
+  status: z.enum(["draft", "published"]),
+  seo: z.unknown(),
+  workingTitle: z.string().nullable(),
+  workingExcerpt: z.string().nullable(),
+  workingBody: z.string().nullable(),
+  workingSeo: z.unknown().nullable(),
+  version: z.number().int(),
+  publishedAt: timestamp.nullable(),
+  createdAt: timestamp,
+  updatedAt: timestamp,
+});
+
+const newsletterSubscriptionRow = row({
+  id: uuid,
+  newsletterId: uuid,
+  contactId: uuid,
+  status: z.enum(["pending", "confirmed", "unsubscribed"]),
+  confirmToken: z.string(),
+  unsubscribeToken: z.string(),
+  confirmedAt: timestamp.nullable(),
+  unsubscribedAt: timestamp.nullable(),
+  createdAt: timestamp,
+  updatedAt: timestamp,
+});
+
+function token(): string {
+  return randomBytes(32).toString("hex");
+}
+
+const RANK = { confirmed: 3, pending: 2, unsubscribed: 1 } as const;
+
+registerContactReference({
+  table: "newsletter_subscriptions",
+  repoint: async (tx, duplicateId, survivingId) => {
+    const incoming = await tx
+      .select()
+      .from(newsletterSubscriptions)
+      .where(eq(newsletterSubscriptions.contactId, duplicateId));
+    for (const row of incoming) {
+      const [already] = await tx
+        .select()
+        .from(newsletterSubscriptions)
+        .where(
+          and(
+            eq(newsletterSubscriptions.newsletterId, row.newsletterId),
+            eq(newsletterSubscriptions.contactId, survivingId),
+          ),
+        )
+        .limit(1);
+      if (!already) {
+        await tx
+          .update(newsletterSubscriptions)
+          .set({ contactId: survivingId })
+          .where(eq(newsletterSubscriptions.id, row.id));
+        continue;
+      }
+      const keepSurvivor = RANK[already.status] >= RANK[row.status];
+      if (keepSurvivor) {
+        await tx.delete(newsletterSubscriptions).where(eq(newsletterSubscriptions.id, row.id));
+      } else {
+        await tx.delete(newsletterSubscriptions).where(eq(newsletterSubscriptions.id, already.id));
+        await tx
+          .update(newsletterSubscriptions)
+          .set({ contactId: survivingId })
+          .where(eq(newsletterSubscriptions.id, row.id));
+      }
+    }
+  },
+  captureForUndo: async (tx, duplicateId, survivingId) => {
+    const rows = await tx
+      .select({ id: newsletterSubscriptions.id })
+      .from(newsletterSubscriptions)
+      .where(inArray(newsletterSubscriptions.contactId, [duplicateId, survivingId]));
+    return {
+      state: rows,
+      undoable: rows.length === 0,
+      blocker:
+        rows.length > 0
+          ? "Newsletter subscriptions were merged and cannot be split back apart safely."
+          : undefined,
+    };
+  },
+  restoreAfterUndo: async () => undefined,
+});
+
+registerContactPrivacySource({
+  scope: "newsletters.subscriptions",
+  tables: ["newsletter_subscriptions"],
+  exportData: async (tx: Tx, contactId: string) =>
+    tx
+      .select({
+        id: newsletterSubscriptions.id,
+        newsletterId: newsletterSubscriptions.newsletterId,
+        status: newsletterSubscriptions.status,
+        confirmedAt: newsletterSubscriptions.confirmedAt,
+        unsubscribedAt: newsletterSubscriptions.unsubscribedAt,
+      })
+      .from(newsletterSubscriptions)
+      .where(eq(newsletterSubscriptions.contactId, contactId)),
+  erase: async (tx: Tx, contactId: string) => {
+    const rows = await tx
+      .update(newsletterSubscriptions)
+      .set({
+        status: "unsubscribed",
+        unsubscribedAt: sql`now()`,
+        confirmToken: token(),
+        unsubscribeToken: token(),
+      })
+      .where(eq(newsletterSubscriptions.contactId, contactId))
+      .returning({ id: newsletterSubscriptions.id });
+    return { affected: rows.length };
+  },
+});
+
+export const listNewsletters = defineService({
+  name: "newsletters.list",
+  summary: "List newsletter identities for the owner workspace.",
+  kind: "query",
+  permission: "scoped",
+  input: z.object({}),
+  output: listed(newsletterRow),
+  handler: async (_input, ctx) =>
+    ctx.tx.select().from(newsletters).orderBy(desc(newsletters.updatedAt)),
+});
+
+export const listPublicNewsletters = defineService({
+  name: "newsletters.listPublic",
+  summary: "Active newsletters a visitor may subscribe to.",
+  kind: "query",
+  permission: "public",
+  input: z.object({}),
+  output: listed(newsletterRow),
+  handler: async (_input, ctx) =>
+    ctx.tx.select().from(newsletters).where(eq(newsletters.status, "active")).orderBy(asc(newsletters.name)),
+});
+
+export const getNewsletter = defineService({
+  name: "newsletters.get",
+  summary: "One newsletter with issues and subscription counts.",
+  kind: "query",
+  permission: "scoped",
+  input: z.object({ id }),
+  output: z.object({
+    newsletter: newsletterRow,
+    issues: listed(newsletterIssueRow),
+    subscriptions: listed(newsletterSubscriptionRow),
+  }),
+  handler: async (input, ctx) => {
+    const [newsletter] = await ctx.tx.select().from(newsletters).where(eq(newsletters.id, input.id)).limit(1);
+    if (!newsletter) throw new ServiceError("not_found", "That newsletter is not here.");
+    const issues = await ctx.tx
+      .select()
+      .from(newsletterIssues)
+      .where(eq(newsletterIssues.newsletterId, newsletter.id))
+      .orderBy(desc(newsletterIssues.updatedAt));
+    const subscriptions = await ctx.tx
+      .select()
+      .from(newsletterSubscriptions)
+      .where(eq(newsletterSubscriptions.newsletterId, newsletter.id))
+      .orderBy(desc(newsletterSubscriptions.updatedAt));
+    return { newsletter, issues, subscriptions };
+  },
+});
+
+export const createNewsletter = defineService({
+  name: "newsletters.create",
+  summary: "Create a newsletter identity.",
+  kind: "mutation",
+  permission: "scoped",
+  input: z.object({
+    name: z.string().trim().min(1).max(200),
+    slug,
+    description: z.string().trim().max(2_000).optional(),
+  }),
+  output: newsletterRow,
+  handler: async (input, ctx) => {
+    const [created] = await ctx.tx
+      .insert(newsletters)
+      .values({
+        name: input.name,
+        slug: input.slug,
+        description: input.description ?? null,
+      })
+      .returning()
+      .catch((error: unknown) => {
+        if (isUniqueViolation(error, "newsletters_slug_idx")) {
+          throw new ServiceError("conflict", `Another newsletter already uses ${input.slug}.`);
+        }
+        throw error;
+      });
+    ctx.setSubject("newsletter", created!.id);
+    ctx.queueEvent("newsletters.created", { newsletterId: created!.id });
+    return created!;
+  },
+});
+
+export const updateNewsletter = defineService({
+  name: "newsletters.update",
+  summary: "Update a newsletter identity or pause it.",
+  kind: "mutation",
+  permission: "scoped",
+  input: z.object({
+    id,
+    name: z.string().trim().min(1).max(200).optional(),
+    description: z.string().trim().max(2_000).nullable().optional(),
+    status: z.enum(["active", "paused"]).optional(),
+  }),
+  output: newsletterRow,
+  handler: async (input, ctx) => {
+    const { id: newsletterId, ...patch } = input;
+    const [updated] = await ctx.tx
+      .update(newsletters)
+      .set(patch)
+      .where(eq(newsletters.id, newsletterId))
+      .returning();
+    if (!updated) throw new ServiceError("not_found", "That newsletter is not here.");
+    ctx.setSubject("newsletter", updated.id);
+    ctx.queueEvent("newsletters.updated", { newsletterId: updated.id });
+    return updated;
+  },
+});
+
+export const listPublicIssues = defineService({
+  name: "newsletters.listPublicIssues",
+  summary: "Published issues for the public archive.",
+  kind: "query",
+  permission: "public",
+  input: z.object({}),
+  output: listed(newsletterIssueRow),
+  handler: async (_input, ctx) =>
+    ctx.tx
+      .select()
+      .from(newsletterIssues)
+      .where(eq(newsletterIssues.status, "published"))
+      .orderBy(desc(newsletterIssues.publishedAt)),
+});
+
+export const resolvePublicIssue = defineService({
+  name: "newsletters.resolvePublicIssue",
+  summary: "A published issue by slug.",
+  kind: "query",
+  permission: "public",
+  input: z.object({ slug }),
+  output: newsletterIssueRow.nullable(),
+  handler: async (input, ctx) => {
+    const [issue] = await ctx.tx
+      .select()
+      .from(newsletterIssues)
+      .where(eq(newsletterIssues.slug, input.slug))
+      .limit(1);
+    if (!issue || issue.status !== "published") return null;
+    return issue;
+  },
+});
+
+export const createIssue = defineService({
+  name: "newsletters.createIssue",
+  summary: "Draft an issue for a newsletter.",
+  kind: "mutation",
+  permission: "scoped",
+  input: z.object({
+    newsletterId: id,
+    slug,
+    title: z.string().trim().min(1).max(240),
+    excerpt: z.string().trim().max(500).optional(),
+    body: z.string().max(100_000).default(""),
+  }),
+  output: newsletterIssueRow,
+  handler: async (input, ctx) => {
+    const [newsletter] = await ctx.tx
+      .select({ id: newsletters.id })
+      .from(newsletters)
+      .where(eq(newsletters.id, input.newsletterId))
+      .limit(1);
+    if (!newsletter) throw new ServiceError("not_found", "That newsletter is not here.");
+    const [created] = await ctx.tx
+      .insert(newsletterIssues)
+      .values({
+        newsletterId: input.newsletterId,
+        slug: input.slug,
+        title: input.title,
+        excerpt: input.excerpt ?? null,
+        body: input.body,
+      })
+      .returning()
+      .catch((error: unknown) => {
+        if (isUniqueViolation(error, "newsletter_issues_slug_idx")) {
+          throw new ServiceError("conflict", `Another issue already uses /newsletters/${input.slug}.`);
+        }
+        throw error;
+      });
+    ctx.setSubject("newsletterIssue", created!.id);
+    ctx.queueEvent("newsletters.issueCreated", { issueId: created!.id });
+    return created!;
+  },
+});
+
+export const updateIssue = defineService({
+  name: "newsletters.updateIssue",
+  summary: "Edit an issue. A published issue's live copy does not change until publish.",
+  kind: "mutation",
+  permission: "scoped",
+  input: z.object({
+    id,
+    expectedVersion,
+    title: z.string().trim().min(1).max(240).optional(),
+    excerpt: z.string().trim().max(500).nullable().optional(),
+    body: z.string().max(100_000).optional(),
+    seo: z.object({ title: z.string().max(60).optional(), description: z.string().max(155).optional() }).optional(),
+  }),
+  output: newsletterIssueRow,
+  handler: async (input, ctx) => {
+    const [existing] = await ctx.tx
+      .select()
+      .from(newsletterIssues)
+      .where(eq(newsletterIssues.id, input.id))
+      .limit(1);
+    if (!existing) throw new ServiceError("not_found", "That issue is not here.");
+    if (existing.version !== input.expectedVersion) {
+      throw new ServiceError("conflict", "This issue changed after you opened it.");
+    }
+    const published = existing.status === "published";
+    const [updated] = await ctx.tx
+      .update(newsletterIssues)
+      .set({
+        ...(published
+          ? {
+              workingTitle: input.title ?? existing.workingTitle ?? existing.title,
+              workingExcerpt:
+                input.excerpt !== undefined
+                  ? input.excerpt
+                  : (existing.workingExcerpt ?? existing.excerpt),
+              workingBody: input.body ?? existing.workingBody ?? existing.body,
+              workingSeo: input.seo ?? existing.workingSeo ?? existing.seo,
+            }
+          : {
+              ...(input.title !== undefined ? { title: input.title, workingTitle: input.title } : {}),
+              ...(input.excerpt !== undefined
+                ? { excerpt: input.excerpt, workingExcerpt: input.excerpt }
+                : {}),
+              ...(input.body !== undefined ? { body: input.body, workingBody: input.body } : {}),
+              ...(input.seo !== undefined ? { seo: input.seo, workingSeo: input.seo } : {}),
+            }),
+        version: existing.version + 1,
+      })
+      .where(and(eq(newsletterIssues.id, existing.id), eq(newsletterIssues.version, existing.version)))
+      .returning();
+    if (!updated) throw new ServiceError("conflict", "This issue changed while it was being saved.");
+    ctx.setSubject("newsletterIssue", updated.id);
+    ctx.queueEvent("newsletters.issueUpdated", { issueId: updated.id });
+    return updated;
+  },
+});
+
+export const publishIssue = defineService({
+  name: "newsletters.publishIssue",
+  summary: "Publish an issue to the public archive.",
+  kind: "mutation",
+  permission: "scoped",
+  input: z.object({ id, expectedVersion }),
+  output: newsletterIssueRow,
+  handler: async (input, ctx) => {
+    const [existing] = await ctx.tx
+      .select()
+      .from(newsletterIssues)
+      .where(eq(newsletterIssues.id, input.id))
+      .limit(1);
+    if (!existing) throw new ServiceError("not_found", "That issue is not here.");
+    if (existing.version !== input.expectedVersion) {
+      throw new ServiceError("conflict", "This issue changed after you opened it.");
+    }
+    const title = existing.workingTitle ?? existing.title;
+    const excerpt = existing.workingExcerpt ?? existing.excerpt;
+    const body = existing.workingBody ?? existing.body;
+    const seo = existing.workingSeo ?? existing.seo;
+    const [updated] = await ctx.tx
+      .update(newsletterIssues)
+      .set({
+        status: "published",
+        publishedAt: existing.publishedAt ?? sql`now()`,
+        title,
+        excerpt,
+        body,
+        seo,
+        workingTitle: title,
+        workingExcerpt: excerpt,
+        workingBody: body,
+        workingSeo: seo,
+        version: existing.version + 1,
+      })
+      .where(and(eq(newsletterIssues.id, existing.id), eq(newsletterIssues.version, existing.version)))
+      .returning();
+    if (!updated) throw new ServiceError("conflict", "This issue changed during publish.");
+    ctx.setSubject("newsletterIssue", updated.id);
+    ctx.queueEvent("newsletters.issuePublished", { issueId: updated.id });
+    await syncNewsletterIssuePage(ctx, updated.id);
+    return updated;
+  },
+});
+
+/** A pending address is not sent a second confirmation inside this window. */
+const CONFIRMATION_COOLDOWN_MS = 10 * 60_000;
+/** Confirmation emails one address receives per hour, across every newsletter. */
+const CONFIRMATION_RECIPIENT_LIMIT = { limit: 5, windowSeconds: 60 * 60 } as const;
+
+export const subscribeToNewsletter = defineService({
+  name: "newsletters.subscribe",
+  summary: "Start a double-opt-in subscription through contacts.resolve.",
+  kind: "mutation",
+  permission: "public",
+  input: z.object({
+    newsletterId: id,
+    email: z.string().trim().email().toLowerCase(),
+    name: z.string().trim().min(1).max(200).optional(),
+    consent: subscriptionConsent.optional(),
+  }),
+  output: z.object({
+    status: z.enum(["confirmed", "pending"]),
+    subscriptionId: uuid,
+  }),
+  handler: async (input, ctx) => {
+    const [newsletter] = await ctx.tx
+      .select()
+      .from(newsletters)
+      .where(eq(newsletters.id, input.newsletterId))
+      .limit(1);
+    if (!newsletter || newsletter.status !== "active") {
+      throw new ServiceError("not_found", "That newsletter is not open for subscriptions.");
+    }
+    await assertMailReady(ctx.tx, "transactional");
+    const resolved = await ctx.callAsSystem(resolveContact, {
+      email: input.email,
+      name: input.name,
+      source: "newsletter",
+    });
+    const [existing] = await ctx.tx
+      .select()
+      .from(newsletterSubscriptions)
+      .where(
+        and(
+          eq(newsletterSubscriptions.newsletterId, newsletter.id),
+          eq(newsletterSubscriptions.contactId, resolved.contact.id),
+        ),
+      )
+      .limit(1);
+    if (existing?.status === "confirmed") {
+      return { status: "confirmed" as const, subscriptionId: existing.id };
+    }
+    // C11.10: a public form is a way to make this site email any address.
+    // A recent pending request keeps the link already sent, and each address
+    // gets a bounded number of confirmations whichever form or popup asks —
+    // counted in this transaction, so it holds when the call is composed.
+    if (
+      existing?.status === "pending" &&
+      existing.updatedAt.getTime() > Date.now() - CONFIRMATION_COOLDOWN_MS
+    ) {
+      return { status: "pending" as const, subscriptionId: existing.id };
+    }
+    const delivery = await consumeAccepted(
+      ctx.tx,
+      rateLimitKey("newsletters.subscribe.recipient", input.email),
+      CONFIRMATION_RECIPIENT_LIMIT,
+    );
+    if (!delivery.allowed) {
+      throw new ServiceError(
+        "rate_limited",
+        "That address has been sent several confirmations already. Check its inbox, or try again later.",
+        delivery.retryAfterSeconds,
+      );
+    }
+    // Evidence a trusted caller assembled from stored configuration (a popup's
+    // own statement) is recorded as given. What an anonymous visitor's request
+    // carries is recorded too, but marked as theirs, so the consent trail never
+    // presents a caller's claim as something this site verified.
+    const trustedEvidence =
+      ctx.actor.kind === "system" ||
+      permits(ctx.actor, "scoped", "newsletters.publishIssue", "mutation");
+    const consentEvidence = input.consent
+      ? trustedEvidence
+        ? input.consent.evidence
+        : { ...input.consent.evidence, provenance: "visitor-submitted" }
+      : {};
+    const consentIp = ctx.actor.request?.ip ?? null;
+    const confirmToken = token();
+    const unsubscribeToken = existing?.unsubscribeToken ?? token();
+    const [saved] = existing
+      ? await ctx.tx
+          .update(newsletterSubscriptions)
+          .set({
+            status: "pending",
+            confirmToken,
+            unsubscribeToken,
+            unsubscribedAt: null,
+            consentTermsVersion: input.consent?.termsVersion ?? null,
+            consentSourceUrl: input.consent?.sourceUrl ?? null,
+            consentIp,
+            consentEvidence,
+            updatedAt: new Date(),
+          })
+          .where(eq(newsletterSubscriptions.id, existing.id))
+          .returning()
+      : await ctx.tx
+          .insert(newsletterSubscriptions)
+          .values({
+            newsletterId: newsletter.id,
+            contactId: resolved.contact.id,
+            status: "pending",
+            confirmToken,
+            unsubscribeToken,
+            consentTermsVersion: input.consent?.termsVersion ?? null,
+            consentSourceUrl: input.consent?.sourceUrl ?? null,
+            consentIp,
+            consentEvidence,
+          })
+          .returning();
+    const origin = siteOrigin();
+    const confirmUrl = `${origin}/newsletters/confirm?token=${confirmToken}`;
+    await sendMail(ctx.tx, {
+      to: input.email,
+      subject: `Confirm ${newsletter.name}`,
+      text: `Confirm your subscription to ${newsletter.name}: ${confirmUrl}`,
+    }, {
+      requireDelivery: true,
+      // The double opt-in challenge itself: the person asked for this link.
+      transactionalReason: "authentication",
+      eventRef: `newsletter-subscription:${saved!.id}`,
+    });
+    ctx.setSubject("newsletterSubscription", saved!.id);
+    ctx.queueEvent("newsletters.subscribed", {
+      subscriptionId: saved!.id,
+      newsletterId: newsletter.id,
+      contactId: resolved.contact.id,
+    });
+    return { status: "pending" as const, subscriptionId: saved!.id };
+  },
+});
+
+export const confirmSubscription = defineService({
+  name: "newsletters.confirm",
+  summary: "Confirm a pending double-opt-in subscription.",
+  kind: "mutation",
+  permission: "public",
+  input: z.object({ token: z.string().trim().min(16).max(128) }),
+  output: newsletterSubscriptionRow,
+  handler: async (input, ctx) => {
+    const [row] = await ctx.tx
+      .select()
+      .from(newsletterSubscriptions)
+      .where(eq(newsletterSubscriptions.confirmToken, input.token))
+      .limit(1).for("update");
+    if (!row) throw new ServiceError("not_found", "That confirmation link is not valid.");
+    if (row.status === "unsubscribed") {
+      throw new ServiceError("conflict", "This address has been unsubscribed.");
+    }
+    const [updated] = await ctx.tx
+      .update(newsletterSubscriptions)
+      .set({
+        status: "confirmed",
+        confirmedAt: row.confirmedAt ?? sql`now()`,
+        confirmToken: token(),
+      })
+      .where(eq(newsletterSubscriptions.id, row.id))
+      .returning();
+    // The double opt-in *is* the consent evidence.
+    //
+    // §2096: subscriptions carry "double-opt-in records ... consent timestamps
+    // retained for compliance (CASL, GDPR, CAN-SPAM)". Until C9.06 there was
+    // nothing that read them, and the confirmation wrote a subscription row
+    // and nothing else — so `contacts.canContact("marketing", "email")` said
+    // "denied" for every confirmed subscriber on the platform, because absence
+    // of evidence is denial there and no email path ever produced evidence.
+    //
+    // Recorded here rather than in the campaign sender because this is the
+    // moment somebody actually consented, and because consent belongs to the
+    // contact spine rather than to whichever module happens to send next.
+    // `callAsSystem`: the person clicking a confirmation link is anonymous.
+    await ctx.callAsSystem(recordConsent, {
+      contactId: row.contactId,
+      purpose: "marketing" as const,
+      channel: "email" as const,
+      state: "granted" as const,
+      method: "double_opt_in" as const,
+      termsVersion: row.consentTermsVersion,
+      sourceUrl: row.consentSourceUrl,
+      sourceIp: row.consentIp,
+      evidence: row.consentEvidence,
+    });
+
+    ctx.setSubject("newsletterSubscription", row.id);
+    ctx.queueEvent("newsletters.confirmed", {
+      subscriptionId: row.id,
+      newsletterId: row.newsletterId,
+      contactId: row.contactId,
+    });
+    return updated!;
+  },
+});
+
+export const unsubscribeFromNewsletter = defineService({
+  name: "newsletters.unsubscribe",
+  summary: "RFC 8058 one-click unsubscribe by token.",
+  kind: "mutation",
+  permission: "public",
+  input: z.object({ token: z.string().trim().min(16).max(128) }),
+  output: newsletterSubscriptionRow,
+  handler: async (input, ctx) => {
+    const [row] = await ctx.tx
+      .select()
+      .from(newsletterSubscriptions)
+      .where(eq(newsletterSubscriptions.unsubscribeToken, input.token))
+      .limit(1).for("update");
+    if (!row) throw new ServiceError("not_found", "That unsubscribe link is not valid.");
+    const [updated] = await ctx.tx
+      .update(newsletterSubscriptions)
+      .set({
+        status: "unsubscribed",
+        unsubscribedAt: row.unsubscribedAt ?? sql`now()`,
+      })
+      .where(eq(newsletterSubscriptions.id, row.id))
+      .returning();
+    // The other half of the same record. An unsubscribe that left the consent
+    // ledger saying "granted" would let a campaign built on a segment mail
+    // somebody who had just asked not to be mailed.
+    await ctx.callAsSystem(recordConsent, {
+      contactId: row.contactId,
+      purpose: "marketing" as const,
+      channel: "email" as const,
+      state: "withdrawn" as const,
+      method: "preference_center" as const,
+    });
+
+    ctx.setSubject("newsletterSubscription", row.id);
+    ctx.queueEvent("newsletters.unsubscribed", {
+      subscriptionId: row.id,
+      newsletterId: row.newsletterId,
+      contactId: row.contactId,
+    });
+    return updated!;
+  },
+});
+
+export function rfc8058UnsubscribeHeaders(origin: string, unsubscribeToken: string) {
+  const url = `${origin}/unsubscribe?token=${unsubscribeToken}`;
+  return {
+    "List-Unsubscribe": `<${url}>`,
+    "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+  };
+}
+
+// Templates (C9.05). Re-exported because the manifest names one services
+// module, and separate because authoring a template and sending an issue are
+// not the same subject.
+export {
+  saveTemplate,
+  resetTemplate,
+  listTemplates,
+  getTemplate,
+  renderTemplate,
+  templateSlots,
+} from "./template-service";
+import templateServices from "./template-service";
+// Broadcasts (C9.06): a template, an audience and a moment.
+export {
+  saveBroadcast,
+  testSend,
+  audiencePreview,
+  startBroadcast,
+  sendNext,
+  tick,
+  pauseBroadcast,
+  resumeBroadcast,
+  listBroadcasts,
+  broadcastStats,
+  broadcastRecipientList,
+  unsubscribeFromBroadcast,
+  // The provider-feedback listener. Named in the manifest's `listens`, which
+  // resolves handlers from this module.
+  onMailDeliveryUpdated,
+} from "./broadcast-service";
+import broadcastServices from "./broadcast-service";
+
+export default [
+  listNewsletters,
+  listPublicNewsletters,
+  getNewsletter,
+  createNewsletter,
+  updateNewsletter,
+  listPublicIssues,
+  resolvePublicIssue,
+  createIssue,
+  updateIssue,
+  publishIssue,
+  subscribeToNewsletter,
+  confirmSubscription,
+  unsubscribeFromNewsletter,
+  ...templateServices,
+  ...broadcastServices,
+];

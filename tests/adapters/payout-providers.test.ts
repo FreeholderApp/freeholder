@@ -1,0 +1,268 @@
+// Copyright (C) 2026 Tony Aly
+// SPDX-License-Identifier: Apache-2.0
+// C12.26–C12.27: each payout provider against recorded HTTP — the requests
+// it sends (shapes taken from the providers' public API references), how it
+// reads replies, and how it verifies webhooks. Not yet run against live
+// sandboxes; that waits for test credentials.
+import { createHash, createHmac } from "node:crypto";
+import { describe, expect, it } from "vitest";
+import { createStripeConnect, stripeAccountStatus, stripeMerchantDetails } from "@/adapters/payouts/stripe-connect";
+import { marketFeeMinor } from "@/modules/invoicing/market-policy";
+import { createPayPalPayouts } from "@/adapters/payouts/paypal-payouts";
+import { createRazorpayRoute, razorpayKey } from "@/adapters/payouts/razorpay-route";
+
+type Call = { url: string; method: string; headers: Record<string, string>; body: string };
+
+function recorder(reply: (call: Call) => unknown) {
+  const calls: Call[] = [];
+  const fetcher = (async (input: string | URL, init: RequestInit = {}) => {
+    const call: Call = { url: String(input), method: init.method ?? "GET", headers: Object.fromEntries(Object.entries((init.headers ?? {}) as Record<string, string>).map(([k, v]) => [k.toLowerCase(), v])), body: typeof init.body === "string" ? init.body : init.body instanceof URLSearchParams ? init.body.toString() : "" };
+    calls.push(call);
+    const value = reply(call);
+    const status = typeof value === "object" && value && "__status" in value ? (value as { __status: number }).__status : 200;
+    return new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
+  }) as typeof fetch;
+  return { calls, fetcher };
+}
+
+const seller = { userId: "00000000-0000-4000-8000-0000000000c2", email: "sam@example.test", displayName: "Sam" };
+const urls = { returnUrl: "https://site.test/portal/payouts?setup=done", refreshUrl: "https://site.test/portal/payouts?setup=again" };
+const body = (s: string) => new TextEncoder().encode(s);
+
+describe("Stripe Connect payouts (C12.26)", () => {
+  it("creates an Express account, links its hosted onboarding, transfers and reverses with idempotency keys", async () => {
+    const { calls, fetcher } = recorder((c) => (c.url.endsWith("/v1/accounts") ? { id: "acct_1" } : c.url.endsWith("/v1/account_links") ? { url: "https://connect.stripe.test/setup/1" } : c.url.endsWith("/v1/transfers") ? { id: "tr_1" } : c.url.includes("/reversals") ? { id: "trr_1" } : {}));
+    const stripe = createStripeConnect({ secretKey: "sk_test_x", webhookSecrets: ["whsec_x"], fetch: fetcher });
+    expect(await stripe.onboard(seller, {}, urls)).toEqual({ externalAccountId: "acct_1", url: "https://connect.stripe.test/setup/1", status: "pending" });
+    const account = new URLSearchParams(calls[0]!.body);
+    expect([account.get("type"), account.get("email"), account.get("capabilities[transfers][requested]"), calls[0]!.headers["idempotency-key"]]).toEqual(["express", "sam@example.test", "true", `freeholder-account-${seller.userId}`]);
+    expect(new URLSearchParams(calls[1]!.body).get("type")).toBe("account_onboarding");
+    // An existing account only gets a fresh link.
+    calls.length = 0;
+    await stripe.onboard(seller, {}, urls, "acct_1");
+    expect(calls.map((c) => c.url.replace("https://api.stripe.com", ""))).toEqual(["/v1/account_links"]);
+
+    expect(await stripe.transfer({ externalAccountId: "acct_1", amountMinor: 3600, currency: "CAD", idempotencyKey: "p1", description: "Payout p1" })).toEqual({ reference: "tr_1", settled: true });
+    const transfer = calls.at(-1)!;
+    expect([new URLSearchParams(transfer.body).get("amount"), new URLSearchParams(transfer.body).get("currency"), new URLSearchParams(transfer.body).get("destination"), transfer.headers["idempotency-key"]]).toEqual(["3600", "cad", "acct_1", "freeholder-payout-p1"]);
+    expect(await stripe.reverse({ reference: "tr_1", amountMinor: 3600, currency: "CAD", idempotencyKey: "p1" })).toEqual({ reference: "trr_1" });
+    expect(calls.at(-1)!.url).toBe("https://api.stripe.com/v1/transfers/tr_1/reversals");
+  });
+
+  it("is ready only when transfers are active and payouts enabled, and verifies Connect webhooks", async () => {
+    expect(stripeAccountStatus({ payouts_enabled: true, capabilities: { transfers: "active" } })).toBe("ready");
+    expect(stripeAccountStatus({ payouts_enabled: false, capabilities: { transfers: "inactive" } })).toBe("pending");
+    expect(stripeAccountStatus({ requirements: { disabled_reason: "rejected.fraud" } })).toBe("disabled");
+    const stripe = createStripeConnect({ secretKey: "sk_test_x", webhookSecrets: ["whsec_x"], fetch: recorder(() => ({})).fetcher });
+    const event = JSON.stringify({ type: "account.updated", data: { object: { id: "acct_1", payouts_enabled: true, capabilities: { transfers: "active" } } } });
+    const t = Math.floor(Date.now() / 1000);
+    const sig = createHmac("sha256", "whsec_x").update(`${t}.${event}`).digest("hex");
+    const now = new Date().toISOString();
+    expect(await stripe.webhook({ headers: { "stripe-signature": `t=${t},v1=${sig}` }, body: body(event), receivedAt: now })).toEqual([{ kind: "account", externalAccountId: "acct_1", status: "ready", chargesReady: false, merchantName: null,merchantSupport:null }]);
+    await expect(stripe.webhook({ headers: { "stripe-signature": `t=${t},v1=${"0".repeat(64)}` }, body: body(event), receivedAt: now })).rejects.toThrow(/invalid/);
+    await expect(stripe.webhook({ headers: { "stripe-signature": `t=${t - 3600},v1=${sig}` }, body: body(event), receivedAt: now })).rejects.toThrow(/window/);
+  });
+
+  it("authenticates connected financial bytes with the Connect secret before forwarding account and fee evidence (C12.38)", async () => {
+    const { calls, fetcher } = recorder(() => ({}));
+    const stripe = createStripeConnect({ secretKey: "sk_test_x", webhookSecrets: ["whsec_connect"], fetch: fetcher });
+    const timestamp = Math.floor(Date.now() / 1000);
+    const receivedAt = new Date().toISOString();
+    const event = { id: "evt_connected_paid", created: timestamp, account: "acct_seller", type: "payment_intent.succeeded", data: { object: { id: "pi_direct", amount_received: 2000, currency: "cad", application_fee_amount: 200 } } };
+    async function deliver(value: unknown, secret = "whsec_connect") {
+      const raw = JSON.stringify(value);
+      const signature = createHmac("sha256", secret).update(`${timestamp}.${raw}`).digest("hex");
+      return stripe.webhook({ headers: { "stripe-signature": `t=${timestamp},v1=${signature}` }, body: body(raw), receivedAt });
+    }
+    const forwarded = await deliver(event);
+    expect(forwarded).toMatchObject([{ kind: "payment", receivedAt, bodySha256: createHash("sha256").update(JSON.stringify(event)).digest("hex"), event: { id: event.id, kind: "payment_succeeded", providerAccountId: "acct_seller", providerRef: "pi_direct", applicationFeeMinor: 200, amountMinor: 2000, currency: "CAD" } }]);
+    await expect(deliver(event, "whsec_platform")).rejects.toThrow("signature is invalid");
+    await expect(deliver({ ...event, account: null })).rejects.toThrow("account scope");
+    expect(await deliver({ ...event, account: undefined })).toEqual([]);
+    const raw = JSON.stringify(event);
+    const signature = createHmac("sha256", "whsec_connect").update(`${timestamp}.${raw}`).digest("hex");
+    await expect(stripe.webhook({ headers: { "stripe-signature": `t=${timestamp},v1=${signature}` }, body: body(raw + " "), receivedAt })).rejects.toThrow("signature is invalid");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("proves connected recurring payments with account-scoped invoice-payment and PaymentIntent reads (C12.38)", async () => {
+    let proof = "valid";
+    const { calls, fetcher } = recorder(call => {
+      if (call.url.includes("/v1/invoice_payments?")) {
+        const record = { id: "inpay_direct", invoice: "in_direct", status: "paid", amount_paid: proof === "amount" ? 1999 : 2000, amount_requested: 2000, currency: "cad", payment: { type: "payment_intent", payment_intent: "pi_direct" } };
+        return { has_more: proof === "pagination", data: proof === "split" ? [record,record] : [record] };
+      }
+      if (call.url.endsWith("/v1/payment_intents/pi_direct")) return { id: "pi_direct", status: "succeeded", amount_received: 2000, currency: "cad", customer: proof === "customer" ? "cus_other" : "cus_direct", application_fee_amount: proof === "fee" ? undefined : 200 };
+      throw new Error("Unexpected provider request.");
+    });
+    const stripe = createStripeConnect({ secretKey: "sk_test_x", webhookSecrets: ["whsec_connect"], apiBase: "https://stripe.example.test", fetch: fetcher });
+    const timestamp = Math.floor(Date.now()/1000);
+    const event = { id: "evt_recurring_direct", created: timestamp, account: "acct_seller", type: "invoice.paid", data: { object: { id: "in_direct", parent: { subscription_details: { subscription: "sub_direct" } }, amount_paid: 2000, total: 2000, currency: "cad", customer: "cus_direct", application_fee_amount: 1, lines: { data: [{ period: { start: timestamp, end: timestamp + 86400 } }] } } } };
+    async function deliver(value: unknown = event) {
+      const raw = JSON.stringify(value);
+      const signature = createHmac("sha256", "whsec_connect").update(`${timestamp}.${raw}`).digest("hex");
+      return stripe.webhook({ headers: { "stripe-signature": `t=${timestamp},v1=${signature}` }, body: body(raw), receivedAt: new Date().toISOString() });
+    }
+    expect(await deliver()).toMatchObject([{ kind: "payment", event: { kind: "subscription_period_paid", providerRef: "sub_direct", providerAccountId: "acct_seller", paymentProviderRef: "pi_direct", applicationFeeMinor: 200, amountMinor: 2000, currency: "CAD" } }]);
+    expect(calls).toHaveLength(2);
+    const query = new URL(calls[0]!.url).searchParams;
+    expect([query.get("invoice"),query.get("status"),query.get("limit")]).toEqual(["in_direct","paid","2"]);
+    for (const invalid of ["split","pagination","amount","fee","customer"]) {
+      proof = invalid;
+      await expect(deliver()).rejects.toThrow("did not prove");
+    }
+    expect(calls.every(call => call.headers["stripe-account"] === "acct_seller" && call.headers["stripe-version"] === "2026-02-25.clover")).toBe(true);
+    const before = calls.length;
+    expect(await deliver({ ...event, data: { object: { ...event.data.object, amount_paid: 0, total: 0 } } })).toEqual([]);
+    expect(calls).toHaveLength(before);
+    await expect(deliver({ ...event, data: { object: { ...event.data.object, paid_out_of_band: true } } })).rejects.toThrow("did not prove");
+    expect(calls).toHaveLength(before);
+  });
+
+  it("requests direct charge capability explicitly and requires charge readiness plus public merchant branding (C12.38)", async () => {
+    const account = { id: "acct_1", payouts_enabled: true, charges_enabled: true, capabilities: { transfers: "active", card_payments: "active" }, business_profile: { name: "Sam Studio" } };
+    const { calls, fetcher } = recorder(call => call.url.endsWith("/account_links") ? { url: "https://connect.stripe.test/setup/1" } : account);
+    const stripe = createStripeConnect({ secretKey: "sk_test_x", webhookSecrets: ["whsec_x"], fetch: fetcher });
+    await stripe.onboard({ ...seller, acceptDirectCharges: true }, {}, urls);
+    expect(new URLSearchParams(calls[0]!.body).get("capabilities[card_payments][requested]")).toBe("true");
+    calls.length = 0;
+    await stripe.onboard({ ...seller, acceptDirectCharges: true }, {}, urls, "acct_1");
+    expect(calls[0]!.url).toBe("https://api.stripe.com/v1/accounts/acct_1");
+    expect(calls[0]!.method).toBe("POST");
+    expect(new URLSearchParams(calls[0]!.body).get("capabilities[card_payments][requested]")).toBe("true");
+    expect(await stripe.accountDetails!("acct_1")).toEqual({ status: "ready", chargesReady: true, merchantName: "Sam Studio",merchantSupport:null });
+    for (const broken of [
+      { ...account, payouts_enabled: false }, { ...account, charges_enabled: false },
+      { ...account, capabilities: { transfers: "active", card_payments: "pending" } },
+      { ...account, business_profile: {}, individual: { first_name: "Private", last_name: "Name" } },
+    ]) expect(stripeMerchantDetails(broken).chargesReady).toBe(false);
+    expect(stripeMerchantDetails({ ...account, business_profile: {} }).merchantName).toBeNull();
+  });
+
+  it("preserves only public merchant support details for original commercial documents (C12.38)", () => {
+    const merchantSupport={email:"support@studio.example",phone:"+1 250 555 0123",url:"https://studio.example/support",address:{line1:"10 Public Studio Lane",line2:null,city:"Victoria",state:"BC",postalCode:"V8W 1P6",country:"CA"}};
+    const details=stripeMerchantDetails({id:"acct_original",payouts_enabled:true,charges_enabled:true,capabilities:{transfers:"active",card_payments:"active"},
+      email:"private-owner@example.test",company:{name:"Private corporate name",address:{line1:"Private registered address"}},individual:{first_name:"Private",last_name:"Person",email:"private-person@example.test"},
+      business_profile:{name:"Original Studio",support_email:merchantSupport.email,support_phone:merchantSupport.phone,support_url:merchantSupport.url,support_address:{line1:"10 Public Studio Lane",line2:null,city:"Victoria",state:"BC",postal_code:"V8W 1P6",country:"CA"}},
+    });
+    expect(details).toMatchObject({merchantName:"Original Studio",merchantSupport});
+    for(const privateValue of ["private-owner","Private corporate","Private registered","Private Person","private-person"])expect(JSON.stringify(details)).not.toContain(privateValue);
+  });
+
+  it("never treats the internal erased-identity marker as a ready public merchant name",()=>{
+    expect(stripeMerchantDetails({payouts_enabled:true,charges_enabled:true,capabilities:{transfers:"active",card_payments:"active"},business_profile:{name:"[privacy-erased-merchant]",support_email:"support@studio.example"}})).toMatchObject({merchantName:null,chargesReady:false});
+  });
+
+  const credentialBearingUrl = new URL("https://example.test/help");
+  credentialBearingUrl.username = "synthetic";
+  credentialBearingUrl.password = "synthetic";
+  it.each([
+    {},{support_url:"javascript:alert(1)"},{support_url:credentialBearingUrl.href},{support_url:"file:///private/address"},
+    {support_email:"private\r\nBcc: someone@example.test"},{support_phone:"private\u0000phone"},
+    {support_address:{line1:"Public studio",city:"Victoria"}},{support_email:`${"a".repeat(260)}@example.test`},
+  ])("never fills missing or invalid public support from private representative fields: %j",businessProfile=>{
+    expect(stripeMerchantDetails({business_profile:{name:"Original studio",...businessProfile},email:"private-owner@example.test",country:"CA",company:{phone:"+12505550123",address:{line1:"Private registered address",country:"CA"}},individual:{email:"private-person@example.test",address:{line1:"Private home address",country:"CA"}}})).toMatchObject({merchantName:"Original studio",merchantSupport:null});
+  });
+  it("refuses another account's public merchant details on an original-account refresh",async()=>{
+    const {fetcher}=recorder(()=>({id:"acct_OtherMerchant",payouts_enabled:true,charges_enabled:true,capabilities:{transfers:"active",card_payments:"active"},business_profile:{name:"Other Studio",support_email:"other@studio.example"}}));
+    const stripe=createStripeConnect({secretKey:"synthetic-test-only",webhookSecrets:["synthetic-test-only"],fetch:fetcher});
+    await expect(stripe.accountDetails!("acct_OriginalMerchant")).rejects.toThrow("original connected account");
+  });
+
+  it("does not round a large site's fee up by a minor unit (C12.38)", () => {
+    // Floating-point multiplication previously produced 208967022709991.
+    expect(marketFeeMinor(Number.MAX_SAFE_INTEGER, 232)).toBe(208967022709990);
+    expect(marketFeeMinor(1, 232)).toBe(0);
+  });
+});
+
+describe("PayPal Payouts (C12.27)", () => {
+  it("pays a seller's PayPal email in one idempotent batch, settles by verified webhook, and cannot reverse", async () => {
+    const { calls, fetcher } = recorder((c) =>
+      c.url.endsWith("/v1/oauth2/token") ? { access_token: "tok" }
+      : c.url.endsWith("/v1/payments/payouts") ? { batch_header: { payout_batch_id: "BATCH1" } }
+      : c.url.endsWith("/verify-webhook-signature") ? { verification_status: (JSON.parse(c.body) as { transmission_sig?: string }).transmission_sig === "good" ? "SUCCESS" : "FAILURE" }
+      : {},
+    );
+    const paypal = createPayPalPayouts({ clientId: "id", clientSecret: "secret", webhookId: "WH1", environment: "sandbox", fetch: fetcher });
+    await expect(paypal.onboard(seller, { paypalEmail: "not-an-email" }, urls)).rejects.toThrow(/PayPal account/);
+    expect(await paypal.onboard(seller, { paypalEmail: "Sam@Example.test" }, urls)).toEqual({ externalAccountId: "sam@example.test", status: "ready" });
+    expect(await paypal.transfer({ externalAccountId: "sam@example.test", amountMinor: 1234, currency: "CAD", idempotencyKey: "p1", description: "Payout p1" })).toEqual({ reference: "BATCH1", settled: false });
+    const payout = JSON.parse(calls.at(-1)!.body) as { sender_batch_header: { sender_batch_id: string }; items: { amount: { value: string; currency: string }; receiver: string; sender_item_id: string }[] };
+    expect(payout.sender_batch_header.sender_batch_id).toBe("p1");
+    expect(calls.at(-1)!.headers["paypal-request-id"]).toBe("freeholder-payout-p1");
+    expect(payout.items[0]).toMatchObject({ amount: { value: "12.34", currency: "CAD" }, receiver: "sam@example.test", sender_item_id: "p1" });
+    expect(calls.at(-1)!.url).toBe("https://api-m.sandbox.paypal.com/v1/payments/payouts");
+    expect("unsupported" in (await paypal.reverse({ reference: "BATCH1", amountMinor: 1234, currency: "CAD", idempotencyKey: "p1" }))).toBe(true);
+
+    const event = JSON.stringify({ event_type: "PAYMENT.PAYOUTS-ITEM.SUCCEEDED", resource: { payout_batch_id: "BATCH1", payout_item: { sender_item_id: "p1" } } });
+    expect(await paypal.webhook({ headers: { "paypal-transmission-sig": "good" }, body: body(event), receivedAt: new Date().toISOString() })).toEqual([{ kind: "transfer", reference: "BATCH1", key: "p1", state: "settled" }]);
+    expect((JSON.parse(calls.at(-1)!.body) as { webhook_id: string }).webhook_id).toBe("WH1");
+    await expect(paypal.webhook({ headers: { "paypal-transmission-sig": "bad" }, body: body(event), receivedAt: new Date().toISOString() })).rejects.toThrow(/verify/);
+    const returned = JSON.stringify({ event_type: "PAYMENT.PAYOUTS-ITEM.RETURNED", resource: { payout_batch_id: "BATCH1" } });
+    expect(await paypal.webhook({ headers: { "paypal-transmission-sig": "good" }, body: body(returned), receivedAt: new Date().toISOString() })).toEqual([{ kind: "transfer", reference: "BATCH1", state: "failed", error: "returned" }]);
+    const refunded = JSON.stringify({ event_type: "PAYMENT.PAYOUTS-ITEM.REFUNDED", resource: { payout_batch_id: "BATCH1" } });
+    expect(await paypal.webhook({ headers: { "paypal-transmission-sig": "good" }, body: body(refunded), receivedAt: new Date().toISOString() })).toEqual([{ kind: "transfer", reference: "BATCH1", state: "failed", error: "refunded" }]);
+    // Unclaimed money can still be claimed: its own state, not a failure.
+    const unclaimed = JSON.stringify({ event_type: "PAYMENT.PAYOUTS-ITEM.UNCLAIMED", resource: { payout_batch_id: "BATCH1", payout_item: { sender_item_id: "p1:2" } } });
+    expect(await paypal.webhook({ headers: { "paypal-transmission-sig": "good" }, body: body(unclaimed), receivedAt: new Date().toISOString() })).toEqual([{ kind: "transfer", reference: "BATCH1", key: "p1:2", state: "unclaimed" }]);
+  });
+
+  it("reads a refused duplicate batch as the original payout, not a failure", async () => {
+    const { fetcher } = recorder((c) =>
+      c.url.endsWith("/v1/oauth2/token") ? { access_token: "tok" }
+      : { __status: 400, name: "USER_BUSINESS_ERROR", message: "Batch with given sender_batch_id already exists", links: [{ href: "https://api-m.sandbox.paypal.com/v1/payments/payouts/BATCH9", rel: "self", method: "GET" }] },
+    );
+    const paypal = createPayPalPayouts({ clientId: "id", clientSecret: "secret", webhookId: "WH1", environment: "sandbox", fetch: fetcher });
+    expect(await paypal.transfer({ externalAccountId: "sam@example.test", amountMinor: 1234, currency: "CAD", idempotencyKey: "p1", description: "Payout p1" })).toEqual({ reference: "BATCH9", settled: false });
+    const refused = createPayPalPayouts({ clientId: "id", clientSecret: "secret", webhookId: "WH1", environment: "sandbox", fetch: recorder((c) => (c.url.endsWith("/v1/oauth2/token") ? { access_token: "tok" } : { __status: 422, name: "INSUFFICIENT_FUNDS" })).fetcher });
+    await expect(refused.transfer({ externalAccountId: "sam@example.test", amountMinor: 1234, currency: "CAD", idempotencyKey: "p1", description: "Payout p1" })).rejects.toThrow(/INSUFFICIENT_FUNDS/);
+  });
+});
+
+describe("Razorpay Route (C12.27)", () => {
+  const details = { legalName: "Sam Rao", phone: "9000000000", street: "1 MG Road", city: "Bengaluru", state: "Karnataka", postalCode: "560001", beneficiaryName: "Sam Rao", accountNumber: "1234567890", ifsc: "HDFC0001234" };
+
+  it("creates a linked account with Route and settlement details, transfers and reverses", async () => {
+    const { calls, fetcher } = recorder((c) =>
+      c.url.endsWith("/v2/accounts") ? { id: "acc_1" }
+      : c.url.endsWith("/v2/accounts/acc_1/products") ? { id: "acc_prd_1" }
+      : c.url.endsWith("/products/acc_prd_1") ? { activation_status: c.method === "PATCH" ? "under_review" : "activated" }
+      : c.url.endsWith("/v1/transfers") ? { id: "trf_1", status: "processed" }
+      : c.url.includes("/reversals") ? { id: "rvrsl_1" }
+      : {},
+    );
+    const razorpay = createRazorpayRoute({ keyId: "rzp_test_x", keySecret: "secret", webhookSecrets: ["whs"], fetch: fetcher });
+    await expect(razorpay.onboard(seller, { ...details, ifsc: "BAD" }, urls)).rejects.toThrow(/IFSC/);
+    expect(calls).toHaveLength(0);
+    expect(await razorpay.onboard(seller, details, urls)).toEqual({ externalAccountId: "acc_1:acc_prd_1", status: "pending" });
+    expect(calls.map((c) => `${c.method} ${c.url.replace("https://api.razorpay.com", "")}`)).toEqual(["POST /v2/accounts", "POST /v2/accounts/acc_1/products", "PATCH /v2/accounts/acc_1/products/acc_prd_1"]);
+    expect(JSON.parse(calls[0]!.body)).toMatchObject({ type: "route", email: "sam@example.test", business_type: "individual" });
+    expect(JSON.parse(calls[2]!.body)).toMatchObject({ settlements: { account_number: "1234567890", ifsc_code: "HDFC0001234", beneficiary_name: "Sam Rao" } });
+    expect(calls[0]!.headers.authorization).toBe(`Basic ${Buffer.from("rzp_test_x:secret").toString("base64")}`);
+    expect(await razorpay.accountStatus("acc_1:acc_prd_1")).toBe("ready");
+    expect(await razorpay.transfer({ externalAccountId: "acc_1:acc_prd_1", amountMinor: 50000, currency: "INR", idempotencyKey: "p1", description: "Payout p1" })).toEqual({ reference: "trf_1", settled: true });
+    expect(JSON.parse(calls.at(-1)!.body)).toMatchObject({ account: "acc_1", amount: 50000, currency: "INR", notes: { freeholder_payout_id: "p1" } });
+    // Razorpay's documented idempotency header: a retry returns the first transfer.
+    expect(calls.at(-1)!.headers["x-transfer-idempotency"]).toBe("p1");
+    // A later attempt's key fits Razorpay's 4–36 character alphabet.
+    const later = razorpayKey("0f8fad5b-d9cb-469f-a165-70867728950e:2");
+    expect(later).toBe("0f8fad5bd9cb469fa16570867728950e_2");
+    expect(later).toMatch(/^[A-Za-z0-9_ -]{4,36}$/);
+    expect(razorpayKey("0f8fad5b-d9cb-469f-a165-70867728950e")).toBe("0f8fad5b-d9cb-469f-a165-70867728950e");
+    // 409: the same key is still being processed — the outcome is unknown, not refused.
+    const busy = createRazorpayRoute({ keyId: "k", keySecret: "s", webhookSecrets: ["whs"], fetch: recorder(() => ({ __status: 409, error: { code: "BAD_REQUEST_ERROR" } })).fetcher });
+    await expect(busy.transfer({ externalAccountId: "acc_1:acc_prd_1", amountMinor: 50000, currency: "INR", idempotencyKey: "p1", description: "Payout p1" })).rejects.toMatchObject({ code: "provider_failure", retryable: true });
+    expect(await razorpay.reverse({ reference: "trf_1", amountMinor: 50000, currency: "INR", idempotencyKey: "p1" })).toEqual({ reference: "rvrsl_1" });
+  });
+
+  it("verifies webhooks and reads activation and transfer events", async () => {
+    const razorpay = createRazorpayRoute({ keyId: "k", keySecret: "s", webhookSecrets: ["whs"], fetch: recorder(() => ({})).fetcher });
+    const sign = (s: string) => createHmac("sha256", "whs").update(s).digest("hex");
+    const activated = JSON.stringify({ event: "product.route.activated", payload: { account: { entity: { id: "acc_1" } }, merchant_product: { entity: { id: "acc_prd_1", activation_status: "activated" } } } });
+    expect(await razorpay.webhook({ headers: { "x-razorpay-signature": sign(activated) }, body: body(activated), receivedAt: "" })).toEqual([{ kind: "account", externalAccountId: "acc_1:acc_prd_1", status: "ready" }]);
+    const failed = JSON.stringify({ event: "transfer.failed", payload: { transfer: { entity: { id: "trf_1", notes: { freeholder_payout_id: "p1" } } } } });
+    expect(await razorpay.webhook({ headers: { "x-razorpay-signature": sign(failed) }, body: body(failed), receivedAt: "" })).toEqual([{ kind: "transfer", reference: "trf_1", key: "p1", state: "failed", error: "failed" }]);
+    await expect(razorpay.webhook({ headers: { "x-razorpay-signature": sign("other") }, body: body(failed), receivedAt: "" })).rejects.toThrow(/invalid/);
+  });
+});

@@ -1,0 +1,509 @@
+// Copyright (C) 2026 Tony Aly
+// SPDX-License-Identifier: Apache-2.0
+// The form block (MASTER.md §11, §32, §36).
+//
+// This is the module contract's central claim being tested for real: forms
+// reaches the public surface **without a route of its own**. An owner drags a
+// form onto a page, the catch-all renders the block tree, and this turns a row
+// in `forms` into markup. No file added to app/, no deploy.
+//
+// Everything here is server-rendered. There is no client component and no
+// hydration boundary on the public surface, which is the property §5 and the
+// SEO gate both rest on — so the submission result travels back in the URL and
+// is rendered, rather than being held in client state.
+import { z } from "zod";
+import { env } from "@/core/env";
+import { defineBlock } from "@/modules/cms/blocks/types";
+import { submitPublicForm } from "../../../app/(public)/form-actions";
+import { HONEYPOT_FIELD, issueStamp, STAMP_FIELD } from "./antispam";
+import {
+  acceptedKinds,
+  fileFieldMaxBytes,
+  submissionSchema,
+  type FormField,
+} from "./fields";
+import { FileField } from "./FileField";
+import { acceptAttribute } from "@/core/media/validation";
+import { formScreening } from "@/adapters/form-screening";
+import { issueLeadNotice, LEAD_NOTICE_FIELD } from "./lead-notice";
+import { leadSink } from "@/adapters/lead-sink";
+import {
+  failureFromQuery,
+  failureMessageKey,
+  returnedValues,
+  type PublicFailure,
+} from "@/core/http/public-form-return";
+import type { Translate } from "@/core/i18n";
+
+export interface Resolved {
+  slug: string;
+  name: string;
+  fields: FormField[];
+  submitLabel: string | null;
+  successMessage: string | null;
+  stamp: string;
+  /**
+   * C3.38: whether this visitor can upload a file answer — a signed-in
+   * session. Absent or false shows "Sign in to upload" on file questions.
+   */
+  canUpload?: boolean;
+  /** Where "Sign in to upload" goes; the portal sign-in by default. */
+  signInHref?: string;
+}
+
+export const formBlock = defineBlock({
+  type: "form",
+  labelKey: "cms.block.form",
+  contexts: ["page"],
+  schema: z.object({
+    /** The form's slug, so renaming a form's *name* never breaks a page. */
+    formSlug: z.string().min(1),
+  }),
+  starter: () => ({ formSlug: "contact" }),
+  resolve: async (props, ctx): Promise<Resolved | null> => {
+    // Imported lazily so the block library does not drag the forms module into
+    // every bundle that only needs a heading.
+    const { getForm } = await import("./service");
+    const form = await getForm.call(
+      { slug: props.formSlug },
+      { kind: "anonymous" },
+    );
+    if (!form || form.status === "closed") return null;
+    return {
+      slug: form.slug,
+      name: form.name,
+      fields: form.fields as FormField[],
+      submitLabel: form.submitLabel,
+      successMessage: form.successMessage,
+      // Issued per render: the trap measures the gap between this page being
+      // built and the answer arriving, so a stamp reused across renders would
+      // measure nothing.
+      stamp: issueStamp(),
+      canUpload: ctx.actor?.kind === "user",
+      signInHref: `/portal/login?returnTo=${encodeURIComponent(ctx.path)}`,
+    };
+  },
+  render: ({ resolved, ctx }) => {
+    // A block pointing at a deleted or closed form renders nothing rather than
+    // an error. A page must not break because a form was retired.
+    if (!resolved) return null;
+
+    if (ctx.query?.sent === resolved.slug) {
+      return (
+        <p
+          role="status"
+          className="max-w-prose rounded-md border border-rule bg-success-soft px-4 py-3 text-sm text-success"
+        >
+          {resolved.successMessage ?? ctx.t("forms.public.success")}
+        </p>
+      );
+    }
+
+    const failed = ctx.query?.formError === resolved.slug;
+    const failure = failed ? failureFromQuery(ctx.query?.failure) : undefined;
+    return (
+      <RenderedForm
+        form={resolved}
+        failed={failed}
+        failure={failure}
+        values={failed ? returnedValues(ctx.formReturn, `form:${resolved.slug}`) : undefined}
+        t={ctx.t}
+      />
+    );
+  },
+});
+
+/**
+ * One form, rendered.
+ *
+ * Exported because an intake form on a booking (C6.09) is the *same* form with
+ * a different destination, and a second copy of this markup would be a second
+ * copy of the honeypot below — which is the part that goes wrong silently. The
+ * caller supplies the action and any hidden fields the destination needs;
+ * everything about the form itself stays here.
+ */
+export function RenderedForm({
+  form,
+  failed,
+  failure,
+  values,
+  t,
+  action = submitPublicForm,
+  extraFields,
+}: {
+  form: Resolved;
+  failed: boolean;
+  /** Why it was refused; absent reads as "check your answers", as before. */
+  failure?: PublicFailure;
+  /** The visitor's own answers from the refused attempt, to refill. */
+  values?: Record<string, string>;
+  t: Translate;
+  action?: (form: FormData) => Promise<void>;
+  extraFields?: React.ReactNode;
+}) {
+  const leadNotice = issueLeadNotice(form.slug, t("forms.public.notice.leadSink", { provider: "Paradise Modern" }));
+  // Only an answer problem marks fields, and only with the form's own rules:
+  // the same schema the service applied, so the marks cannot disagree with
+  // the refusal. A playground or server refusal leaves every field unmarked.
+  const fieldErrors = failed && (failure ?? "invalid") === "invalid" && values
+    ? answerIssues(form.fields, values)
+    : {};
+  return (
+    <form action={action} className="grid max-w-prose gap-4">
+      <input type="hidden" name="form_slug" value={form.slug} />
+      <input type="hidden" name={STAMP_FIELD} value={form.stamp} />
+      {leadNotice ? <input type="hidden" name={LEAD_NOTICE_FIELD} value={leadNotice} /> : null}
+      {extraFields}
+
+      {failed ? (
+        <p
+          role="alert"
+          className="rounded-md border border-rule bg-danger-soft px-4 py-3 text-sm text-danger"
+        >
+          {t(failureMessageKey(failure, "forms.public.error"))}
+          {/* Only claimed when the answers really did come back. */}
+          {values ? ` ${t("public.failure.kept")}` : null}
+        </p>
+      ) : null}
+
+      {/*
+        The honeypot: hidden from layout *and* from the accessibility tree, and
+        out of the keyboard path.
+
+        The attributes matter more than they look. `autoComplete="off"` is
+        advisory and iOS Safari ignores it, so it cannot be the only defence —
+        the field's *name* carries none of the terms a filler matches on, and
+        the three vendor opt-outs below cover the password managers that make
+        their own decisions. Getting this wrong does not produce a visible bug:
+        it produces a real person's enquiry quietly marked as spam because
+        their phone helpfully filled in a box they could not see.
+      */}
+      <div className="hidden" aria-hidden="true">
+        <label htmlFor={`${form.slug}-${HONEYPOT_FIELD}`}>
+          {t("forms.public.leaveBlank")}
+        </label>
+        <input
+          id={`${form.slug}-${HONEYPOT_FIELD}`}
+          type="text"
+          name={HONEYPOT_FIELD}
+          tabIndex={-1}
+          autoComplete="off"
+          data-1p-ignore=""
+          data-lpignore="true"
+          data-bwignore="true"
+          data-form-type="other"
+        />
+      </div>
+
+      {form.fields.map((field) => (
+        <Field
+          key={field.key}
+          slug={form.slug}
+          field={field}
+          t={t}
+          value={values?.[field.key]}
+          error={fieldErrors[field.key]}
+          canUpload={form.canUpload ?? false}
+          signInHref={form.signInHref ?? "/portal/login"}
+        />
+      ))}
+
+      <ProviderNotice t={t} />
+
+      <button
+        type="submit"
+        className="inline-flex w-fit items-center gap-2 rounded-md bg-accent px-4 py-2 text-sm font-semibold text-on-accent shadow-press"
+      >
+        {form.submitLabel ?? t("forms.public.submit")}
+      </button>
+    </form>
+  );
+}
+
+function Field({
+  slug,
+  field,
+  t,
+  value,
+  error,
+  canUpload = false,
+  signInHref = "/portal/login",
+}: {
+  slug: string;
+  field: FormField;
+  t: Translate;
+  value?: string;
+  error?: string;
+  canUpload?: boolean;
+  signInHref?: string;
+}) {
+  if (field.kind === "file") {
+    return (
+      <FileQuestion
+        slug={slug}
+        field={field}
+        t={t}
+        error={error}
+        canUpload={canUpload}
+        signInHref={signInHref}
+      />
+    );
+  }
+  const id = `${slug}-${field.key}`;
+  const describedBy = [field.help ? `${id}-help` : null, error ? `${id}-error` : null]
+    .filter(Boolean)
+    .join(" ") || undefined;
+  const invalid = error ? true : undefined;
+  // 16px, not 14px. iOS Safari zooms the whole page when a control under 16px
+  // takes focus, so every phone visitor's first tap on the enquiry form shifted
+  // the page under them — on the form that exists to collect enquiries.
+  // Reported by a third party. The label stays at 14px; only the control has
+  // to clear the threshold.
+  const control =
+    "w-full rounded-md border border-rule-strong bg-field px-3 py-2 text-base text-ink";
+
+  return (
+    <div className="grid gap-1.5">
+      <label htmlFor={id} className="text-sm font-medium text-ink">
+        {field.label}
+        {/*
+          Decorative: `required` is what a screen reader announces, so the
+          asterisk is hidden rather than read out after every label.
+        */}
+        {field.required ? (
+          <span aria-hidden="true" className="text-ink-muted">
+            {" *"}
+          </span>
+        ) : null}
+      </label>
+
+      {field.kind === "multiline" ? (
+        <textarea
+          id={id}
+          name={field.key}
+          required={field.required}
+          placeholder={field.placeholder}
+          aria-describedby={describedBy}
+          aria-invalid={invalid}
+          defaultValue={value}
+          rows={5}
+          maxLength={field.maxLength ?? 2000}
+          className={control}
+        />
+      ) : field.kind === "select" ? (
+        <select
+          id={id}
+          name={field.key}
+          required={field.required}
+          aria-describedby={describedBy}
+          aria-invalid={invalid}
+          defaultValue={value ?? ""}
+          className={control}
+        >
+          <option value="" disabled>
+            {t("forms.public.chooseOne")}
+          </option>
+          {(field.options ?? []).map((option) => (
+            <option key={option} value={option}>
+              {option}
+            </option>
+          ))}
+        </select>
+      ) : field.kind === "checkbox" ? (
+        <input
+          id={id}
+          name={field.key}
+          required={field.required}
+          aria-describedby={describedBy}
+          aria-invalid={invalid}
+          defaultChecked={value === "on" || value === "true"}
+          type="checkbox"
+          className="size-4 rounded border-rule-strong"
+        />
+      ) : (
+        <input
+          id={id}
+          name={field.key}
+          required={field.required}
+          placeholder={field.placeholder}
+          aria-describedby={describedBy}
+          aria-invalid={invalid}
+          defaultValue={value}
+          type={inputType(field.kind)}
+          maxLength={field.maxLength}
+          // Which keyboard a phone shows, and whether the browser can fill it
+          // in — the difference between a typed address and an abandoned form.
+          autoComplete={autoCompleteFor(field)}
+          className={control}
+        />
+      )}
+
+      {(field.kind === "email" || field.kind === "tel") && env().FREEHOLDER_PLAYGROUND === "1" ? (
+        // C1.38: the shared demo is public; say so where people type contact details.
+        <p className="text-xs text-ink-muted">{t("playground.fictionalHint")}</p>
+      ) : null}
+      {field.help ? (
+        <p id={`${id}-help`} className="text-xs text-ink-muted">
+          {field.help}
+        </p>
+      ) : null}
+      {error ? (
+        <p id={`${id}-error`} className="text-xs text-danger">
+          {error}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * A file question (C3.38). Uploading needs a signed-in session, because the
+ * file is private and must be provably the sender's own; a visitor who is not
+ * signed in is told so and pointed at the sign-in, and the rest of the form
+ * still works for them.
+ */
+function FileQuestion({
+  slug,
+  field,
+  t,
+  error,
+  canUpload,
+  signInHref,
+}: {
+  slug: string;
+  field: FormField;
+  t: Translate;
+  error?: string;
+  canUpload: boolean;
+  signInHref: string;
+}) {
+  const id = `${slug}-${field.key}`;
+  const kinds = acceptedKinds(field);
+  const maxBytes = fileFieldMaxBytes(field);
+  const kindList = kinds.map((kind) => t(`forms.file.kind.${kind}`)).join(", ");
+  const limit = t("forms.file.limit", {
+    kinds: kindList,
+    mb: Math.floor(maxBytes / 1024 / 1024),
+  });
+  const hintId = `${id}-hint`;
+  const describedBy = [hintId, field.help ? `${id}-help` : null, error ? `${id}-error` : null]
+    .filter(Boolean)
+    .join(" ");
+  return (
+    <div className="grid gap-1.5">
+      {canUpload ? (
+        <label htmlFor={id} className="text-sm font-medium text-ink">
+          {field.label}
+          {field.required ? (
+            <span aria-hidden="true" className="text-ink-muted">
+              {" *"}
+            </span>
+          ) : null}
+        </label>
+      ) : (
+        <p id={id} className="text-sm font-medium text-ink">
+          {field.label}
+          {field.required ? (
+            <span aria-hidden="true" className="text-ink-muted">
+              {" *"}
+            </span>
+          ) : null}
+        </p>
+      )}
+      <p id={hintId} className="text-xs text-ink-muted">
+        {limit} {canUpload ? t("forms.file.needsScript") : null}
+      </p>
+      {canUpload ? (
+        <FileField
+          id={id}
+          name={field.key}
+          required={field.required}
+          accept={acceptAttribute(kinds)}
+          maxBytes={maxBytes}
+          describedBy={describedBy}
+          invalid={error ? true : undefined}
+          copy={{
+            uploading: t("forms.file.uploading", { percent: "{percent}" }),
+            uploaded: t("forms.file.uploaded", { filename: "{filename}" }),
+            failed: t("forms.file.failed", { message: "{message}" }),
+            tooLarge: t("forms.file.tooLarge", { mb: "{mb}" }),
+            wrongType: t("forms.file.wrongType", { kinds: kindList }),
+            wait: t("forms.file.wait"),
+            remove: t("forms.file.remove"),
+          }}
+        />
+      ) : (
+        <p className="text-sm text-ink">
+          <a href={signInHref} className="font-semibold text-accent underline">
+            {t("forms.file.signIn")}
+          </a>{" "}
+          <span className="text-ink-muted">{t("forms.file.signInWhy")}</span>
+        </p>
+      )}
+      {field.help ? (
+        <p id={`${id}-help`} className="text-xs text-ink-muted">
+          {field.help}
+        </p>
+      ) : null}
+      {error ? (
+        <p id={`${id}-error`} className="text-xs text-danger">
+          {error}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+function inputType(kind: FormField["kind"]): string {
+  if (kind === "email") return "email";
+  if (kind === "tel") return "tel";
+  if (kind === "number") return "number";
+  return "text";
+}
+
+function autoCompleteFor(field: FormField): string | undefined {
+  if (field.kind === "email") return "email";
+  if (field.kind === "tel") return "tel";
+  if (field.key.includes("name")) return "name";
+  return undefined;
+}
+
+/** The first message per field from the form's own rules, keyed by field. */
+function answerIssues(fields: FormField[], values: Record<string, string>): Record<string, string> {
+  const answers: Record<string, unknown> = {};
+  for (const field of fields) {
+    const value = values[field.key];
+    // The action posts a ticked box as `true` and an unticked one not at all.
+    answers[field.key] = field.kind === "checkbox" ? (value === "on" || value === "true" ? true : undefined) : value;
+  }
+  // A file is chosen again after a refusal, so its question is left to the
+  // banner rather than re-checked against an upload that is gone.
+  const parsed = submissionSchema(fields.filter((field) => field.kind !== "file")).safeParse(answers);
+  if (parsed.success) return {};
+  const issues: Record<string, string> = {};
+  for (const issue of parsed.error.issues) {
+    const key = String(issue.path[0] ?? "");
+    if (key && !issues[key]) issues[key] = issue.message;
+  }
+  return issues;
+}
+
+/**
+ * The privacy notice for outside providers, at the point of collection
+ * (MASTER.md §12, C3.33, C3.34): while screening or a lead sink is on, the
+ * person filling the form is told the provider's name, exactly what is sent
+ * and why. Nothing renders while both categories are off.
+ */
+function ProviderNotice({ t }: { t: Translate }) {
+  const screening = formScreening();
+  const sink = leadSink();
+  if (!screening && !sink) return null;
+  return (
+    <div className="grid gap-1 text-xs text-ink-muted">
+      {screening ? (
+        <p>{t("forms.public.notice.screening", { provider: screening.displayName })}</p>
+      ) : null}
+      {sink ? <p>{t("forms.public.notice.leadSink", { provider: sink.displayName })}</p> : null}
+    </div>
+  );
+}

@@ -1,0 +1,425 @@
+<!-- Copyright (C) 2026 Tony Aly -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
+# Commerce payment providers
+
+This is the C5.06-C5.07 provider checkpoint over Freeholder's one money spine.
+Manual, Stripe, PayPal, Square, Mollie, Razorpay, Paystack, and Flutterwave
+never write a parallel balance: a checkout or owner-attested offline receipt
+creates one `Payment`, and every refund creates one `Refund` against the same
+immutable invoice.
+
+## Choose a provider
+
+Set `adapters.payments` in `freeholder.config.ts` to `manual`, `stripe`,
+`paypal`, `square`, `mollie`, `razorpay`, `paystack`, or `flutterwave`. A fresh
+instance selects `manual`; it can record cash, cheque, bank transfer, or a card
+processed in a separate terminal without any credential or network call.
+In-person collection at a location is `/admin/pos`: cash settles immediately;
+Stripe Terminal and tap-to-pay create a `card_present` PaymentIntent and wait
+on the reader or the existing Stripe webhook.
+Offline settlement and refund services require an authorized invoicing manager
+and step-up authentication where the actor has a step-up policy.
+
+Stripe requires:
+
+```dotenv
+STRIPE_SECRET_KEY=sk_...
+STRIPE_WEBHOOK_SECRET=whsec_...
+```
+
+Point its Workbench webhook endpoint at:
+
+```text
+${APP_URL}/api/payments/webhooks/stripe
+```
+
+The adapter pins the known-compatible `2026-02-25.clover` API version. During
+endpoint-secret rotation, put the retiring secret in
+`STRIPE_WEBHOOK_SECRET_PREVIOUS`; remove it after Stripe's rotation window.
+The handler accepts any valid `v1` signature, requires the exact raw body, and
+rejects signed timestamps more than five minutes from receipt. Stripe's
+official guidance requires raw-body verification and describes timestamped
+replay protection: <https://docs.stripe.com/webhooks>. Hosted Checkout and
+future-use consent follow the official Checkout contract:
+<https://docs.stripe.com/api/checkout/sessions/create>.
+
+PayPal requires:
+
+```dotenv
+PAYPAL_CLIENT_ID=...
+PAYPAL_CLIENT_SECRET=...
+PAYPAL_WEBHOOK_ID=...
+PAYPAL_ENVIRONMENT=sandbox # change to live only after sandbox proof
+```
+
+Point its REST-app webhook at:
+
+```text
+${APP_URL}/api/payments/webhooks/paypal
+```
+
+Freeholder posts the exact parsed event plus all PayPal transmission headers to
+PayPal's `verify-webhook-signature` endpoint before touching the database. It
+does not download a provider-supplied certificate and therefore adds no webhook
+SSRF surface. PayPal's verification contract is documented at
+<https://developer.paypal.com/docs/api/webhooks/v1/>. Orders and capture follow
+Orders v2 (<https://developer.paypal.com/docs/api/orders/v2/>); saved methods
+follow PayPal's provider-hosted consent/vault flow
+(<https://developer.paypal.com/docs/checkout/save-payment-methods/>).
+
+Square requires `SQUARE_ACCESS_TOKEN`, `SQUARE_LOCATION_ID`,
+`SQUARE_WEBHOOK_SIGNATURE_KEY`, and `SQUARE_ENVIRONMENT`. Register the exact
+`/api/payments/webhooks/square` URL because Square signs the notification URL
+concatenated with the untouched body. Freeholder uses the current Payment Links
+API and tracks its order through Payment/Refund webhooks. The retiring
+signature key may temporarily live in `SQUARE_WEBHOOK_SIGNATURE_KEY_PREVIOUS`.
+See Square's [Payment Links](https://developer.squareup.com/docs/checkout-api)
+and [webhook validation](https://developer.squareup.com/docs/webhooks/step3validate)
+contracts.
+
+Mollie requires `MOLLIE_API_KEY`. Each payment carries
+`/api/payments/webhooks/mollie` as its classic webhook URL. Classic callbacks
+contain only a `tr_...` identifier; Freeholder fetches the full payment through
+the authenticated Mollie API before normalizing any state, so a forged public
+POST cannot settle money. `MOLLIE_WEBHOOK_SECRET` and its previous value are
+needed only if next-generation signed events share this endpoint. This follows
+Mollie's [classic webhook security model](https://docs.mollie.com/reference/webhooks)
+and [next-generation signature contract](https://docs.mollie.com/reference/webhooks-new).
+
+Razorpay requires `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, and
+`RAZORPAY_WEBHOOK_SECRET`. Freeholder checks for an existing Payment Link by
+its deterministic, 40-character reference before creating one, because
+Razorpay rejects duplicate references instead of accepting a create
+idempotency header. Register `/api/payments/webhooks/razorpay`; exact raw bytes
+are verified against the current or retiring webhook secret. Payment Link,
+refund, and dispute events converge into the shared ledger. See the official
+[Payment Links API](https://razorpay.com/docs/api/payments/payment-links/) and
+[webhook validation guide](https://razorpay.com/docs/webhooks/validate-test/).
+
+Paystack requires `PAYSTACK_SECRET_KEY`, which authenticates API calls and the
+SHA-512 `x-paystack-signature`. Register `/api/payments/webhooks/paystack`.
+Freeholder initializes and verifies unique transaction references and never
+coerces potentially large Paystack transaction identifiers into unsafe
+JavaScript numbers. See Paystack's [Transaction API](https://paystack.com/docs/api/transaction/)
+and [webhook contract](https://paystack.com/docs/payments/webhooks/).
+
+Flutterwave requires `FLUTTERWAVE_SECRET_KEY` and the dashboard secret hash as
+`FLUTTERWAVE_WEBHOOK_SECRET`. Register `/api/payments/webhooks/flutterwave` and
+enable retries. A valid HMAC is necessary but not sufficient for settlement:
+Freeholder also verifies the transaction by its merchant reference and compares
+status, amount, currency, and provider transaction ID. See Flutterwave's
+[Standard checkout](https://developer.flutterwave.com/v3.0/docs/flutterwave-standard-1),
+[webhook](https://developer.flutterwave.com/docs/webhooks), and
+[verification](https://developer.flutterwave.com/v3.0/reference/verify-transaction-with-tx_ref)
+contracts.
+
+`platform.doctor` reports whether the selected provider has both its API and
+authenticated-feedback settings. Doctor never creates a checkout or moves
+money.
+
+## Runtime contract
+
+- `invoicing.listPaymentProviders` returns readiness, capabilities, methods,
+  and whether a provider is selected. It never returns a secret.
+- `invoicing.beginPaymentCheckout` creates the ledger attempt and provider
+  session under the same idempotency key. Success and cancellation URLs must
+  remain on `APP_URL`, preventing an authenticated caller from turning a
+  checkout into an open redirect.
+- `invoicing.completePaymentCheckout` captures an approved PayPal order or
+  rechecks the selected provider's hosted checkout. The public cart/customer
+  choreography belongs to C5.21; current callers are scoped API/MCP/admin
+  clients.
+- `invoicing.submitProviderRefund` reserves the amount in Freeholder first,
+  commits its original processing claim, and submits the provider refund once.
+  The completed provider answer is retained independently before the ledger
+  projection. A retry can apply a retained answer; it does not repeat a live
+  or uncertain provider request. Current prepared-return reservations carry
+  the same server-created authority. Historical reservations without that
+  authority require reconciliation, including rows still labelled created.
+- `invoicing.recordOfflinePayment` and `recordOfflineRefund` require a plain-
+  language owner evidence note and accept an external statement/reference.
+- masked saved-method listings expose brand/label/last four/expiry only. The
+  provider token and provider-customer reference stay internal. Revocation
+  removes the provider token before marking the local evidence revoked. Only
+  Stripe and PayPal advertise this behavior; the other adapters reject a save
+  request rather than pretending their theoretical vault products are wired.
+- disputes retain amount, currency, provider occurrence time, reason, evidence
+  deadline, and open/won/lost state. Older provider events cannot move a dispute
+  backward.
+- `invoicing.reconcilePaymentProviders` reports unsettled attempts, open
+  disputes, unreconciled payout deposits, unmatched provider balance lines,
+  and authenticated event receipts. Stripe and Square signed payout webhooks
+  converge automatically; every hosted provider can also ingest statement
+  observations and gross/fee/net lines through the identical service contract.
+- `invoicing.reconcileProviderPayout` refuses pending/failed deposits, mixed
+  provider or currency lines, reused provider transactions, and any line set
+  whose exact signed net does not equal the bank deposit. Reconciliation is
+  therefore evidence, not a checkbox.
+
+Hosted provider calls occur outside business-service transactions, between
+short committed claim and observation/application phases. Stripe,
+PayPal, Square, and Mollie receive their documented request-idempotency value;
+Razorpay uses a deterministic reference and retrieves an existing link before
+create. Paystack and Flutterwave receive a deterministic unique transaction
+reference, preventing a second settlement from matching the invoice. Their
+hosted-checkout APIs do not document a way to recover a lost checkout URL from
+an idempotency key, so an HTTP-response-loss incident can require recheck or
+operator reconciliation instead of blind creation. Paystack and Flutterwave
+also do not document provider-side refund replay under a caller key; after a
+committed local refund Freeholder returns the existing row, but an ambiguous
+provider-response failure must be reconciled before retry. The refund path
+keeps uncertain throws reserved for every provider, including already-refunded
+or in-use responses. Authenticated exact-resource feedback can converge
+asynchronous settlement; it does not prove a still-live caller has finished.
+
+Original refund journal authentication uses the existing private wrapping
+key and configured previous key during rotation, with the mandatory server
+session secret as the existing fallback. Preserve these configured keys in
+recovery backups. Missing keys or damaged authority fail closed; neither a
+refund's age nor its local status supplies a replacement provider fact.
+
+## Webhook threat and failure behavior
+
+The HTTP boundary caps announced and actual bodies at 1 MiB, lower-cases header
+names, retains exact bytes for verification, and stores only a SHA-256 digest
+plus the normalized event receipt. Raw bodies, payer payloads, signatures, and
+credentials are never persisted.
+
+Receipts are unique on `(provider, provider_event_id)`. A duplicate returns
+success without applying money twice. Different events for the same payment,
+method, or dispute are serialized by transaction locks and provider occurrence
+time. Authenticated amount or currency disagreement refuses settlement. An
+event that arrives before its idempotent checkout transaction commits receives
+`503` plus `Retry-After`, so the provider retries it instead of Freeholder
+silently acknowledging unmatched money.
+
+Stripe intentionally does not make `payment_intent.payment_failed` terminal:
+Checkout can reuse that PaymentIntent after a customer corrects a declined
+method. Terminal async session failure/expiry owns failure. PayPal capture
+decline/denial is terminal. Provider success can never overpay an invoice; the
+existing invoice advisory lock refuses a competing settlement.
+
+## Sandbox acceptance
+
+Before live credentials:
+
+1. Apply migrations through `0047_fantastic_miss_america.sql` and run
+   `platform.doctor`.
+2. Create and issue a small invoice through the generated invoicing API.
+3. Create a sandbox checkout with a unique idempotency key. Retry the same
+   request and confirm the payment/session IDs do not change.
+4. Complete one immediate and one delayed/failed test payment; resend the same
+   webhook and confirm one receipt and one balance movement.
+5. Submit a partial refund, resend its webhook, and confirm the refund and
+   invoice remain balanced.
+6. For Stripe/PayPal, exercise a saved-method add/remove event. For Stripe,
+   Razorpay, or another adapter that advertises disputes, exercise a dispute.
+   Confirm capability-false operations are refused and masked data is all the
+   list service returns.
+7. Send a forged signature, stale Stripe timestamp, oversized body, mismatched
+   amount/currency, and an event before its payment exists. Expect refusal and
+   no ledger mutation.
+8. Import or receive one payout, record its charge/refund/fee lines, refuse an
+   intentionally mismatched selection, then reconcile the exact net. Confirm
+   the admin payment console surfaces unmatched lines and unreconciled payouts.
+
+Repeat the checklist for each provider an instance plans to enable. The
+repository tests use deterministic mocked provider HTTP only. They never make a
+real, billable, sandbox, or live provider request.
+
+## Customer invoice issuer (C12.38, source integration)
+
+Customer invoices expose the frozen public issuer through `issuerName` when
+their original collection policy names a direct seller. Site-issued invoices
+return `null` and keep the existing site-branding behavior. The same customer
+session/private-link ownership check runs before policy lookup; routing,
+account IDs, seller IDs and application fees remain private. A changed site
+default cannot relabel the original seller or offer offline instructions for
+that online invoice. Collection preview uses the original Stripe capability
+and account verifier; if unavailable or changed, the document remains readable
+while payment is unavailable. The portal uses bidirectional isolation and
+wraps long names. This read-model integration enables no direct collection.
+
+The public commercial-identity continuation also freezes deliberately public
+support email, phone, URL and postal address on each original seller agreement
+and invoice. The customer invoice and exact payment-return receipt expose
+`issuerName`, `issuerIsMerchant` and `issuerSupport`; private provider accounts,
+seller/contact IDs and fees remain private. The seller's payout page shows
+their current public business details and offers the existing provider refresh.
+Changing current details never rewrites an issued document. Missing historical
+support remains missing; an erased supplier displays an unavailable supplier
+identity and never adopts the platform's branding. These values come only from
+the original provider's public business-profile fields, never its private
+representative or home details. Source qualification and migration74's
+contiguous upgrade remain pending; direct collection stays unavailable.
+
+## Returned-item refunds (C5.19/C11.10, source repair)
+
+Authenticated refund feedback must match the recorded original payment
+reference, account, amount and currency before any state transition, including
+terminal replay. Stripe's signed `canceled` refund outcome is an unsuccessful
+refund with `provider_cancelled` evidence, matching its immediate API response.
+It releases the failed attempt's reservation without adding refunded money;
+unknown calls remain pending. Expanded PaymentIntent/charge references retain
+their exact IDs. Stripe documents those expandable parent references and the
+actual final statuses in its [Refund object](https://docs.stripe.com/api/refunds/object).
+The [Checkout Session](https://docs.stripe.com/api/checkout/sessions/object)
+response and signed event also preserve an expanded PaymentIntent's ID, so a
+later original-parent refund can match its actual payment rather than a
+Checkout-session fallback.
+This source repair does not supply dashboard-refund recovery, enabled-provider
+acceptance, independent review or direct seller-collection activation.
+
+Final qualification on protected archive main passed all 61 adapter, provider
+ledger, live SDK and activity-label checks in one run, plus 373 contract checks
+with one deliberate exclusion and the full static gates. The final production
+artifact contains 19,445 files / 238,811,983 bytes and passes the standalone
+source/environment scrub. The actual wrong-parent and ignored-cancellation
+controls failed before repair; the peer-found signed expanded-Checkout mismatch
+also failed before its two accessor corrections. Bounded peer re-review found
+no remaining source blocker. No UI or permission surface is added; the same
+private verified-feedback and authorized refund services carry these outcomes.
+
+`catalog.prepareReturnRefund` freezes every original-payment allocation and
+reserves its shared refund-ledger attempt before any money moves. Review the
+amounts in `/admin/returns`. The allocation records original payment, currency,
+provider, private original account and application fee; it cannot be edited.
+
+`catalog.refundReturn` records only the actual offline portion already returned
+to the customer. It requires a person with fresh verification and an explicit
+`offlineRefundConfirmed: true`; API keys and plugins cannot attest. For a mixed
+return, `offlineRefundAmountMinor` must exactly match the displayed remaining
+offline amount. It never records an online provider refund. Old all-manual
+requests remain compatible. The return stays received and its credit stays
+draft until all original portions are confirmed. A completed return replays
+without recording more money. Return requests cannot duplicate a line or exceed
+the order's quantities across earlier non-rejected returns.
+
+`catalog.submitReturnProviderRefund` submits a received return through the
+original payments' shared provider-refund orchestrator. Its private claim
+reserves every installment and a draft credit in one transaction before
+provider I/O. Account routing and application-fee refunds come from the original
+payment, never the caller or current seller defaults. The return remains
+received while any refund is created, processing or failed. The durable
+`refund.succeeded` listener issues its credit and closes the return only when
+confirmed assigned refunds cover the whole credit. A completed return replays
+without another provider request.
+
+A connection failure reuses the same frozen provider request. A definite
+refusal releases only that attempt's active ledger reservation; the original
+allocation remains owed and cannot be consumed by another refund. After reloading, a fresh
+human request can retry the remaining balance without sending a successful
+installment again. Ambiguous created/processing attempts keep their reservation
+and cannot be replaced. Voided credits require owner reconciliation and never
+close a return automatically. All three preparation/money actions require fresh human
+verification; keys and plugins cannot impersonate that confirmation.
+
+Return amounts use the original immutable invoice line's discounted subtotal
+and tax. Cumulative integer allocation preserves every rounding remainder as
+units are returned separately, including earlier pending draft credits. New
+orders bind each order line to its invoice line; an old ambiguous mapping is
+refused for reconciliation. Shipping remains outside returned-item refunds.
+All affected original payment balances are locked before invoice credit work.
+The original C11.02 journey supplies only offline integration evidence.
+Customers request and follow only their own returns at
+`/portal/orders/<order-id>/returns`, linked from their order. The shared services
+bind the current signed-in contact, bound remaining quantities, show safe label
+links and masked refund totals, and expose no private payment/account routing.
+The owner still approves, receives and confirms refunds. Notifications use the
+contact's preferred locale, with the business locale as fallback. Restocking
+is bounded by quantities that actually shipped, under the order lock.
+
+Migration68 adds the allocation table and database guards. It preserves old
+rows and imports only a whole, provable legacy allocation during reconciliation.
+Ambiguous history requires reconciliation. The previous image remains readable,
+but generic settlement of a new prepared return fails closed; its provider
+callbacks must retry on the new image. Complete rollback requires restoring
+the pre-upgrade database and objects, as the release declaration already requires.
+Financial allocations follow their parent return's contact merge reference,
+are exported without private routing, and remain excluded from generic search
+and retention until the original financial obligations are resolved.
+
+The mixed flow and customer return journey have source qualification below.
+Actual enabled-provider and full fulfillment acceptance remain open in
+MASTER.md C5.19; no historical ledger is rewritten.
+
+The private refund claim is bound to its exact public operation and runs with
+the original person's actor. Its committed audit names that person; nested
+provider applications and authenticated feedback remain system phases.
+
+Source qualification on 2026-11-11 passed 49 financial/private/audit cases,
+including the original provider suite. After the original-actor refinement,
+a separate final 37-case run passed return recovery, private inventory, human
+audit and shared orchestration boundaries. These are overlapping runs, not
+86 distinct cases. All eight live SDK checks passed again. The final production
+build and scrub checked 19,277 files and 227,809,507 bytes with no source or
+environment leakage. Eight actual Chromium journeys passed at 320px across
+English, Spanish, French and Arabic RTL with keyboard submission and both-theme
+Axe scans: four offline attestations and four pending-to-confirmed provider
+returns. Provider feedback is seeded in those browser journeys; they do not
+make real provider requests or supply live financial acceptance. English/light
+and Arabic/dark provider screenshots were also inspected.
+
+The three pre-repair reproductions failed on the old source as expected.
+The repaired `tests/core/catalog-fulfillment.test.ts` and existing manual
+`tests/core/c11-02-catalog-journey.test.ts` passed all 11 cases, including
+created/processing/succeeded refund reservations, concurrent requests for
+the same quantities, human/key/plugin boundaries, full installment allocation
+and replay. Live SDK generation passed all eight checks. The production
+build and standalone artifact scrub passed. After rebasing onto merged
+`98f4713d`, all 16 financial/private-service cases and all eight live SDK
+checks passed; the combined production artifact scrub checked 18,777 files
+and 226,587,149 bytes.
+`tests/browser/return-refund.spec.ts` passed four actual Chromium journeys
+at 320px in English/Spanish/French/Arabic RTL, checking required confirmation,
+keyboard submission, both-theme Axe scans and both original installments
+in the ledger. Those payment settlements are seeded and no provider is called.
+Required fast gates also passed typechecking, lint, licensing, release notes,
+plan consistency and 368 contract checks with one deliberate skip. The
+evidence matrix retains 369 rows × 12 criteria; C5.19 remains open.
+
+## Rollback
+
+C5.08 migration `0047_fantastic_miss_america.sql` is additive except for safely
+widening `money_state_events_subject_valid` to admit plans and payouts. The
+previous image continues to read invoices, payments, and refunds and ignores
+the advanced tables. Roll back the image normally. Do not drop balance,
+allocation, fee, or payout evidence during an incident. Disable hosted checkout
+by selecting `manual`, retain webhook endpoints until outstanding attempts and
+payouts settle, and reconcile before removing credentials.
+
+
+Further mixed-return source qualification on 2026-11-11 covered all 32
+return/private/catalog-journey and 49 adjacent provider/balance/orchestration/
+customer-invoice targets across native runs. A final fresh-process 11-case
+focused run passed after four PostgreSQL reset timeouts and three stale module
+inventory expectations during main integration; the other 33 selected-file
+cases were intentionally filtered in that focused run. These are recovery
+runs, not additional unique accepted cases. Source remained frozen during the
+final focused run. Eight live-registry SDK checks and all static gates passed
+(368 contract checks, one deliberate skip). The final production build and
+scrub checked 19,399 files and 228,036,131 bytes with no source/environment
+leakage. The real historical schema67→68 rehearsal preserved the original
+refund row and proved immutable plans, prior-image confirmation/budget refusal
+and exact trusted settlement. The explicit schema compatibility gate passed;
+the restore rollback requirement remains in the release declaration.
+
+Sixteen actual Chromium journeys passed at 320px across English, Spanish,
+French and Arabic RTL: full offline attestations, pending provider installments,
+mixed offline/provider portions, and customer request→owner approval→receipt→
+refund→customer progress. Four final affected customer/owner journeys passed
+again after adding safe return-label handoff, explicit owner restocking and
+shipment order locking. They include keyboard submission and both-theme Axe
+scans for the customer and owner decision screens. English/light and Arabic/
+dark owner screenshots were inspected. Provider feedback is synthetic in the
+browser; native provider application boundaries are tested separately. None
+of these results supplies actual provider-account acceptance, independent
+security sign-off or permission to announce stable.
+
+A further focused account-credit composition case passed through real balance
+funding, invoice payment, prepared return and balance refund: the original
+customer credit was restored exactly once, a human offline claim was refused,
+and the shipping remainder stayed outside the item refund. The other 25 cases
+in that focused file were intentionally filtered. This raises the return/
+private/catalog target set to 32; it adds no live-provider acceptance.

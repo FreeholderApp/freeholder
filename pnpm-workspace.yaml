@@ -1,0 +1,95 @@
+# Copyright (C) 2026 Tony Aly
+# SPDX-License-Identifier: Apache-2.0
+packages:
+  - "packages/*"
+
+# esbuild ships prebuilt binaries as optional deps; its postinstall script
+# races with itself on Windows when multiple versions install concurrently.
+# sharp needs its build script to wire up libvips for next/image.
+allowBuilds:
+  esbuild: false
+  sharp: true
+
+# Transitive dependencies pinned forward past a published advisory (§36:
+# "dependency audit in CI"). These exist because `pnpm audit --audit-level
+# high` is a CI gate, and the honest way past a red gate is to take the patch,
+# not to lower the bar until the gate goes quiet.
+#
+# Each entry is a floor, not a pin — a direct dependency asking for something
+# newer still wins. Remove an entry once every dependency has caught up on its
+# own; the audit gate is what will tell you it is safe to.
+overrides:
+  # CVE-2026-33327/33328/35590 — inherited libvips vulnerabilities. sharp is
+  # also a *direct* dependency now (core/media generates renditions), and Next
+  # pulls its own older copy for next/image; this drags that one forward too.
+  #
+  # The specifier must match package.json's exactly. An override rewrites the
+  # specifier of a direct dependency as well as a transitive one, so a broader
+  # range here (">=0.35.0" against a manifest saying "^0.35.5") makes the
+  # lockfile disagree with package.json and fails --frozen-lockfile in CI.
+  # GHSA-wq5f-xc86-pv6w: patched bundled librsvg in sharp 0.35.5.
+  sharp: "^0.35.5"
+  # GHSA-g3hv-75wg-m249: globparts amplification DoS. Reached only through
+  # eslint's config array (development tooling); no 10.x fix exists.
+  minimatch: ">=11.0.1 <12"
+  # GHSA-pqg4-j6r4-53mv: quote() command injection through launch-editor.
+  shell-quote: ">=1.11.0 <2"
+  # GHSA-r28c-9q8g-f849 and GHSA-fxqj-rqcc-2cmp: sourceMappingURL path
+  # traversal/arbitrary map-file reads. 8.5.23 completes the earlier fix.
+  postcss: ">=8.5.23 <9"
+  # GHSA-68fv-2mgg-jv7q: indexed source-map section offsets could block the
+  # event loop. Shared by PostCSS, Tailwind and test tooling; 1.2.2 patches it.
+  source-map-js: ">=1.2.2 <2"
+  # GHSA-67mh-4wv8-2f99: the old esbuild development server allowed any site
+  # to read its responses. drizzle-kit still reaches 0.18 through its retired
+  # @esbuild-kit loader even though its other esbuild slots are patched. Scope
+  # the forward override to that parent so current Vite/drizzle slots keep
+  # their own newer majors.
+  # GitHub's reviewed advisory names 0.25.0 as the patched release.
+  "@esbuild-kit/core-utils>esbuild": ">=0.25.0 <0.26"
+  # DoS via unbounded brace expansion. Raised to 5.0.9 on 2026-08-03:
+  # GHSA-rgw5-rvv9-x895 found a way around the 5.0.8 mitigation, so the floor
+  # that was enough in July is not enough now. Only reachable through dev
+  # tooling, overridden anyway because the fix is a patch version.
+  brace-expansion: ">=5.0.9"
+  # CVE-2026-59870 — quadratic CPU consumption resolving `!!omap`, which is a
+  # denial of service reachable by anything that parses untrusted YAML. Only
+  # in dev tooling here (changesets reads its own config and our changeset
+  # files), so the exposure is small; the floor is taken because the fix is a
+  # patch release in both majors and the gate is right to insist.
+  #
+  # Two entries rather than one, and both bounded at the next major: 3.x and
+  # 4.x are both installed, and an unbounded floor is not a patch — ">=3.15.1"
+  # resolved the 3.x slot to 5.2.3, which is a different library as far as its
+  # dependents are concerned. A security floor should move a package forward
+  # inside its own major and nowhere else.
+  js-yaml@3: ">=3.15.1 <4"
+  js-yaml@4: ">=4.3.1 <5"
+  # GHSA-2v37-7h3g-55p8 — a custom alphabet can send the generator into an
+  # unbounded loop. Reached through next > postcss, so it is on the request
+  # path rather than in dev tooling, which is why the floor goes in rather
+  # than waiting for Next to bump its own dependency. Bounded at the next
+  # major for the reason the js-yaml entry records.
+  nanoid@3: ">=3.3.18 <4"
+  # GHSA-w5hq-g745-h8pq: v3/v5/v6 accepted out-of-range output buffers before
+  # 11.1.1. Replit Object Storage reaches uuid 9 through gaxios/teeny-request;
+  # both callers use v4 only, and uuid 11 retains their CommonJS v4 export.
+  # Keep this exact patched version because every release below 11.1.1 is in
+  # the advisory's affected range.
+  uuid: "11.1.1"
+  # GHSA-3wwx-pv8p-q78v: WebSocket permessage-deflate unhandled error -> DoS.
+  # Only reachable through jsdom (dev/test fetch), overridden anyway because
+  # the fix is a patch version. 8.10.2 is the first release in the patched
+  # range for the 8.x line the tree uses.
+  undici: ">=8.10.2 <9"
+  # GHSA-587h-7wmj-h5pm (high), GHSA-698v-4r3x-3vcv, GHSA-r825-w8mm-5pxw:
+  # launch-editor argument escaping and Windows path checks, reached through
+  # vite's development server (test tooling only). Bounded at the next major.
+  # vite itself (same advisories plus GHSA-9jrq-w75r-8gcw) is a direct
+  # devDependency at the patched floor: as vitest's auto-installed peer it was
+  # not re-resolved by an override.
+  launch-editor: ">=2.14.2 <3"
+  # GHSA-474x-hrwr-fgx4: quadratic unterminated stop-node scanning. The
+  # application parser is pinned directly; Replit's Google Cloud storage
+  # dependency also needs the patched 5.x floor.
+  "@google-cloud/storage>fast-xml-parser": ">=5.12.0 <6"

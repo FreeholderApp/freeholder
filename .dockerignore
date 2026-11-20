@@ -1,0 +1,17 @@
+# Copyright (C) 2026 Tony Aly
+# SPDX-License-Identifier: Apache-2.0
+node_modules
+.next
+.git
+.env
+.env.*
+!.env.example
+.data
+coverage
+*.tsbuildinfo
+tests
+e2e
+**/target
+
+# Private launch credentials and owner claim link
+.freeholder-launch/

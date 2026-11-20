@@ -1,0 +1,114 @@
+// Copyright (C) 2026 Tony Aly
+// SPDX-License-Identifier: Apache-2.0
+// Choosing the storage implementation (MASTER.md §12, §17): the id comes from
+// freeholder.config.ts, the credentials from env. Instantiated once at first
+// use, like the database pool — importing this module connects to nothing.
+import config from "../../../freeholder.config";
+import { resolve } from "node:path";
+import { env } from "@/core/env";
+import { createLocalStorage } from "@/adapters/storage/local";
+import { createReplitStorage } from "@/adapters/storage/replit";
+import { createS3Storage } from "@/adapters/storage/s3";
+import type { StorageAdapter, StorageBinding } from "@/adapters/storage/types";
+import { withStorageQuota } from "@/adapters/storage/quota";
+import { postgresStorageQuota, storageNamespace, withVerifiedEmptyInitialization } from "@/core/media/storage-quota";
+import { verifyEmptyS3Inventory } from "@/adapters/storage/empty-inventory";
+
+/** Where the app serves stored objects from when the bucket is private. */
+export const MEDIA_PATH = "/media";
+
+function buildUnbounded(): StorageAdapter {
+  const e = env();
+  // Environment wins over the checked-in default, so one published image can
+  // serve instances that store their media in different places (§17).
+  const choice = e.FREEHOLDER_STORAGE ?? config.adapters.storage;
+
+  switch (choice) {
+    case "s3": {
+      // Named rather than defaulted: a half-configured bucket that silently
+      // falls back to the local disk would lose an owner's files at the exact
+      // moment they thought they were safely stored.
+      const missing = (
+        [
+          ["S3_ENDPOINT", e.S3_ENDPOINT],
+          ["S3_REGION", e.S3_REGION],
+          ["S3_BUCKET", e.S3_BUCKET],
+          ["S3_ACCESS_KEY_ID", e.S3_ACCESS_KEY_ID],
+          ["S3_SECRET_ACCESS_KEY", e.S3_SECRET_ACCESS_KEY],
+        ] as const
+      )
+        .filter(([, value]) => !value)
+        .map(([name]) => name);
+      if (missing.length > 0) {
+        throw new Error(
+          `Storage is set to "s3" but ${missing.join(", ")} ${
+            missing.length === 1 ? "is" : "are"
+          } not set. See .env.example.`,
+        );
+      }
+      return createS3Storage({
+        endpoint: e.S3_ENDPOINT!,
+        region: e.S3_REGION!,
+        bucket: e.S3_BUCKET!,
+        accessKeyId: e.S3_ACCESS_KEY_ID!,
+        secretAccessKey: e.S3_SECRET_ACCESS_KEY!,
+        addressingStyle: e.S3_ADDRESSING_STYLE,
+        publicBaseUrl: e.S3_PUBLIC_BASE_URL,
+        isPublic: e.S3_PUBLIC === "true",
+      });
+    }
+
+    case "replit":
+      return createReplitStorage({
+        bucketId: e.REPLIT_BUCKET_ID,
+        mediaPath: MEDIA_PATH,
+      });
+
+    case "local":
+      return createLocalStorage({
+        root: e.LOCAL_STORAGE_ROOT ?? ".data/media",
+        publicPath: MEDIA_PATH,
+      });
+  }
+}
+
+let instance: StorageAdapter | undefined;
+
+export function storage(): StorageAdapter {
+  if (!instance) {
+    const inner = buildUnbounded(), e = env();
+    if (e.FREEHOLDER_STORAGE_QUOTA_BYTES) {
+      // Hosted quota mode deliberately supports private S3 only. Switching
+      // buckets/endpoints changes the namespace and requires new inventory.
+      if (inner.id !== "s3" || inner.isPublic) throw new Error("Storage quota requires private S3 storage");
+      const namespace = storageNamespace({ id: inner.id, endpoint: e.S3_ENDPOINT, bucket: e.S3_BUCKET });
+      const max = Number(e.FREEHOLDER_STORAGE_QUOTA_BYTES);
+      const ledger = e.FREEHOLDER_STORAGE_QUOTA_INITIALIZE_EMPTY === "true"
+        ? withVerifiedEmptyInitialization(namespace,max,() => verifyEmptyS3Inventory({ endpoint:e.S3_ENDPOINT!,region:e.S3_REGION!,bucket:e.S3_BUCKET!,accessKeyId:e.S3_ACCESS_KEY_ID!,secretAccessKey:e.S3_SECRET_ACCESS_KEY!,addressingStyle:e.S3_ADDRESSING_STYLE }))
+        : postgresStorageQuota(namespace,max);
+      instance = withStorageQuota(inner, ledger);
+    } else instance = inner;
+    if (!instance.binding && inner.id !== "replit") {
+      const location: Record<string, string> = inner.id === "local"
+        ? { root: resolve(e.LOCAL_STORAGE_ROOT ?? ".data/media") }
+        : { endpoint: e.S3_ENDPOINT!, bucket: e.S3_BUCKET! };
+      const namespace = storageNamespace({ id: inner.id, ...location });
+      const binding: StorageBinding = Object.freeze({ kind: inner.id, namespace, location: Object.freeze(location) });
+      instance.binding = async () => binding;
+    }
+  }
+  return instance;
+}
+
+/** The adapter and its resource identity are captured together before I/O. */
+export async function boundStorage(): Promise<{ store: StorageAdapter; binding: StorageBinding }> {
+  const store = storage();
+  if (!store.binding) throw new Error("Storage has no verified resource identity. Restore its original configuration before writing or deleting objects.");
+  return { store, binding: await store.binding() };
+}
+
+export function resetStorageForTests(): void {
+  instance = undefined;
+}
+
+export type { StorageAdapter } from "@/adapters/storage/types";

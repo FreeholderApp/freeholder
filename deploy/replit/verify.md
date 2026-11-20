@@ -1,0 +1,10 @@
+# Verify: Replit
+
+Complete the shared [Tier-1 verification](../recipe-verification.md), then the
+platform checks below.
+
+- [ ] `/setup` appears on a fresh instance.
+- [ ] `GET /api/health` returns `ok` and a `version`.
+- [ ] Doctor is green for storage, database and session secret.
+- [ ] An upload lands in Replit Object Storage, not the workspace disk.
+- [ ] `/admin` is `noindex`.

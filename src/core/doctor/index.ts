@@ -1,0 +1,1288 @@
+// Copyright (C) 2026 Tony Aly
+// SPDX-License-Identifier: Apache-2.0
+// Doctor (MASTER.md §17, §18, and the preflight half of §39.4).
+//
+// §17 calls this "the contract that makes community recipes trustworthy — a
+// recipe isn't done until doctor passes green on a fresh deploy of it". So the
+// job is not to describe configuration; it is to *try* it. Anybody can read an
+// environment variable back to somebody. What an owner needs to know is
+// whether the bucket accepts a file, whether the mail server answers, and
+// whether the schema in the database is the one this build expects.
+//
+// Every check therefore does the cheapest real thing rather than the most
+// thorough plausible thing:
+//
+//   - storage writes an object, reads it back, and deletes it
+//   - mail opens a connection and says hello
+//   - the database is asked which migrations it has actually run
+//
+// And every failure carries the sentence that fixes it. A check that reports
+// "storage misconfigured" has told an owner what they already knew.
+import { and, eq, sql } from "drizzle-orm";
+import { readdir } from "node:fs/promises";
+import { env } from "@/core/env";
+import { db } from "@/core/db";
+import { isTimezone } from "@/core/i18n/zoned";
+import { PLATFORM_VERSION } from "@/core/platform";
+import { updateCheckEnabled, updateFeedUrl } from "@/core/update/check";
+import { activeReleaseKeys } from "@/core/update/keys";
+import { THIS_RELEASE } from "@/core/update/this-release";
+import { STRATEGIES, TARGET_STRATEGY, configuredTarget } from "@/core/update/targets";
+
+export type Verdict = "ok" | "warn" | "fail";
+
+export interface Check {
+  /** Dotted and stable, so a recipe or a monitor can name one. */
+  id: string;
+  /** What was examined, in the words an owner would use. */
+  title: string;
+  verdict: Verdict;
+  /** What is true. One sentence, no jargon, no stack traces. */
+  detail: string;
+  /** What to do about it. Present whenever the verdict is not ok. */
+  remedy?: string;
+  /**
+   * The same finding as a catalog key and its values, so the admin screen can
+   * show it in the owner's language. The English above stays for the CLI.
+   */
+  message?: { key: string; params: Record<string, string> };
+}
+
+export interface DoctorReport {
+  verdict: Verdict;
+  checks: Check[];
+  ranAt: string;
+}
+
+const ok = (id: string, title: string, detail: string): Check => ({
+  id,
+  title,
+  verdict: "ok",
+  detail,
+});
+const warn = (id: string, title: string, detail: string, remedy: string): Check => ({
+  id,
+  title,
+  verdict: "warn",
+  detail,
+  remedy,
+});
+const fail = (id: string, title: string, detail: string, remedy: string): Check => ({
+  id,
+  title,
+  verdict: "fail",
+  detail,
+  remedy,
+});
+
+/** The message from an unknown throw, without the stack. */
+function reason(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+async function checkEnvironment(): Promise<Check[]> {
+  const e = env();
+  const production = e.NODE_ENV === "production";
+  const checks: Check[] = [];
+
+  if (!e.SESSION_SECRET) {
+    checks.push(
+      production
+        ? fail(
+            "env.sessionSecret",
+            "Session secret",
+            "SESSION_SECRET is not set, so nobody can stay signed in.",
+            'Generate one: node -e "console.log(crypto.randomBytes(32).toString(\'hex\'))"',
+          )
+        : warn(
+            "env.sessionSecret",
+            "Session secret",
+            "SESSION_SECRET is not set. Development sessions will not survive a restart.",
+            "Set SESSION_SECRET in .env before deploying anywhere real.",
+          ),
+    );
+  } else if (e.SESSION_SECRET.length < 32) {
+    checks.push(
+      fail(
+        "env.sessionSecret",
+        "Session secret",
+        `SESSION_SECRET is ${e.SESSION_SECRET.length} characters; sessions are only as hard to forge as it is.`,
+        "Use at least 32 random characters.",
+      ),
+    );
+  } else {
+    checks.push(
+      ok("env.sessionSecret", "Session secret", "Set, and long enough."),
+    );
+  }
+
+  // §5's canonical URLs, §9's cookies and every emailed link are built from
+  // APP_URL. Wrong here is wrong in a search index and in somebody's inbox.
+  const local = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(e.APP_URL);
+  if (production && local) {
+    checks.push(
+      fail(
+        "env.appUrl",
+        "Site address",
+        `APP_URL is ${e.APP_URL}, so canonical links, sitemaps and password-reset emails all point at this machine.`,
+        "Set APP_URL to the address visitors actually use, including https://.",
+      ),
+    );
+  } else if (production && e.APP_URL.startsWith("http://")) {
+    checks.push(
+      warn(
+        "env.appUrl",
+        "Site address",
+        "APP_URL is http, so session cookies cannot be marked Secure.",
+        "Serve the site over https and set APP_URL accordingly.",
+      ),
+    );
+  } else {
+    checks.push(ok("env.appUrl", "Site address", `Serving as ${e.APP_URL}.`));
+  }
+
+  return checks;
+}
+
+async function checkDatabase(): Promise<Check[]> {
+  const checks: Check[] = [];
+  if (!env().DATABASE_URL) {
+    return [
+      fail(
+        "db.connection",
+        "Database",
+        "DATABASE_URL is not set, so there is nothing to serve from.",
+        "Point DATABASE_URL at a Postgres 15+ database. See .env.example.",
+      ),
+    ];
+  }
+
+  try {
+    const [row] = await db().execute<{ version: string }>(
+      sql`select current_setting('server_version') as version`,
+    );
+    const version = Number.parseInt(row?.version ?? "0", 10);
+    checks.push(
+      version >= 15
+        ? ok("db.connection", "Database", `Connected to Postgres ${row?.version}.`)
+        : warn(
+            "db.connection",
+            "Database",
+            `Connected to Postgres ${row?.version}. Freeholder is developed against 15 and later.`,
+            "Upgrade when convenient; nothing is known to be broken below it.",
+          ),
+    );
+  } catch (error) {
+    return [
+      fail(
+        "db.connection",
+        "Database",
+        `Could not connect: ${reason(error)}`,
+        "Check DATABASE_URL, and that the database is running and reachable.",
+      ),
+    ];
+  }
+
+  // The check that actually matters after a deploy: is the schema the one this
+  // build expects? A missing migration is invisible until the first request
+  // touches the table it added.
+  try {
+    const files = (await readdir("db/migrations"))
+      .filter((name) => name.endsWith(".sql"))
+      .sort();
+    const applied = await db().execute<{ count: number }>(
+      sql`select count(*)::int as count from drizzle.__drizzle_migrations`,
+    );
+    const run = Number(applied[0]?.count ?? 0);
+    checks.push(
+      run >= files.length
+        ? ok(
+            "db.migrations",
+            "Schema",
+            `All ${files.length} migrations have been applied.`,
+          )
+        : fail(
+            "db.migrations",
+            "Schema",
+            `${files.length - run} of ${files.length} migrations have not been applied.`,
+            "Restart the app — it migrates at boot — or run `pnpm db:migrate`.",
+          ),
+    );
+  } catch {
+    // Not fatal: the migration table lives in drizzle's own schema and a
+    // recipe that migrates out of band may not have it.
+    checks.push(
+      warn(
+        "db.migrations",
+        "Schema",
+        "Could not read the migration history, so the schema version is unknown.",
+        "If the site is serving pages, this is probably a permissions detail rather than a problem.",
+      ),
+    );
+  }
+
+  return checks;
+}
+
+async function checkStorage(): Promise<Check> {
+  // A real round trip. Credentials that parse and a bucket that refuses writes
+  // look identical from the outside until an owner uploads a photograph.
+  const probe = `doctor/${Date.now()}-${Math.random().toString(36).slice(2)}.txt`;
+  try {
+    const { storage } = await import("@/adapters/storage");
+    const store = storage();
+    const body = new TextEncoder().encode("freeholder doctor");
+    await store.put(probe, body, "text/plain");
+    const read = await store.get(probe);
+    await store.delete(probe);
+    if (!read || new TextDecoder().decode(read) !== "freeholder doctor") {
+      return fail(
+        "storage.roundTrip",
+        "File storage",
+        "A file was written and came back different or empty.",
+        "Check the bucket's permissions — writes appear to be silently dropped.",
+      );
+    }
+    return ok(
+      "storage.roundTrip",
+      "File storage",
+      `Wrote, read and deleted a test file (${store.isPublic ? "public" : "private"} bucket).`,
+    );
+  } catch (error) {
+    return fail(
+      "storage.roundTrip",
+      "File storage",
+      `Could not store a file: ${reason(error)}`,
+      "Check adapters.storage in freeholder.config.ts and the S3_* variables. Uploads will fail until this passes.",
+    );
+  }
+}
+
+async function checkMail(): Promise<Check[]> {
+  const { mailConfigurationStatus } = await import("@/adapters/mail");
+  const { connectedAccounts, connectionCapabilities } = await import(
+    "@/core/connections/schema"
+  );
+  const { mailSenders } = await import("@/core/mail/schema");
+  const configuration = mailConfigurationStatus();
+  let senders: Array<{
+    purpose: "transactional" | "bulk";
+    provider: string;
+    email: string;
+    verificationStatus: "pending" | "verified" | "failed";
+    status: "active" | "paused" | "needs_attention";
+    isDefault: boolean;
+    verificationDetail: unknown;
+    accountStatus: "active" | "needs_reconnect" | "revoked" | null;
+    capabilityEnabled: boolean | null;
+  }>;
+  try {
+    senders = await db()
+      .select({
+        purpose: mailSenders.purpose,
+        provider: mailSenders.provider,
+        email: mailSenders.email,
+        verificationStatus: mailSenders.verificationStatus,
+        status: mailSenders.status,
+        isDefault: mailSenders.isDefault,
+        verificationDetail: mailSenders.verificationDetail,
+        accountStatus: connectedAccounts.status,
+        capabilityEnabled: connectionCapabilities.enabled,
+      })
+      .from(mailSenders)
+      .leftJoin(
+        connectedAccounts,
+        eq(connectedAccounts.id, mailSenders.connectedAccountId),
+      )
+      .leftJoin(
+        connectionCapabilities,
+        and(
+          eq(
+            connectionCapabilities.connectedAccountId,
+            connectedAccounts.id,
+          ),
+          eq(connectionCapabilities.capability, "mail_send"),
+        ),
+      );
+  } catch {
+    return [
+      fail(
+        "mail.delivers",
+        "Account email",
+        "Mail configuration exists, but sender state could not be read from the database.",
+        "Apply the current migrations, then run doctor again.",
+      ),
+    ];
+  }
+
+  const transactional = senders.filter(
+    (sender) => sender.purpose === "transactional",
+  );
+  const readyTransactional = transactional.find(
+    (sender) =>
+      sender.isDefault &&
+      sender.status === "active" &&
+      sender.verificationStatus === "verified" &&
+      sender.provider !== "console" &&
+      sender.accountStatus !== "needs_reconnect" &&
+      sender.accountStatus !== "revoked" &&
+      sender.capabilityEnabled !== false,
+  );
+  const brokenConnection = transactional.find(
+    (sender) =>
+      sender.accountStatus === "needs_reconnect" ||
+      sender.accountStatus === "revoked" ||
+      sender.capabilityEnabled === false,
+  );
+  let transactionalCheck: Check;
+  if (configuration.transactional.missing.length > 0) {
+    transactionalCheck = fail(
+      "mail.delivers",
+      "Account email",
+      `${configuration.transactional.provider} is selected but its setup is incomplete.`,
+      `Set ${configuration.transactional.missing.join(", ")}, restart Freeholder, and register or connect the sender in Admin → Settings → Mail.`,
+    );
+  } else if (brokenConnection) {
+    transactionalCheck = fail(
+      "mail.delivers",
+      "Account email",
+      `${brokenConnection.email} cannot send because its provider authorization needs attention.`,
+      "Reconnect the mailbox in Admin → Settings → Mail and approve mail-send permission.",
+    );
+  } else if (readyTransactional) {
+    const detail =
+      readyTransactional.provider === "smtp"
+        ? `${readyTransactional.email} is registered through SMTP. Transport is configured; DNS ownership is not proven by SMTP setup alone.`
+        : `${readyTransactional.email} is verified and selected through ${readyTransactional.provider}.`;
+    transactionalCheck =
+      readyTransactional.provider === "smtp"
+        ? warn(
+            "mail.delivers",
+            "Account email",
+            detail,
+            "Send a test from Admin → Settings → Mail, then confirm SPF, DKIM and DMARC with the mailbox provider.",
+          )
+        : ok("mail.delivers", "Account email", detail);
+  } else if (configuration.transactional.provider === "smtp") {
+    transactionalCheck = warn(
+      "mail.delivers",
+      "Account email",
+      "SMTP is configured, but its sender is not registered in the delivery console.",
+      "Open Admin → Settings → Mail, register the configured MAIL_FROM address, and send a non-billable test to your own account.",
+    );
+  } else {
+    transactionalCheck = warn(
+      "mail.delivers",
+      "Account email",
+      "No active verified sender is selected, so password resets and account messages cannot reach an inbox.",
+      "Configure Google or Microsoft OAuth and CREDENTIAL_KEY, or set MAIL_ADAPTER=smtp with SMTP_HOST and MAIL_FROM. Then connect or register the sender in Admin → Settings → Mail. A locked-out owner can use `node scripts/owner-password.mjs` on the server.",
+    );
+  }
+
+  const checks = [transactionalCheck];
+  const bulk = configuration.bulk;
+  const bulkSenders = senders.filter((sender) => sender.purpose === "bulk");
+  const readyBulk = bulkSenders.find(
+    (sender) =>
+      sender.provider === bulk.provider &&
+      sender.isDefault &&
+      sender.status === "active" &&
+      sender.verificationStatus === "verified",
+  );
+  if (bulk.provider === "none") {
+    checks.push(
+      warn(
+        "mail.bulk",
+        "Broadcast email",
+        "Broadcast mail is off. Campaign sends are refused rather than falling back to a personal mailbox.",
+        "When campaigns are needed, choose Resend, Postmark or Amazon SES with MAIL_BULK_ADAPTER and complete the provider variables in .env.example.",
+      ),
+    );
+  } else if (!bulk.sendConfigured) {
+    checks.push(
+      fail(
+        "mail.bulk",
+        "Broadcast email",
+        `${bulk.provider} is selected but cannot submit mail.`,
+        `Set ${bulk.missing.join(", ")}, restart Freeholder, then register and verify MAIL_BULK_FROM in Admin → Settings → Mail.`,
+      ),
+    );
+  } else if (!readyBulk) {
+    const pending = bulkSenders.find(
+      (sender) => sender.verificationStatus === "pending",
+    );
+    checks.push(
+      warn(
+        "mail.bulk",
+        "Broadcast email",
+        pending
+          ? `${pending.email} is registered with ${bulk.provider}, but provider verification is still pending.`
+          : `${bulk.provider} is configured, but no active verified default broadcast sender is selected.`,
+        "Open Admin → Settings → Mail, register MAIL_BULK_FROM, check provider verification, and choose it as the default. Doctor never makes a billable campaign send.",
+      ),
+    );
+  } else {
+    checks.push(
+      ok(
+        "mail.bulk",
+        "Broadcast email",
+        `${readyBulk.email} is verified and selected through ${bulk.provider}. No billable test was sent.`,
+      ),
+    );
+  }
+
+  if (bulk.provider !== "none") {
+    const endpoint = `${env().APP_URL.replace(/\/+$/, "")}${bulk.webhookPath}`;
+    checks.push(
+      bulk.feedbackConfigured
+        ? ok(
+            "mail.feedback",
+            "Delivery feedback",
+            `${bulk.provider} feedback is configured for ${endpoint}${bulk.provider === "ses" ? " with Amazon SNS SignatureVersion 2 (RSA-SHA256) required" : ""}.`,
+          )
+        : fail(
+            "mail.feedback",
+            "Delivery feedback",
+            `${bulk.provider} can submit mail, but authenticated bounce and complaint feedback is incomplete.`,
+            `Set ${bulk.missing.join(", ")} and point the provider webhook at ${endpoint}.${bulk.provider === "ses" ? " Configure the exact SES SNS topic and require SNS SignatureVersion 2; SHA-1 messages are refused." : ""}`,
+          ),
+    );
+  }
+  return checks;
+}
+
+async function checkNotificationChannels(): Promise<Check[]> {
+  const { notificationAdapterStatus } = await import("@/adapters/notifications");
+  return notificationAdapterStatus().map((status) =>
+    status.available
+      ? ok(
+          `notifications.${status.channel}`,
+          `${status.channel.toUpperCase()} notifications`,
+          `${status.provider} is ready. Doctor did not send a billable message.`,
+        )
+      : warn(
+          `notifications.${status.channel}`,
+          `${status.channel.toUpperCase()} notifications`,
+          status.message,
+          status.channel === "sms"
+            ? "Leave SMS preferences off until the C7.10 carrier and consent controls are installed. In-app and email delivery continue normally."
+            : "Leave push preferences off until C10.14 installs device registration and a production carrier. In-app and email delivery continue normally.",
+        ),
+  );
+}
+
+/** Configuration-only: a doctor run never creates a checkout or moves money. */
+async function checkPayments(): Promise<Check> {
+  const { paymentAdapter } = await import("@/adapters/payments");
+  const adapter = paymentAdapter();
+  if (adapter.id === "manual") {
+    return ok(
+      "payments.provider",
+      "Payments",
+      "Offline cash, cheque, bank-transfer, and external-card records are available through the shared invoice ledger.",
+    );
+  }
+  if (!adapter.status.available) {
+    const base = env().APP_URL.replace(/\/+$/, "");
+    const remedies: Record<string, string> = {
+      stripe: `Set STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET, then point Stripe at ${base}/api/payments/webhooks/stripe.`,
+      paypal: `Set PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET, and PAYPAL_WEBHOOK_ID, choose PAYPAL_ENVIRONMENT, then point PayPal at ${base}/api/payments/webhooks/paypal.`,
+      square: `Set SQUARE_ACCESS_TOKEN, SQUARE_LOCATION_ID, and SQUARE_WEBHOOK_SIGNATURE_KEY, choose SQUARE_ENVIRONMENT, then register exactly ${base}/api/payments/webhooks/square.`,
+      mollie: `Set MOLLIE_API_KEY, then use ${base}/api/payments/webhooks/mollie as the payment webhook URL. Set MOLLIE_WEBHOOK_SECRET as well if you enable next-generation events.`,
+      razorpay: `Set RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, and RAZORPAY_WEBHOOK_SECRET, then point Razorpay at ${base}/api/payments/webhooks/razorpay.`,
+      paystack: `Set PAYSTACK_SECRET_KEY, then point Paystack at ${base}/api/payments/webhooks/paystack. The same secret authenticates API calls and SHA-512 feedback.`,
+      flutterwave: `Set FLUTTERWAVE_SECRET_KEY and FLUTTERWAVE_WEBHOOK_SECRET, then point Flutterwave at ${base}/api/payments/webhooks/flutterwave and enable retries.`,
+    };
+    return fail(
+      "payments.provider",
+      "Payments",
+      adapter.status.message,
+      remedies[adapter.id] ?? "Configure the selected payment provider credentials and authenticated webhook endpoint, then restart Freeholder.",
+    );
+  }
+  return ok(
+    "payments.provider",
+    "Payments",
+    `${adapter.id} API credentials and authenticated feedback are configured. Doctor did not create a checkout, refund, or other provider charge.`,
+  );
+}
+
+async function checkJobs(): Promise<Check> {
+  const { getJobRuntimeEvidence } = await import("@/core/jobs/health");
+  const evidence = await getJobRuntimeEvidence();
+
+  if (evidence.state === "disabled") {
+    return warn(
+      "jobs.worker",
+      "Background work",
+      "No database is configured, so durable background work is unavailable.",
+      "Configure DATABASE_URL, apply migrations and start Freeholder again.",
+    );
+  }
+  if (!evidence.ready) {
+    const details: Record<typeof evidence.reason, string> = {
+      database_unconfigured: "No database is configured for durable background work.",
+      no_live_producer: "No producer or worker has published a fresh heartbeat.",
+      no_live_worker: "A producer is alive, but no worker is consuming required background work.",
+      worker_version_mismatch: "Workers are alive, but none runs this Freeholder version.",
+      worker_starting: "The current worker is still mounting its job handlers.",
+      worker_degraded: "The current worker reports a degraded runtime.",
+      ready: "The worker reported an inconsistent readiness result.",
+    };
+    return fail(
+      "jobs.worker",
+      "Background work",
+      details[evidence.reason],
+      "Check the payload-free [jobs] startup and health codes, make sure one current-version process runs with FREEHOLDER_JOBS enabled, then wait for a fresh heartbeat.",
+    );
+  }
+  const detail = `${evidence.currentVersionWorkers} current worker(s); heartbeat ${evidence.heartbeatAgeSeconds ?? 0}s ago; ${evidence.readyJobs} ready job(s); ${evidence.queueLagSeconds}s queue lag; ${evidence.deadLetters} dead letter(s).`;
+  if (evidence.state === "degraded") {
+    return warn(
+      "jobs.worker",
+      "Background work",
+      detail,
+      "Inspect the background-work admin view and payload-free [jobs] alert codes; redrive or resolve dead letters after fixing their cause.",
+    );
+  }
+  return ok(
+    "jobs.worker",
+    "Background work",
+    detail,
+  );
+}
+
+/** The command that makes a key, quoted once so two remedies cannot drift. */
+const GENERATE_KEY = [
+  "Generate one with:",
+  "node -e \"console.log(require('crypto').randomBytes(32).toString('hex'))\"",
+].join(" ");
+
+/**
+ * The key that encrypts an owner's connected accounts (§41).
+ *
+ * Absent is fine until something is connected — an instance that has never
+ * linked a Google account has nothing to protect. Once one exists the key is
+ * load-bearing, and §41 is explicit that doctor should say so rather than
+ * letting the first sync be where an owner finds out.
+ */
+async function checkCredentialKey(): Promise<Check[]> {
+  const { credentialKeyConfigured, credentialKeyWorks } = await import(
+    "@/core/connections/crypto"
+  );
+  const configured = credentialKeyConfigured();
+
+  let connected = false;
+  try {
+    const { hasConnections } = await import("@/core/connections/service");
+    connected = await hasConnections();
+  } catch {
+    // No database is already a failing check of its own; this one has nothing
+    // to add to it.
+    return [];
+  }
+
+  if (!configured) {
+    return [
+      connected
+        ? fail(
+            "security.credentialKey",
+            "Connected accounts",
+            "Accounts are connected but CREDENTIAL_KEY is not set, so their stored credentials cannot be read.",
+            `Restore the key you used when connecting them. If it is gone, disconnect and reconnect each account. ${GENERATE_KEY}`,
+          )
+        : warn(
+            "security.credentialKey",
+            "Connected accounts",
+            "CREDENTIAL_KEY is not set. Nothing needs it yet, and connecting a Google or Microsoft account will.",
+            `Set it before connecting anything. ${GENERATE_KEY}`,
+          ),
+    ];
+  }
+
+  try {
+    if (!credentialKeyWorks()) {
+      return [
+        fail(
+          "security.credentialKey",
+          "Connected accounts",
+          "CREDENTIAL_KEY is set but a test encryption did not survive a round trip.",
+          "Check that the key is 32 bytes, as 64 hex characters or base64url.",
+        ),
+      ];
+    }
+  } catch (error) {
+    return [
+      fail(
+        "security.credentialKey",
+        "Connected accounts",
+        `CREDENTIAL_KEY is set but unusable: ${reason(error)}`,
+        "It must be 32 bytes, as 64 hex characters or base64url.",
+      ),
+    ];
+  }
+
+  return [
+    ok(
+      "security.credentialKey",
+      "Connected accounts",
+      connected
+        ? "The key that protects your connected accounts is working."
+        : "Ready to store connected accounts securely.",
+    ),
+  ];
+}
+
+async function checkSecurity(): Promise<Check[]> {
+  const e = env();
+  const checks: Check[] = [];
+
+  const { localStorageMode, describeLocalStorage } = await import("@/adapters/storage/local-mode");
+  const configuredStorage =
+    e.FREEHOLDER_STORAGE ?? (await import("../../../freeholder.config")).default.adapters.storage;
+  if (configuredStorage === "local" && localStorageMode(e) === "persistent") {
+    // C3.44: a supported single-server mode, so it is information, not a
+    // warning. The owner still needs to know the backup must include it.
+    checks.push(
+      ok("security.localStorage", "Media on this server", describeLocalStorage(e)),
+    );
+  } else if (e.NODE_ENV === "production" && e.FREEHOLDER_UNSAFE_LOCAL_STORAGE === "1") {
+    checks.push(
+      warn(
+        "security.localStorage",
+        "Media on this machine",
+        "Media is being kept on this server's disk, which is not backed up and does not survive a rebuild.",
+        "Move to object storage (§18) unless you have your own backup of this directory.",
+      ),
+    );
+  }
+
+  if (e.NODE_ENV === "production" && e.FREEHOLDER_SEED_DEMO === "1") {
+    checks.push(
+      warn(
+        "security.seedDemo",
+        "Demo content",
+        "FREEHOLDER_SEED_DEMO is set on a production instance. It installs the demo business into an empty site.",
+        "Unset it once the real site has content — it refuses to overwrite, but leaving it set is confusing.",
+      ),
+    );
+  }
+
+  if (e.FREEHOLDER_STORAGE === "s3" && e.S3_PUBLIC === "true") {
+    checks.push(
+      warn(
+        "security.publicMediaBucket",
+        "Media bucket privacy",
+        "The S3 bucket is public, so resumable direct upload is disabled until each original can be validated and scanned.",
+        "Make the bucket private and leave S3_PUBLIC unset. Freeholder signs ready media URLs and proxies document downloads.",
+      ),
+    );
+  }
+
+  return checks;
+}
+
+/**
+ * Marketing grants of deleted or erased contacts that Paradise Modern still
+ * holds (C3.31). Only reported when some are waiting; an erasure receipt
+ * stays pending until they are withdrawn.
+ */
+async function checkProviderGrants(): Promise<Check[]> {
+  let waiting: number;
+  try {
+    const { grantsAwaitingWithdrawal } = await import("@/core/mail/permission");
+    waiting = await grantsAwaitingWithdrawal();
+  } catch {
+    return [];
+  }
+  if (waiting === 0) return [];
+  const title = "Marketing grants awaiting withdrawal";
+  const detail = `${waiting} Paradise Modern marketing grant${waiting === 1 ? "" : "s"} of deleted or erased contacts ${waiting === 1 ? "has" : "have"} not been withdrawn there yet; any erasure waiting on ${waiting === 1 ? "it" : "them"} stays pending.`;
+  return [warn("mail.providerGrants", title, detail, "Review /admin/retention/mail/carriers. Restore the original PARADISEMODERN_API_KEY and provider account or verify its exact final withdrawal and stopped callers; configured credentials alone do not prove completion.")];
+}
+
+async function checkMalwareScanner(): Promise<Check> {
+  const e = env();
+  if (e.MALWARE_SCANNER !== "clamav") {
+    return warn(
+      "media.malwareScanner",
+      "Uploaded-file malware scanner",
+      "No antivirus engine is connected. File signatures are still verified and documents are forced to download.",
+      "Run clamd, set MALWARE_SCANNER=clamav and CLAMAV_HOST, then run doctor again.",
+    );
+  }
+  try {
+    const { malwareScanner } = await import("@/adapters/malware");
+    const test = new Uint8Array(
+      Buffer.from(
+        "X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*",
+      ),
+    );
+    const result = await malwareScanner().scan({
+      filename: "freeholder-doctor-eicar.txt",
+      contentType: "text/plain",
+      bytes: test.byteLength,
+      body: (async function* () {
+        yield test;
+      })(),
+    });
+    if (result.status !== "infected") {
+      return fail(
+        "media.malwareScanner",
+        "Uploaded-file malware scanner",
+        `The scanner answered ${result.status} to its harmless standard test signature.`,
+        "Check clamd connectivity and signature databases before accepting uploads.",
+      );
+    }
+    return ok(
+      "media.malwareScanner",
+      "Uploaded-file malware scanner",
+      "ClamAV detected the standard test signature over its streaming interface.",
+    );
+  } catch (error) {
+    return fail(
+      "media.malwareScanner",
+      "Uploaded-file malware scanner",
+      `ClamAV could not scan a test stream: ${reason(error)}`,
+      "Check MALWARE_SCANNER, CLAMAV_HOST, CLAMAV_PORT and clamd availability.",
+    );
+  }
+}
+
+/** Configuration-only: doctor must never spend provider credits on a probe. */
+async function checkAltTextSuggester(): Promise<Check> {
+  const { altTextSuggester } = await import("@/adapters/alt-text");
+  const provider = altTextSuggester();
+  if (provider.available) {
+    return ok(
+      "media.altTextSuggester",
+      "Generated image descriptions",
+      `${provider.id} model ${provider.model} is configured. A request is made only when a signed-in person asks for a suggestion.`,
+    );
+  }
+  if (provider.id === "none") {
+    return warn(
+      "media.altTextSuggester",
+      "Generated image descriptions",
+      "No suggestion provider is connected. Authored alternative text continues to work normally.",
+      'To offer suggestions, set adapters.ai to "openai" in freeholder.config.ts and set OPENAI_API_KEY plus OPENAI_ALT_TEXT_MODEL.',
+    );
+  }
+  return fail(
+    "media.altTextSuggester",
+    "Generated image descriptions",
+    provider.unavailableReason ?? `${provider.id} is not ready.`,
+    "Complete the selected AI adapter configuration, or set adapters.ai to none. Doctor does not make a billable test request.",
+  );
+}
+
+/**
+ * Configuration-only, like the alt-text check: doctor never spends provider
+ * credits proving a key works. What it can prove is that every managed
+ * connection names an installed adapter and that the environment variable the
+ * connection points at actually holds a value.
+ */
+async function checkManagedAgentConnections(): Promise<Check[]> {
+  try {
+    const { agentConnections } = await import("@/core/agents/schema");
+    const { workforceAdapter } = await import("@/adapters/agent/workforce");
+    const managed = (await db().select().from(agentConnections)).filter(
+      (row) => row.kind === "managed",
+    );
+    if (managed.length === 0) {
+      return [
+        ok(
+          "agents.managedConnections",
+          "Managed agent runtimes",
+          "No managed connections are configured. Inbound agents bring their own runtime and need nothing here.",
+        ),
+      ];
+    }
+    return managed.map((connection) => {
+      const adapter = workforceAdapter(connection);
+      if (adapter.id === "none") {
+        return fail(
+          "agents.managedConnections",
+          `Managed runtime — ${connection.name}`,
+          `The connection names adapter "${connection.adapter ?? ""}", which is not installed in this build.`,
+          "Edit the connection to use one of the installed workforce adapters, or pause it.",
+        );
+      }
+      if (!adapter.configured) {
+        // Name every missing setting at once — a gateway can lack both its
+        // URL and its key — so one restart fixes it.
+        const needed = adapter.missing?.length ? adapter.missing : [adapter.credentialRef ?? "its API key"];
+        const missing = needed.join(" and ");
+        return fail(
+          "agents.managedConnections",
+          `Managed runtime — ${connection.name}`,
+          `${adapter.id} is selected but ${missing} ${needed.length === 1 ? "is" : "are"} not set.`,
+          `Set ${missing} and restart, or pause the connection. Doctor makes no billable test request.`,
+        );
+      }
+      return ok(
+        "agents.managedConnections",
+        `Managed runtime — ${connection.name}`,
+        `${adapter.id} is configured (model ${connection.model ?? adapter.defaultModel}). A request is made only when a run executes.`,
+      );
+    });
+  } catch (error) {
+    return [
+      fail(
+        "agents.managedConnections",
+        "Managed agent runtimes",
+        `Managed connections could not be inspected: ${reason(error)}`,
+        "Check database connectivity.",
+      ),
+    ];
+  }
+}
+
+export async function checkPlugins(): Promise<Check[]> {
+  try {
+    const { installedPlugins, pluginPermissionConsents, pluginPublisherKeys, pluginRegistries } = await import("@/core/plugins/schema");
+    const { pluginScopeHash, validConsentOrigin } = await import("@/core/plugins/permission-policy");
+    const { listPluginExecutions } = await import("@/core/plugins/context");
+    const { hashDirectory, signatureKeyId, verifySignature } = await import("@/core/plugins/integrity");
+    const { registryIndexSchema, verifyRegistryIndex } = await import("@/core/plugins/registry");
+    const rows = await db().select().from(installedPlugins);
+    const keys = await db().select().from(pluginPublisherKeys);
+    const registries = await db().select().from(pluginRegistries);
+    const consents = await db().select().from(pluginPermissionConsents);
+    const activeKey = (id: string | null) => keys.find(key => key.keyId === id && !key.revokedAt);
+    let invalidArtifacts = 0;
+    for (const plugin of rows.filter(row => row.status === "enabled")) {
+      const key = activeKey(plugin.signature ? signatureKeyId(plugin.signature) : null);
+      try {
+        if (!key || !plugin.signature || !verifySignature(plugin.integrity, plugin.signature, key.publicKey)
+          || await hashDirectory(plugin.source) !== plugin.integrity) invalidArtifacts++;
+      } catch { invalidArtifacts++; }
+    }
+    let invalidCatalogs = 0;
+    for (const registry of registries.filter(row => row.fetchedAt !== null)) {
+      const key = activeKey(registry.publisherKeyId);
+      const index = registryIndexSchema.safeParse(registry.cachedIndex);
+      if (!key || !registry.signature || !index.success || !verifyRegistryIndex(index.data, registry.url, registry.signature, key.publicKey)) invalidCatalogs++;
+    }
+    if (invalidArtifacts || invalidCatalogs) {
+      return [{ ...fail("plugins.trust", "Plugin publisher trust",
+        `${invalidArtifacts} enabled artifact(s) and ${invalidCatalogs} cached catalog(s) failed current publisher verification.`,
+        "Disable affected plugins. In Admin → Plugins, verify publisher fingerprints, replace altered artifacts and refresh catalogs with trusted signatures. Revoked keys cannot be restored."),
+        message: { key: "doctor.pluginTrust.failed", params: { artifacts: String(invalidArtifacts), catalogs: String(invalidCatalogs) } } }];
+    }
+    const unreviewed = rows.filter(plugin => plugin.status === "enabled" && !consents.some(consent => consent.name === plugin.name && validConsentOrigin(consent.approvedBy) && !consent.revokedAt && !consent.runtimeDisabledAt && consent.scopeHash === pluginScopeHash(plugin.name, plugin.permissions)));
+    const known = new Set([...rows.map(plugin => plugin.name), ...listPluginExecutions().map(plugin => plugin.name)]);
+    const stopped = consents.filter(consent => consent.runtimeDisabledAt && !consent.revokedAt && known.has(consent.name));
+    if (unreviewed.length || stopped.length) {
+      return [{ ...warn("plugins.permissions", "Plugin permission review",
+        `${unreviewed.length} enabled installation(s) need permission review; ${stopped.length} plugin(s) stopped after a runtime failure.`,
+        "Open Admin → Plugins. Repair affected plugins, review their current permission list, approve it as the verified owner and enable installed artifacts again."),
+        message: { key: "doctor.pluginPermissions.review", params: { unreviewed: String(unreviewed.length), stopped: String(stopped.length) } } }];
+    }
+    const disabled = rows.filter((row) => row.status === "disabled");
+    if (disabled.length === 0) {
+      return [
+        ok(
+          "plugins.installed",
+          "Plugins",
+          rows.length === 0
+            ? "No plugins are installed."
+            : `${rows.length} plugin${rows.length === 1 ? " is" : "s are"} installed.`,
+        ),
+      ];
+    }
+    return [
+      warn(
+        "plugins.disabled",
+        "Plugins",
+        disabled.map((row) => `${row.name}: ${row.disabledReason ?? "disabled"}`).join(" "),
+        "Enable the plugin once the cause is fixed, or uninstall it.",
+      ),
+    ];
+  } catch (error) {
+    return [
+      warn(
+        "plugins.installed",
+        "Plugins",
+        `Could not read installed plugins: ${reason(error)}`,
+        "Apply migrations so the installed_plugins table exists.",
+      ),
+    ];
+  }
+}
+
+function checkPlatformVersion(): Check {
+  if (!PLATFORM_VERSION || PLATFORM_VERSION === "0.0.0") {
+    return fail(
+      "platform.version",
+      "Freeholder version",
+      `This instance reports ${PLATFORM_VERSION || "no version"}, the unset placeholder from before C3.20.`,
+      "Redeploy from a build whose package.json version is the real semver, then confirm GET /api/health returns that version.",
+    );
+  }
+  return ok(
+    "platform.version",
+    "Freeholder version",
+    `This instance is ${PLATFORM_VERSION}.`,
+  );
+}
+
+function checkUpdateRelease(): Check[] {
+  const checks: Check[] = [];
+  if (THIS_RELEASE.version !== PLATFORM_VERSION) {
+    checks.push(
+      fail(
+        "update.release",
+        "Release metadata",
+        `Declared release version ${THIS_RELEASE.version} does not match this instance (${PLATFORM_VERSION}).`,
+        "Keep src/core/update/this-release.ts on the same version as package.json.",
+      ),
+    );
+  } else {
+    const schema =
+      THIS_RELEASE.schemaRisk === "compatible"
+        ? "schema compatible with the previous release"
+        : "schema-breaking, declared as such";
+    const cvss =
+      THIS_RELEASE.cvss === null
+        ? "no CVSS score"
+        : `CVSS ${THIS_RELEASE.cvss} (${THIS_RELEASE.severity})`;
+    const steps =
+      THIS_RELEASE.manualSteps.length === 0
+        ? "no manual steps"
+        : `${THIS_RELEASE.manualSteps.length} manual step${THIS_RELEASE.manualSteps.length === 1 ? "" : "s"}`;
+    checks.push(
+      ok(
+        "update.release",
+        "Release metadata",
+        `${schema}; ${cvss}; ${steps}; can apply from ${THIS_RELEASE.minFromVersion}.`,
+      ),
+    );
+  }
+  checks.push(
+    ok(
+      "update.channel",
+      "Update channel",
+      THIS_RELEASE.channel === "stable"
+        ? "This instance follows the stable channel (patch and minor releases)."
+        : THIS_RELEASE.channel === "security"
+          ? "This instance follows the security channel (security-only patches)."
+          : "This instance follows the edge channel (main).",
+    ),
+  );
+  return checks;
+}
+
+async function checkUpdatePreflight(): Promise<Check> {
+  const { runPreflight } = await import("@/core/update/preflight");
+  try {
+    const report = await runPreflight({});
+    // Doctor has no candidate feed. Keep the unsigned-candidate refusal in
+    // preflight, but report it as an unavailable update rather than a broken site.
+    const failed = report.steps.filter((item) => item.verdict === "fail" && item.id !== "signature");
+    if (failed.length) {
+      return fail(
+        "update.preflight",
+        "Update preflight",
+        failed.map((item) => `${item.id}: ${item.detail}`).join(" "),
+        "Fix the named preflight step before applying an update.",
+      );
+    }
+    return warn(
+      "update.preflight",
+      "Update preflight",
+      "No signed candidate was supplied. Update authorization has not been verified; automatic updates are unavailable.",
+      "Use deploy/update-apply.md to verify a signed image and perform a manual update.",
+    );
+  } catch (error) {
+    return fail(
+      "update.preflight",
+      "Update preflight",
+      `Preflight could not run: ${reason(error)}`,
+      "Check the database connection and try platform.preflightUpdate.",
+    );
+  }
+}
+
+function checkUpdatePolicy(): Check {
+  return warn(
+    "update.policy",
+    "Update policy",
+    "Automatic updates and rollback are unavailable until verified host execution and recoverable backups exist.",
+    "Follow deploy/update-apply.md for manual deployment and recovery.",
+  );
+}
+
+function checkUpdateTarget(): Check {
+  const target = configuredTarget();
+  if (!target) {
+    return warn(
+      "update.target",
+      "Update target",
+      "No deploy recipe is declared. Automatic updates are unavailable; manual deployment needs the correct host recipe.",
+      "Set FREEHOLDER_RECIPE_TARGET to the Tier-1 recipe this instance runs on.",
+    );
+  }
+  const strategy = TARGET_STRATEGY[target];
+  const definition = STRATEGIES[strategy];
+  return ok(
+    "update.target",
+    "Update target",
+    `${target}: ${definition.means} Rollback needs ${definition.rollbackArtifact}, and cutover takes ${definition.cutoverCost}.`,
+  );
+}
+
+function checkForkLane(): Check {
+  const e = env();
+  const configured = Boolean(e.FREEHOLDER_UPSTREAM_REMOTE || e.BUILDER_CODE_REPOSITORY);
+  if (!configured) {
+    return ok(
+      "update.fork",
+      "Fork lane",
+      "This instance updates by image swap. The fork lane is for owners who have modified core and merge upstream instead.",
+    );
+  }
+  if (!e.BUILDER_CODE_REPOSITORY || !e.BUILDER_CODE_TOKEN) {
+    return warn(
+      "update.fork",
+      "Fork lane",
+      "An upstream remote is configured but no repository is connected, so a fork update has nowhere to open a pull request.",
+      "Set BUILDER_CODE_REPOSITORY and BUILDER_CODE_TOKEN, or unset FREEHOLDER_UPSTREAM_REMOTE and update by image.",
+    );
+  }
+  return ok(
+    "update.fork",
+    "Fork lane",
+    `Upstream merges open a pull request in ${e.BUILDER_CODE_REPOSITORY}. The merge is proved in a throwaway worktree and never touches the running tree.`,
+  );
+}
+
+function checkSchemaN1(): Check {
+  return THIS_RELEASE.schemaRisk === "compatible"
+    ? ok(
+        "update.n1",
+        "Schema N-1",
+        "This release declares schemaRisk compatible, so rollback is an image swap.",
+      )
+    : warn(
+        "update.n1",
+        "Schema N-1",
+        "This release declares schemaRisk breaking. Rollback is a restore, not an image swap.",
+        "Expand then contract, or keep schemaRisk: \"breaking\" and do not apply unattended.",
+      );
+}
+
+function checkUpdateCheck(): Check {
+  if (!updateCheckEnabled()) {
+    return ok(
+      "update.check",
+      "Update checks",
+      "Update checks are off. This instance will not learn about security releases unless you watch a mailing list.",
+    );
+  }
+  return ok(
+    "update.check",
+    "Update checks",
+    `Daily update checks are on. They GET ${updateFeedUrl()} and send no instance identifier.`,
+  );
+}
+
+function checkUpdateFeedKey(): Check {
+  const active = activeReleaseKeys();
+  if (active.length === 0) {
+    return fail(
+      "update.feed.key",
+      "Release public key",
+      "This instance has no active release public key, so it cannot verify an update feed.",
+      "Embed a trusted Ed25519 public key in src/core/update/keys.ts.",
+    );
+  }
+  const ids = active.map((key) => key.id).join(", ");
+  return ok(
+    "update.feed.key",
+    "Release public key",
+    `This instance trusts release key ${ids}. A feed not signed by a trusted key is refused.`,
+  );
+}
+
+async function checkUpdateSeams(): Promise<Check[]> {
+  const e = env();
+  const { inspectCoreFiles } = await import("@/core/update/integrity");
+  const instanceConfig = (await import("../../../freeholder.config")).default;
+  const checks: Check[] = [];
+  checks.push(
+    ok(
+      "update.seams.configuration",
+      "Configuration seam",
+      "Instance configuration is loaded separately from replaceable core.",
+    ),
+  );
+  const storage = e.FREEHOLDER_STORAGE ?? instanceConfig.adapters.storage;
+  const { localStorageMode, describeLocalStorage } = await import("@/adapters/storage/local-mode");
+  const mode = storage === "local" ? localStorageMode(e) : undefined;
+  if (mode === "refused") {
+    checks.push(
+      fail(
+        "update.seams.uploads",
+        "Uploads seam",
+        describeLocalStorage(e),
+        "Set LOCAL_STORAGE_ROOT to a persistent absolute directory, or set adapters.storage to s3 or replit.",
+      ),
+    );
+  } else if (mode === "unsafe") {
+    checks.push(
+      warn(
+        "update.seams.uploads",
+        "Uploads seam",
+        describeLocalStorage(e),
+        "Set LOCAL_STORAGE_ROOT to a directory updates keep, or move media to object storage.",
+      ),
+    );
+  } else {
+    checks.push(
+      ok(
+        "update.seams.uploads",
+        "Uploads seam",
+        mode ? describeLocalStorage(e) : `Uploads use ${storage} object storage, not instance disk.`,
+      ),
+    );
+  }
+  const core = await inspectCoreFiles({
+    root: process.cwd(),
+    expectedDigest: e.FREEHOLDER_CORE_DIGEST ?? null,
+    hash: Boolean(e.FREEHOLDER_CORE_DIGEST),
+  });
+  if (core.matches === false) {
+    checks.push(
+      fail(
+        "update.coreFiles",
+        "Core files",
+        "Replaceable core does not match the release digest. Live edits of core files are not supported.",
+        "Move the behaviour into a plugin or configuration, or treat this instance as a fork.",
+      ),
+    );
+  } else if (core.modified.length > 0) {
+    checks.push(
+      warn(
+        "update.coreFiles",
+        "Core files",
+        `${core.modified.length} core file${core.modified.length === 1 ? " was" : "s were"} edited on this instance. Updates will not overwrite them safely.`,
+        "Use a plugin, a configuration change, or the fork lane. Editing core files on a live server is not supported.",
+      ),
+    );
+  } else {
+    checks.push(
+      ok(
+        "update.coreFiles",
+        "Core files",
+        core.expected
+          ? "Replaceable core matches the release digest."
+          : "No live core-file edits detected.",
+      ),
+    );
+  }
+  return checks;
+}
+
+/**
+ * Run every check.
+ *
+ * Sequential rather than parallel on purpose: the output reads as a list
+ * somebody works down, and one adapter's timeout should not interleave its
+ * error with another's.
+ */
+/**
+ * Postgres's own reading of the business's zone (§4.9). The offset is the
+ * difference between the local and the UTC wall reading of the same instant,
+ * so it does not depend on the session's TimeZone either.
+ */
+async function checkZoneData(): Promise<Check[]> {
+  if (!env().DATABASE_URL) return [];
+  try {
+    const { businessProfile } = await import("@/core/settings/schema");
+    const [business] = await db()
+      .select({ timezone: businessProfile.timezone })
+      .from(businessProfile)
+      .limit(1);
+    const timezone = business?.timezone ?? "UTC";
+    if (timezone === "UTC") return [];
+    const { checkTimezoneData, unknownZoneCheck } = await import("./timezone");
+    if (!isTimezone(timezone)) return [unknownZoneCheck(timezone)];
+    return [
+      await checkTimezoneData(timezone, {
+        async offsets(instants, zone) {
+          const rows = await db().execute<{ minutes: number }>(sql`
+            select (extract(epoch from (probe.at at time zone ${zone}) - (probe.at at time zone 'UTC')) / 60)::int as minutes
+            from unnest(${`{${instants.map((each) => each.toISOString()).join(",")}}`}::timestamptz[])
+              with ordinality as probe(at, n)
+            order by probe.n
+          `);
+          return rows.map((each) => Number(each.minutes));
+        },
+        async version() {
+          const [row] = await db().execute<{ version: string }>(
+            sql`select current_setting('server_version') as version`,
+          );
+          return row?.version ?? "unknown";
+        },
+      }),
+    ];
+  } catch {
+    // No business yet, or the table is not there: nothing to compare.
+    return [];
+  }
+}
+
+export async function runDoctor(): Promise<DoctorReport> {
+  const checks: Check[] = [
+    ...(await checkEnvironment()),
+    ...(await checkDatabase()),
+    ...(await checkZoneData()),
+    await checkStorage(),
+    await checkMalwareScanner(),
+    await checkAltTextSuggester(),
+    ...(await checkMail()),
+    ...(await checkProviderGrants()),
+    await checkPayments(),
+    ...(await checkNotificationChannels()),
+    await checkJobs(),
+    ...(await checkCredentialKey()),
+    ...(await checkSecurity()),
+    ...(await checkPlugins()),
+    ...(await checkManagedAgentConnections()),
+    checkPlatformVersion(),
+    ...checkUpdateRelease(),
+    checkUpdateFeedKey(),
+    checkUpdatePolicy(),
+    checkUpdateTarget(),
+    checkForkLane(),
+    checkSchemaN1(),
+    checkUpdateCheck(),
+    await checkUpdatePreflight(),
+    ...(await checkUpdateSeams()),
+  ];
+
+  const verdict: Verdict = checks.some((check) => check.verdict === "fail")
+    ? "fail"
+    : checks.some((check) => check.verdict === "warn")
+      ? "warn"
+      : "ok";
+
+  return { verdict, checks, ranAt: new Date().toISOString() };
+}
+
+/** The report as somebody would want to read it in a terminal. */
+export function formatReport(report: DoctorReport): string {
+  const mark = { ok: "  ok  ", warn: " warn ", fail: " FAIL " } as const;
+  const lines = report.checks.map((check) => {
+    const head = `${mark[check.verdict]} ${check.title}: ${check.detail}`;
+    return check.remedy ? `${head}\n         → ${check.remedy}` : head;
+  });
+  const summary =
+    report.verdict === "ok"
+      ? "Everything doctor can check is working."
+      : report.verdict === "warn"
+        ? "Working, with things worth knowing about."
+        : "Something is broken. The failures above will stop this instance doing its job.";
+  return [...lines, "", summary].join("\n");
+}

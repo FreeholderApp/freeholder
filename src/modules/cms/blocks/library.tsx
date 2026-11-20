@@ -1,0 +1,1359 @@
+// Copyright (C) 2026 Tony Aly
+// SPDX-License-Identifier: Apache-2.0
+// The v1 block vocabulary (MASTER.md §32).
+//
+// §32 lists a longer palette than this. The blocks missing here are the ones
+// that need a module that does not exist yet — image and gallery need
+// core/media, product and booking need catalog and booking, tip and paywall
+// need the money path. Each arrives with its module rather than as a stub that
+// renders an apology, because a palette advertising blocks that do not work is
+// worse than a short palette.
+//
+// Every block below renders *owner content*, never platform copy, which is why
+// there are no catalog lookups in the markup: the words on a public page come
+// from the database. The one exception is a fallback for an empty nav, and it
+// goes through `t` like everything else.
+import { Fragment } from "react";
+import { z } from "zod";
+import { renderNAP } from "@/core/locations/nap";
+import { formatMoney } from "@/core/i18n";
+import type { Actor } from "@/core/service";
+import { languageName, localePath } from "@/core/i18n/customer";
+import { cx } from "@/ui/primitives";
+import {
+  effectiveFocal,
+  focalCoordinate,
+  imageAspectSchema,
+  imageCropSchema,
+  imageFraming,
+} from "@/core/media/framing";
+import { navigationLinksSchema } from "../navigation-schema";
+import { navigationTree, type NavigationNode } from "../navigation-tree";
+import { defineBlock } from "./types";
+import { fromPlainString, richBodySchema } from "./rich";
+import { renderRichDoc } from "./rich-render";
+import { sanitizeOwnerHtml } from "./html";
+import { selectAssignedVariants } from "../experiments";
+import { AddToCart, addToCartLabels } from "../../../../app/(public)/buy/AddToCart";
+import { CollectionGrid } from "../../../../app/(public)/c/[slug]/CollectionGrid";
+
+/* ------------------------------------------------------------------ text */
+
+/** C3.22: retain a source document's addressable fragment without raw markup. */
+export const anchor = defineBlock({
+  type: "anchor",
+  labelKey: "cms.block.anchor",
+  contexts: ["page"],
+  schema: z.object({ target: z.string().min(1).max(200).regex(/^[^\s\x00-\x1f\x7f]+$/).refine(value => value !== "main-content", "That target is reserved for the page's main content.") }),
+  starter: () => ({ target: `section-${crypto.randomUUID().slice(0, 8)}` }),
+  render: ({ props }) => <span id={props.target} className="block scroll-mt-6" aria-hidden="true" />,
+});
+
+export const heading = defineBlock({
+  type: "heading",
+  labelKey: "cms.block.heading",
+  contexts: ["page", "chrome", "email"],
+  schema: z.object({
+    text: z.string().min(1),
+    // The editor enforces one H1 per page (§32: "the drag-and-drop layer
+    // can't produce pages that fail the SEO gate"), which is why the level is
+    // a constrained choice rather than free text.
+    level: z.union([z.literal(1), z.literal(2), z.literal(3), z.literal(4)]).default(2),
+    align: z.enum(["start", "center"]).default("start"),
+  }),
+  starter: () => ({ text: "A new heading", level: 2 as const }),
+  render: ({ props, ctx }) => {
+    const Tag = `h${props.level}` as const;
+    const size = {
+      1: "text-4xl sm:text-5xl font-bold tracking-tight text-balance",
+      2: "text-2xl sm:text-3xl font-bold tracking-tight text-balance",
+      3: "text-xl font-semibold tracking-tight",
+      4: "text-base font-semibold",
+    }[props.level];
+    return (
+      <Tag
+        {...ctx.editable?.("text")}
+        className={cx(size, props.align === "center" && "text-center")}
+      >
+        {props.text}
+      </Tag>
+    );
+  },
+});
+
+export const text = defineBlock({
+  type: "text",
+  labelKey: "cms.block.text",
+  contexts: ["page", "chrome", "email"],
+  schema: z.object({
+    // Typed rich text (C2.05). A leftover plain string still writes, and is
+    // coerced to paragraphs. HTML soup is refused — the html block is the
+    // escape hatch, and it is deliberately a different type.
+    body: richBodySchema,
+    align: z.enum(["start", "center"]).default("start"),
+    measure: z.boolean().default(true),
+  }),
+  starter: () => ({ body: fromPlainString("Write something here.") }),
+  fieldHints: { body: { control: "rich" } },
+  render: ({ props, ctx }) => (
+    // The whole body is one rich region on the canvas: the caret flows across
+    // paragraphs and lists exactly where the owner reads them.
+    <div
+      {...ctx.editableRich?.("body")}
+      className={cx(
+        "grid gap-4 text-ink-muted",
+        props.measure && "max-w-prose",
+        props.align === "center" && "text-center justify-items-center",
+      )}
+    >
+      {renderRichDoc(props.body)}
+    </div>
+  ),
+});
+
+/* --------------------------------------------------------------- actions */
+
+export const button = defineBlock({
+  type: "button",
+  labelKey: "cms.block.button",
+  contexts: ["page", "chrome", "email"],
+  schema: z.object({
+    label: z.string().min(1),
+    href: z.string().min(1),
+    variant: z.enum(["solid", "quiet"]).default("solid"),
+  }),
+  starter: () => ({ label: "Get in touch", href: "/contact" }),
+  render: ({ props, ctx }) => (
+    <a
+      href={ctx.localizeHref?.(props.href) ?? props.href}
+      {...ctx.editable?.("label")}
+      className={cx(
+        "inline-flex items-center gap-2 rounded-md px-4 py-2 text-sm font-semibold",
+        props.variant === "solid"
+          ? "bg-accent text-on-accent shadow-press"
+          : "border border-rule text-ink",
+      )}
+    >
+      {props.label}
+    </a>
+  ),
+});
+
+/**
+ * A phone line deserves more than a small generic button in site chrome.
+ *
+ * The number is stored twice on purpose: `phone` is the machine-safe E.164
+ * destination and `displayPhone` is the human typography the owner chooses.
+ * Keeping those jobs separate prevents punctuation from breaking a `tel:` URL
+ * and prevents the editor from forcing every country into one visual format.
+ */
+export const callCta = defineBlock({
+  type: "callCta",
+  labelKey: "cms.block.callCta",
+  contexts: ["page", "chrome"],
+  schema: z.object({
+    eyebrow: z.string().min(1),
+    label: z.string().min(1),
+    phone: z.string().regex(/^\+[1-9]\d{7,14}$/, "Use an E.164 phone number, such as +15551234567."),
+    displayPhone: z.string().min(1),
+    supportText: z.string().min(1),
+  }),
+  starter: () => ({
+    eyebrow: "Direct line",
+    label: "Call now",
+    phone: "+15551234567",
+    displayPhone: "+1 (555) 123-4567",
+    supportText: "Tap to speak with us.",
+  }),
+  render: ({ props, ctx }) => (
+    <a
+      href={`tel:${props.phone}`}
+      aria-label={`${props.label}: ${props.displayPhone}`}
+      className={cx(
+        "group mb-4 grid w-full gap-3 rounded-xl border border-accent bg-accent px-5 py-4",
+        "text-on-accent shadow-raised",
+        "transition-transform hover:-translate-y-0.5 sm:grid-cols-[1fr_auto] sm:items-center sm:px-6",
+      )}
+    >
+      <span className="grid gap-0.5">
+        <span
+          {...ctx.editable?.("eyebrow")}
+          className="font-mono text-[0.68rem] font-bold uppercase tracking-[0.18em] opacity-80"
+        >
+          {props.eyebrow}
+        </span>
+        <span {...ctx.editable?.("label")} className="text-lg font-bold tracking-tight">
+          {props.label}
+        </span>
+        <span {...ctx.editable?.("supportText")} className="text-sm opacity-[0.85]">
+          {props.supportText}
+        </span>
+      </span>
+      <span
+        {...ctx.editable?.("displayPhone")}
+        className="font-mono text-2xl font-bold tracking-[-0.04em] sm:text-3xl"
+      >
+        {props.displayPhone}
+      </span>
+    </a>
+  ),
+});
+
+/* ----------------------------------------------------------------- layout */
+
+/**
+ * A responsive chrome row (C2.11).
+ *
+ * Header items stack on a narrow screen and sit on one line from `sm` up,
+ * so brand, locales and any extras stay reachable without a three-column
+ * grid that collapses into an unreadable pile.
+ */
+export const chromeBar = defineBlock({
+  type: "chromeBar",
+  labelKey: "cms.block.chromeBar",
+  contexts: ["chrome"],
+  container: true,
+  schema: z.object({
+    align: z.enum(["start", "between"]).default("between"),
+  }),
+  starter: () => ({ align: "between" as const }),
+  render: ({ props, children }) => (
+    <div
+      className={cx(
+        "flex flex-col gap-3 sm:flex-row sm:items-center",
+        props.align === "between" ? "sm:justify-between" : "sm:justify-start sm:gap-6",
+      )}
+    >
+      {children}
+    </div>
+  ),
+});
+
+/**
+ * Site-wide announcement bar (C2.11). Empty text renders nothing.
+ */
+export const announcement = defineBlock({
+  type: "announcement",
+  labelKey: "cms.block.announcement",
+  contexts: ["chrome"],
+  schema: z.object({
+    text: z.string().max(240).default(""),
+    href: z.string().max(2048).optional(),
+  }),
+  starter: () => ({ text: "" }),
+  render: ({ props, ctx }) => {
+    const text = props.text.trim();
+    if (!text) return null;
+    const body = props.href ? (
+      <a
+        href={ctx.localizeHref?.(props.href) ?? props.href}
+        className="font-semibold underline decoration-current underline-offset-2"
+      >
+        {text}
+      </a>
+    ) : (
+      <span>{text}</span>
+    );
+    return <p className="text-center text-sm">{body}</p>;
+  },
+});
+
+export const columns = defineBlock({
+  type: "columns",
+  labelKey: "cms.block.columns",
+  contexts: ["page", "chrome"],
+  container: true,
+  schema: z.object({
+    count: z.union([z.literal(2), z.literal(3)]).default(2),
+    gap: z.enum(["tight", "normal", "loose"]).default("normal"),
+  }),
+  starter: () => ({ count: 2 as const }),
+  render: ({ props, children }) => (
+    <div
+      className={cx(
+        "grid",
+        props.count === 2 ? "sm:grid-cols-2" : "sm:grid-cols-3",
+        { tight: "gap-4", normal: "gap-8", loose: "gap-12" }[props.gap],
+      )}
+    >
+      {children}
+    </div>
+  ),
+});
+
+export const divider = defineBlock({
+  type: "divider",
+  labelKey: "cms.block.divider",
+  contexts: ["page", "chrome", "email"],
+  schema: z.object({}),
+  starter: () => ({}),
+  render: () => <hr className="border-0 border-t border-rule" />,
+});
+
+export const spacer = defineBlock({
+  type: "spacer",
+  labelKey: "cms.block.spacer",
+  contexts: ["page", "email"],
+  schema: z.object({ size: z.enum(["s", "m", "l"]).default("m") }),
+  starter: () => ({ size: "m" as const }),
+  render: ({ props }) => (
+    <div
+      aria-hidden="true"
+      className={{ s: "h-4", m: "h-10", l: "h-20" }[props.size]}
+    />
+  ),
+});
+
+/* -------------------------------------------------------------------- SEO */
+
+/**
+ * FAQ is a first-class block because §5 says so: "content blocks encourage
+ * direct-answer patterns (FAQ blocks are first-class in the CMS)". It is the
+ * clearest example of the block contract earning its keep — the block emits
+ * its own FAQPage JSON-LD, so structured data is a property of what the owner
+ * dragged onto the page rather than something the SEO module has to infer.
+ */
+export const faq = defineBlock({
+  type: "faq",
+  labelKey: "cms.block.faq",
+  contexts: ["page"],
+  schema: z.object({
+    items: z
+      .array(z.object({ question: z.string().min(1), answer: z.string().min(1) }))
+      .min(1),
+  }),
+  starter: () => ({
+    items: [{ question: "A question people ask", answer: "The answer." }],
+  }),
+  render: ({ props, ctx }) => (
+    <dl className="grid gap-0 border-t border-rule">
+      {props.items.map((item, i) => (
+        <div key={i} className="border-b border-rule py-4">
+          {/* Each question and answer is its own typeable surface; the dotted
+              path is how the canvas edit is written back into the items array. */}
+          <dt {...ctx.editable?.(`items.${i}.question`)} className="font-semibold text-ink">
+            {item.question}
+          </dt>
+          <dd {...ctx.editable?.(`items.${i}.answer`)} className="mt-1.5 max-w-prose text-ink-muted">
+            {item.answer}
+          </dd>
+        </div>
+      ))}
+    </dl>
+  ),
+  jsonLd: (props) => ({
+    "@context": "https://schema.org",
+    "@type": "FAQPage",
+    mainEntity: props.items.map((item) => ({
+      "@type": "Question",
+      name: item.question,
+      acceptedAnswer: { "@type": "Answer", text: item.answer },
+    })),
+  }),
+});
+
+/* ----------------------------------------------------------------- chrome */
+
+/**
+ * A language switcher (§4.9).
+ *
+ * Added because the SEO gate caught its absence: the French home page was in
+ * the sitemap and no page linked to it, which is an orphan — a URL a crawler
+ * is told about and a person cannot reach. Every bilingual site needs this, so
+ * it belongs in the vocabulary rather than in one owner's footer markup.
+ *
+ * Renders nothing on a single-locale instance, which is most of them.
+ */
+export const locales = defineBlock({
+  type: "locales",
+  labelKey: "cms.block.locales",
+  contexts: ["chrome"],
+  schema: z.object({
+    separator: z.string().max(4).default("·"),
+  }),
+  starter: () => ({}),
+  render: ({ props, ctx }) => {
+    const enabled = ctx.business?.enabledLocales ?? [];
+    const fallback = ctx.business?.defaultLocale;
+    if (enabled.length < 2 || !fallback) return null;
+
+    return (
+      <nav aria-label={ctx.t("cms.nav.locales")} className="flex items-center gap-2">
+        {enabled.map((locale, index) => {
+          // The same page in each language, not everybody's home page: a
+          // visitor switching on an article wants that article.
+          const href = localePath(ctx.path, locale, fallback);
+          const current = ctx.locale === locale;
+          return (
+            <span key={locale} className="flex items-center gap-2">
+              {index > 0 ? (
+                <span aria-hidden="true" className="text-ink-muted">
+                  {props.separator}
+                </span>
+              ) : null}
+              <a
+                href={href}
+                hrefLang={locale}
+                lang={locale}
+                aria-current={current ? "true" : undefined}
+                className={cx(
+                  "text-xs",
+                  current ? "font-semibold text-ink" : "text-ink-muted",
+                )}
+              >
+                {/* The language's own name, not the reader's: somebody looking
+                    for French is looking for the word "Français". */}
+                {languageName(locale)}
+              </a>
+            </span>
+          );
+        })}
+      </nav>
+    );
+  },
+});
+
+/**
+ * The business's name, live from settings. §4.10's discipline applied to
+ * branding: rendered from one source so it cannot drift between the header,
+ * the footer and the page that hardcoded it.
+ */
+export const brand = defineBlock({
+  type: "brand",
+  labelKey: "cms.block.brand",
+  contexts: ["chrome"],
+  schema: z.object({
+    href: z.string().default("/"),
+    showTagline: z.boolean().default(false),
+  }),
+  starter: () => ({}),
+  resolve: async () => {
+    const { getDesign } = await import("@/core/design/service");
+    const design = await getDesign.call({}, { kind: "anonymous" });
+    if (!design.logoAssetId) return null;
+    const { resolveImage } = await import("@/core/media/service");
+    return resolveImage.call({ id: design.logoAssetId }, { kind: "anonymous" });
+  },
+  render: ({ props, resolved, ctx }) => (
+    <a href={ctx.localizeHref?.(props.href) ?? props.href} className="grid gap-0.5">
+      {resolved ? (
+        <img
+          src={resolved.src}
+          alt={resolved.altText ?? ctx.business?.name ?? ctx.t("common.appName")}
+          width={resolved.width ?? undefined}
+          height={resolved.height ?? undefined}
+          className="h-8 w-auto"
+        />
+      ) : (
+        <span className="text-sm font-semibold text-ink">
+          {ctx.business?.name ?? ctx.t("common.appName")}
+        </span>
+      )}
+      {props.showTagline && ctx.business?.tagline ? (
+        <span className="text-xs text-ink-muted">{ctx.business.tagline}</span>
+      ) : null}
+    </a>
+  ),
+});
+
+/**
+ * Navigation as rows, not JSX (§32). The links are stored on the block, so
+ * reordering the menu is a database write — which is the whole thesis of this
+ * module expressed in the smallest possible component.
+ */
+export const nav = defineBlock({
+  type: "nav",
+  labelKey: "cms.block.nav",
+  contexts: ["chrome"],
+  schema: z.object({
+    links: navigationLinksSchema.default([]),
+    ariaLabelKey: z.string().default("cms.nav.primary"),
+    /**
+     * Collapse behind a "Menu" disclosure on small screens.
+     *
+     * Right for the header, wrong for a footer: a footer nav collapsed to
+     * a disclosure hides its links from every phone visitor, which is most
+     * of them. Reported by a third party whose footer links were invisible
+     * on mobile. Defaults true so the header is unchanged.
+     */
+    collapseOnMobile: z.boolean().default(true),
+  }),
+  starter: () => ({ links: [{ label: "About", href: "/about" }] }),
+  // The screen-reader name for the menu is platform machinery, not copy the
+  // owner writes — it is a catalog key, and showing it would invite someone to
+  // type a sentence into a field that expects an identifier.
+  fieldHints: { ariaLabelKey: { hidden: true }, links: { items: { id: { hidden: true } } } },
+  render: ({ props, ctx }) => {
+    if (props.links.length === 0) return null;
+    const tree = navigationTree(props.links);
+    const linkItems = (nodes: NavigationNode[], suffix: string): React.ReactNode => nodes.map((node, index) => {
+      const link = node.link;
+      const current = link.href === ctx.path || (link.href !== "/" && ctx.path.startsWith(`${link.href}/`));
+      return <li key={`${suffix}-${link.id ?? link.href}-${index}`} className="min-w-0">
+        <a href={ctx.localizeHref?.(link.href) ?? link.href} aria-current={link.href === ctx.path ? "page" : undefined} className={cx("break-words text-sm", current ? "font-semibold text-ink" : "text-ink-muted")}>{link.label}</a>
+        {node.children.length ? <ul className="ms-3 mt-1 grid min-w-0 list-none gap-1 border-s border-rule ps-3">{linkItems(node.children, `${suffix}-${index}`)}</ul> : null}
+      </li>;
+    });
+    return (
+      <nav aria-label={ctx.t(props.ariaLabelKey)} className="min-w-0 max-w-full">
+        {props.collapseOnMobile ? (
+          <details className="sm:hidden">
+            <summary className="cursor-pointer text-sm font-semibold text-ink">
+              {ctx.t("cms.nav.menu")}
+            </summary>
+            <ul className="mt-2 grid list-none gap-2 p-0">{linkItems(tree, "mobile")}</ul>
+          </details>
+        ) : (
+          <ul className="grid list-none gap-2 p-0 sm:hidden">{linkItems(tree, "mobile")}</ul>
+        )}
+        <ul className="hidden min-w-0 list-none flex-wrap items-start gap-x-5 gap-y-1 p-0 sm:flex">
+          {linkItems(tree, "desktop")}
+        </ul>
+      </nav>
+    );
+  },
+});
+
+/* ------------------------------------------------------------------ media */
+
+/**
+ * An image from the asset library (MASTER.md §32 block list, §36, §5).
+ *
+ * The first block with a `resolve` step, and the reason that hook exists: what
+ * this renders is not in the block's props. The props name an asset; the URLs,
+ * the renditions and the intrinsic size come from core/media at render time,
+ * so replacing a file updates every page that shows it without touching a
+ * single block tree.
+ *
+ * The markup is the §36 checklist made concrete: `<picture>` with AVIF then
+ * WebP then the original, `srcset` so the browser picks a width, `loading` and
+ * `decoding` set for lazy rendering, and intrinsic `width`/`height` so the
+ * page reserves space and does not reflow when the image lands.
+ *
+ * Alt text lives on the *asset*, not the block: it describes the image, and
+ * copying it onto every block that uses the picture is how it drifts. §5
+ * requires it on public images, so a missing one is a visible gap in the media
+ * library rather than something a page can quietly omit.
+ *
+ * Crop and focal point (C2.25, `core/media/framing`): the asset carries the
+ * subject's focal point; this placement may override it, choose a frame shape
+ * (`aspect`) that crops by `object-fit: cover` around that point, or set an
+ * explicit `crop` rectangle. All three are placement props on the block — the
+ * file and its renditions are never re-encoded — and the same pure framing
+ * function draws the public page, the canvas and the crop tool's preview.
+ */
+export const image = defineBlock({
+  type: "image",
+  labelKey: "cms.block.image",
+  contexts: ["page", "chrome", "email"],
+  schema: z.object({
+    assetId: z.string().uuid().optional(),
+    /** Overrides the asset's own description where the context needs it to. */
+    alt: z.string().optional(),
+    /** Empty alt is a decision, not a missing description (C2.20). */
+    decorative: z.boolean().default(false),
+    width: z.enum(["column", "wide", "full"]).default("column"),
+    rounded: z.boolean().default(true),
+    /** Frame shape; anything but `original` crops around the focal point. */
+    aspect: imageAspectSchema.default("original"),
+    /** This placement's focal point, basis points; else the asset's own. */
+    focalX: focalCoordinate.optional(),
+    focalY: focalCoordinate.optional(),
+    /** An explicit crop window in basis points of the original. */
+    crop: imageCropSchema.optional(),
+  }),
+  starter: () => ({}),
+  // Crop and focal point are set on the canvas, where the picture is — the
+  // form has no honest control for a rectangle on an image.
+  fieldHints: {
+    assetId: { control: "asset" },
+    focalX: { hidden: true },
+    focalY: { hidden: true },
+    crop: { hidden: true },
+  },
+  // Imported lazily so the block library does not drag core/media into every
+  // bundle that only needs a heading.
+  resolve: async (props) => {
+    if (!props.assetId) return null;
+    const { resolveImage } = await import("@/core/media/service");
+    return resolveImage.call({ id: props.assetId }, { kind: "anonymous" });
+  },
+  render: ({ props, resolved, ctx }) => {
+    const alt = props.decorative ? "" : (props.alt ?? resolved?.altText ?? "");
+    const framing = resolved
+      ? imageFraming({
+          width: resolved.width,
+          height: resolved.height,
+          crop: props.crop,
+          aspect: props.aspect,
+          focal: effectiveFocal(props, resolved),
+        })
+      : undefined;
+    const framed = framing !== undefined && framing.mode !== "natural";
+    const stretch = props.width === "wide" || props.width === "full";
+    const pictureEl = resolved ? (
+      <picture>
+        {resolved.sources.map((source) => (
+          <source key={source.format} srcSet={source.srcset} type={source.type} />
+        ))}
+        <img
+          src={resolved.src}
+          alt={alt}
+          width={resolved.width ?? undefined}
+          height={resolved.height ?? undefined}
+          loading="lazy"
+          decoding="async"
+          data-framing={framed ? framing.mode : undefined}
+          style={framed ? framing.image : undefined}
+          className={cx(
+            framed ? undefined : "h-auto max-w-full",
+            !framed && props.rounded && "rounded-lg",
+            !framed && stretch && "w-full",
+          )}
+        />
+      </picture>
+    ) : null;
+    // A framed placement is a window onto the ordinary picture: the frame
+    // takes the shape, clips, and carries the rounding.
+    const picture =
+      pictureEl && framed ? (
+        <div
+          className={cx("fh-frame", props.rounded && "rounded-lg")}
+          style={{ ...framing.frame, ...(stretch ? { width: "100%" } : {}) }}
+        >
+          {pictureEl}
+        </div>
+      ) : (
+        pictureEl
+      );
+    // The public surface renders exactly the picture (nothing at all when no
+    // asset is chosen). The canvas instead wraps it so the picture can be
+    // replaced where it renders: an empty block shows a placeholder rather
+    // than being invisible, and a button raises the picker.
+    if (!ctx.identifyBlocks) return picture;
+    return (
+      <div className="fh-asset" data-asset-prop="assetId" data-asset-current={props.assetId ?? ""}>
+        <div className="fh-asset-body">
+          {picture ?? <span className="fh-asset-empty">{ctx.t("cms.editor.noImage")}</span>}
+        </div>
+        <button type="button" className="fh-replace" data-replace-asset="assetId">
+          {ctx.t("cms.editor.replaceImage")}
+        </button>
+        <button type="button" className="fh-alt" data-edit-alt="alt">
+          {ctx.t("cms.editor.editAlt")}
+        </button>
+        {props.assetId ? (
+          <button type="button" className="fh-crop" data-edit-crop="crop">
+            {ctx.t("cms.editor.editCrop")}
+          </button>
+        ) : null}
+      </div>
+    );
+  },
+});
+
+/**
+ * A video from the asset library (C2.07).
+ *
+ * Same resolve pattern as image: the block names an asset, core/media
+ * supplies the URL and intrinsic size, and the page reserves space so the
+ * player cannot shove the layout when it loads.
+ */
+export const video = defineBlock({
+  type: "video",
+  labelKey: "cms.block.video",
+  contexts: ["page", "chrome"],
+  schema: z.object({
+    assetId: z.string().uuid().optional(),
+    caption: z.string().max(200).optional(),
+    width: z.enum(["column", "wide", "full"]).default("column"),
+  }),
+  starter: () => ({}),
+  fieldHints: { assetId: { control: "asset", assetKind: "video" } },
+  resolve: async (props) => {
+    if (!props.assetId) return null;
+    const { resolveAsset } = await import("@/core/media/service");
+    const asset = await resolveAsset.call({ id: props.assetId }, { kind: "anonymous" });
+    if (!asset || asset.kind !== "video") return null;
+    return asset;
+  },
+  render: ({ props, resolved, ctx }) => {
+    if (!resolved) return null;
+    return (
+      <figure className={cx(props.width !== "column" && "w-full")}>
+        <video
+          controls
+          preload="metadata"
+          src={resolved.src}
+          width={resolved.width ?? undefined}
+          height={resolved.height ?? undefined}
+          className="h-auto max-w-full"
+        >
+          {resolved.filename}
+        </video>
+        {props.caption ? (
+          <figcaption {...ctx.editable?.("caption")} className="mt-2 text-sm text-ink-muted">
+            {props.caption}
+          </figcaption>
+        ) : null}
+      </figure>
+    );
+  },
+});
+
+/** C3.22: imported documents and audio keep a typed, revocable asset reference. */
+export const file = defineBlock({
+  type: "file",
+  labelKey: "cms.block.file",
+  contexts: ["page", "chrome"],
+  schema: z.object({ assetId: z.string().uuid().optional(), label: z.string().max(200).optional() }),
+  starter: () => ({}),
+  fieldHints: { assetId: { control: "asset" } },
+  resolve: async (props) => {
+    if (!props.assetId) return null;
+    const { authorizeAssetDownload, resolveAsset } = await import("@/core/media/service");
+    const asset = await resolveAsset.call({ id: props.assetId }, { kind: "anonymous" });
+    if (asset) return asset;
+    const download = await authorizeAssetDownload.call({ id: props.assetId }, { kind: "anonymous" });
+    return download ? { kind: "doc" as const, filename: download.filename, src: `/media/download/${props.assetId}` } : null;
+  },
+  render: ({ props, resolved }) => {
+    if (!resolved) return null;
+    const label = props.label || resolved.filename;
+    return <div className="grid min-w-0 gap-2">
+      {resolved.kind === "audio" ? <audio controls preload="metadata" src={resolved.src} aria-label={label} className="w-full max-w-full" /> : null}
+      <a href={resolved.src} className="break-words underline" download={resolved.kind === "doc" || undefined}>{label}</a>
+    </div>;
+  },
+});
+
+/**
+ * Admin-only custom HTML (C2.07).
+ *
+ * Deliberately a textarea, not the rich-text editor. Ordinary copy belongs
+ * in typed nodes. This is the escape hatch §32 keeps "scoped and
+ * inconvenient", and the renderer strips script before it ever reaches
+ * the page.
+ */
+export const html = defineBlock({
+  type: "html",
+  labelKey: "cms.block.html",
+  contexts: ["page"],
+  schema: z.object({
+    markup: z.string().min(1).max(20_000),
+  }),
+  starter: () => ({ markup: "<p></p>" }),
+  fieldHints: { markup: { control: "multiline" } },
+  render: ({ props }) => (
+    <div
+      className="max-w-prose text-ink-muted"
+      dangerouslySetInnerHTML={{ __html: sanitizeOwnerHtml(props.markup) }}
+    />
+  ),
+});
+
+/* -------------------------------------------------------------- locations */
+
+/**
+ * The business's address, phone and hours (MASTER.md §4.10).
+ *
+ * The block owns *what to show*; it owns nothing about *how the address
+ * reads*. Every string it renders comes from `renderNAP`, which is §4.10's
+ * exact-match rule made structural: this block, the contact page and the
+ * JSON-LD builder all call one formatter, so the address a visitor copies
+ * into a search box is character-for-character the one a crawler compares
+ * against a directory listing.
+ *
+ * Renders nothing at all when there is no location — §4.10: "a purely online
+ * creator skips this and no empty local scaffolding appears". Not a message
+ * saying an address has not been set: that is scaffolding, and it would be
+ * on the live site for every business that never intends to have one.
+ */
+export const nap = defineBlock({
+  type: "nap",
+  labelKey: "cms.block.nap",
+  // Available in chrome as well as pages, because the footer is where a NAP
+  // most often lives and the footer is chrome.
+  contexts: ["page", "chrome"],
+  schema: z.object({
+    /** Empty means the primary location — the usual case, and the default. */
+    locationId: z.string().nullish(),
+    showAddress: z.boolean().default(true),
+    showPhone: z.boolean().default(true),
+    showEmail: z.boolean().default(false),
+    showHours: z.boolean().default(false),
+    /**
+     * §4.10's go-to-customer case: the business has an address on file for
+     * tax and shipping, and does not want visitors arriving at it.
+     */
+    hideStreetAddress: z.boolean().default(false),
+  }),
+  starter: () => ({}),
+  fieldHints: { locationId: { hidden: true } },
+  resolve: async (props) => {
+    const { getLocation, primaryLocation } = await import(
+      "@/core/locations/service"
+    );
+    const anonymous = { kind: "anonymous" } as const;
+    if (props.locationId) {
+      return getLocation.call({ id: props.locationId }, anonymous);
+    }
+    const primary = await primaryLocation.call({}, anonymous);
+    if (!primary) return null;
+    return getLocation.call({ id: primary.id }, anonymous);
+  },
+  render: ({ props, ctx, resolved }) => {
+    if (!resolved) return null;
+
+    const nap = renderNAP(resolved, { hideAddress: props.hideStreetAddress });
+    const weekly = props.showHours
+      ? resolved.hours
+          .filter((row) => row.weekday !== null)
+          .sort((a, b) => (a.weekday ?? 0) - (b.weekday ?? 0))
+      : [];
+
+    // schema.org's own vocabulary is emitted elsewhere; what a visitor reads
+    // is a real address element, which is the semantic tag for exactly this.
+    return (
+      <address className="grid gap-1.5 not-italic text-sm text-ink-muted">
+        <span className="font-semibold text-ink">{nap.name}</span>
+        {props.showAddress && nap.addressLines.length > 0 ? (
+          <span className="grid">
+            {nap.addressLines.map((line) => (
+              <span key={line}>{line}</span>
+            ))}
+          </span>
+        ) : null}
+        {props.showPhone && nap.phone ? (
+          <a href={nap.phoneHref ?? undefined} className="text-ink-muted">
+            {nap.phone}
+          </a>
+        ) : null}
+        {props.showEmail && nap.email ? (
+          <a href={`mailto:${nap.email}`} className="text-ink-muted">
+            {nap.email}
+          </a>
+        ) : null}
+        {weekly.length > 0 ? (
+          <dl className="mt-1 grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5">
+            {weekly.map((row) => (
+              <Fragment key={row.id}>
+                <dt>{weekdayName(row.weekday!, ctx.locale)}</dt>
+                <dd>
+                  {row.closed
+                    ? ctx.t("cms.nap.closed")
+                    : `${row.opens?.slice(0, 5)}–${row.closes?.slice(0, 5)}`}
+                </dd>
+              </Fragment>
+            ))}
+          </dl>
+        ) : null}
+      </address>
+    );
+  },
+});
+
+/**
+ * The day's name in the visitor's language.
+ *
+ * `Intl` rather than seven catalog keys: the platform would be restating what
+ * every runtime already knows, and getting it wrong for the first locale
+ * somebody adds without translating. 2024-01-07 was a Sunday, which makes the
+ * arithmetic below index 0 = Sunday, matching the column.
+ */
+function weekdayName(weekday: number, locale: string): string {
+  const date = new Date(Date.UTC(2024, 0, 7 + weekday));
+  return new Intl.DateTimeFormat(locale, {
+    weekday: "long",
+    timeZone: "UTC",
+  }).format(date);
+}
+
+/**
+ * The index of every location (§4.10, §5's RIBA rule).
+ *
+ * "Multi-location businesses get /locations/ as a root-linked index page with
+ * each location one hop below — RIBA-compliant by construction." This block is
+ * the "root-linked" half: it lists what exists now, so a location added today
+ * is linked from the index without anyone editing the index. §5's "no orphan
+ * pages: publishing anything automatically links it from its section index" is
+ * a promise a hand-maintained list cannot keep.
+ */
+export const productsIndex = defineBlock({
+  type: "productsIndex",
+  labelKey: "cms.block.productsIndex",
+  contexts: ["page"],
+  schema: z.object({
+    showSubtitle: z.boolean().default(true),
+  }),
+  starter: () => ({}),
+  // The shop index wears the collection page's card — picture, "From …"
+  // price and add-to-cart — rather than a list of names (2026-10-23
+  // pre-launch check: the "Shop" nav target was the one shelf without prices).
+  resolve: async (_props, ctx) => {
+    const { listVisibleProducts, purchaseOptions } = await import("@/modules/catalog/service");
+    const { productCardImages } = await import("@/modules/catalog/merchandising");
+    const actor = ctx.actor ?? { kind: "anonymous" as const };
+    const products = await listVisibleProducts.call({ limit: 200 }, { kind: "anonymous" });
+    if (products.length === 0) return null;
+    const slugs = products.map((product) => product.slug);
+    const [purchases, images] = await Promise.all([
+      purchaseOptions.call({ slugs }, actor),
+      productCardImages.call({ slugs }, { kind: "anonymous" }),
+    ]);
+    return {
+      products,
+      purchases: Object.fromEntries(purchases.map((entry) => [entry.slug, entry])),
+      currency: purchases.find((entry) => entry.currency)?.currency ?? null,
+      images: Object.fromEntries(images.map(({ slug, ...image }) => [slug, image])),
+    };
+  },
+  render: ({ props, resolved, ctx }) => {
+    if (!resolved || resolved.products.length === 0) return null;
+    return (
+      <CollectionGrid
+        products={resolved.products.map((product) => ({
+          productId: product.id,
+          name: product.name,
+          slug: product.slug,
+          subtitle: props.showSubtitle ? product.subtitle : null,
+          brand: product.brand,
+        }))}
+        page={1}
+        pageCount={1}
+        labels={{
+          empty: ctx.t("store.collection.empty"),
+          previous: ctx.t("store.collection.previous"),
+          next: ctx.t("store.collection.next"),
+          page: ctx.t("store.collection.page", { page: 1, pages: 1 }),
+          pagination: ctx.t("store.collection.pagination"),
+        }}
+        productHref={(product) =>
+          ctx.localizeHref?.(`/products/${product.slug}`) ?? `/products/${product.slug}`
+        }
+        purchases={resolved.purchases}
+        formatMinor={(minor) => formatMoney(minor, resolved.currency ?? "USD", ctx.locale)}
+        buyLabels={addToCartLabels(ctx.t)}
+        images={resolved.images}
+      />
+    );
+  },
+});
+
+/**
+ * The buy panel's data source, kept at module level so the block's resolve
+ * stays a thin composition over the catalog service.
+ */
+async function purchaseOptionsOf(slug: string, actor: Actor | undefined) {
+  const { purchaseOptions } = await import("@/modules/catalog/service");
+  const [entry] = await purchaseOptions.call({ slugs: [slug] }, actor ?? { kind: "anonymous" });
+  return entry ?? null;
+}
+
+/** The product's lead image, resolved for the public page. */
+async function productPicture(slug: string) {
+  const { productHeroImage } = await import("@/modules/catalog/merchandising");
+  const { assetId } = await productHeroImage.call({ slug }, { kind: "anonymous" });
+  if (!assetId) return null;
+  const { resolveImage } = await import("@/core/media/service");
+  return resolveImage.call({ id: assetId }, { kind: "anonymous" });
+}
+
+/**
+ * The words of a product description, as plain paragraphs.
+ *
+ * The description is a block tree written in the product editor; its text
+ * and headings are what a shopper reads. Other block kinds in it are left to
+ * the page around the product rather than half-rendered here.
+ */
+function plainText(node: unknown): string {
+  if (!node || typeof node !== "object") return "";
+  const value = node as { text?: unknown; children?: unknown };
+  if (typeof value.text === "string") return value.text;
+  return Array.isArray(value.children) ? value.children.map(plainText).join("") : "";
+}
+
+function descriptionParagraphs(description: unknown): Array<{ text: string; heading: boolean }> {
+  const out: Array<{ text: string; heading: boolean }> = [];
+  const walk = (nodes: unknown) => {
+    if (!Array.isArray(nodes)) return;
+    for (const node of nodes as Array<{ type?: string; props?: Record<string, unknown>; children?: unknown }>) {
+      if (node.type === "heading" && typeof node.props?.text === "string" && node.props.text.trim()) {
+        out.push({ text: node.props.text.trim(), heading: true });
+      } else if (node.type === "text" && typeof node.props?.body === "string") {
+        for (const paragraph of node.props.body.split(/\n{2,}/)) {
+          if (paragraph.trim()) out.push({ text: paragraph.trim(), heading: false });
+        }
+      } else if (node.type === "text" && Array.isArray(node.props?.body)) {
+        // Rich text: one entry per top-level paragraph or heading node.
+        for (const rich of node.props.body as Array<{ type?: string; children?: unknown }>) {
+          const text = plainText(rich).trim();
+          if (text) out.push({ text, heading: rich.type === "heading" });
+        }
+      }
+      walk(node.children);
+    }
+  };
+  walk(description);
+  return out.slice(0, 40);
+}
+
+export const productDetail = defineBlock({
+  type: "productDetail",
+  labelKey: "cms.block.productDetail",
+  contexts: ["page"],
+  schema: z.object({
+    productId: z.string().uuid(),
+    slug: z.string().min(1),
+  }),
+  starter: () => ({ productId: "00000000-0000-4000-8000-000000000000", slug: "product" }),
+  resolve: async (props, ctx) => {
+    const { resolveVisibleProduct } = await import("@/modules/catalog/service");
+    const product = await resolveVisibleProduct.call(
+      { slug: props.slug },
+      ctx.actor ?? { kind: "anonymous" },
+    );
+    if (!product) return null;
+    // Projects owns the relation. Catalog remains unaware of portfolio data;
+    // this public block asks the registry only when the optional module is
+    // installed, so disabling projects does not disable service pages.
+    let projects: Array<{
+      id: string;
+      title: string;
+      summary: string | null;
+      href: string;
+    }> = [];
+    if (product.kind === "service") {
+      try {
+        const { publicProjectsForService } = await import("@/modules/projects/publishing-service");
+        projects = await publicProjectsForService.call(
+          { productId: product.id, limit: 12 },
+          { kind: "anonymous" },
+        );
+      } catch {
+        // An optional proof module must never make the service itself 500.
+        projects = [];
+      }
+    }
+    // The buy affordance (C3.25 slice 3): the same purchase projection the
+    // shelf pages quote from, so the detail page, the card and the cart can
+    // never disagree about price or availability. A signed-in customer is
+    // quoted their own audience prices through the caller's actor.
+    let purchase: Awaited<ReturnType<typeof purchaseOptionsOf>> = null;
+    try {
+      purchase = await purchaseOptionsOf(props.slug, ctx.actor);
+    } catch {
+      // A buy panel is never the reason a product page fails.
+      purchase = null;
+    }
+    // The product's own picture and words (C1.38). A product page that showed
+    // only its subtitle and a buy button left everything an owner wrote in
+    // the product editor — and every picture they attached — off the page.
+    let picture: Awaited<ReturnType<typeof productPicture>> = null;
+    try {
+      picture = await productPicture(props.slug);
+    } catch {
+      picture = null;
+    }
+    return { product, projects, purchase, picture, paragraphs: descriptionParagraphs(product.description) };
+  },
+  render: ({ resolved, ctx }) => {
+    if (!resolved) return null;
+    return (
+      <div className="grid gap-6">
+        {resolved.picture ? (
+          <picture>
+            {resolved.picture.sources.map((source) => (
+              <source key={source.format} srcSet={source.srcset} type={source.type} />
+            ))}
+            <img
+              src={resolved.picture.src}
+              alt={resolved.picture.altText ?? ""}
+              width={resolved.picture.width ?? undefined}
+              height={resolved.picture.height ?? undefined}
+              decoding="async"
+              className="h-auto w-full max-w-full rounded-lg"
+            />
+          </picture>
+        ) : null}
+        <div className="grid gap-3">
+          {resolved.product.subtitle ? <p className="text-lg text-ink-muted">{resolved.product.subtitle}</p> : null}
+          {resolved.product.brand ? <p className="text-sm text-ink-muted">{resolved.product.brand}</p> : null}
+        </div>
+        {resolved.paragraphs.length ? (
+          <div className="grid max-w-prose gap-3 text-ink">
+            {resolved.paragraphs.map((paragraph, index) =>
+              paragraph.heading ? (
+                <h2 key={index} className="text-xl font-bold tracking-tight text-ink">
+                  {paragraph.text}
+                </h2>
+              ) : (
+                <p key={index}>{paragraph.text}</p>
+              ),
+            )}
+          </div>
+        ) : null}
+        {resolved.purchase && resolved.purchase.variants.length > 0 ? (
+          // On the canvas (identifyBlocks) the buy chrome renders inert: the
+          // preview must show exactly what ships, but a form that submitted
+          // inside the iframe would rip the frame to /cart.
+          <div inert={ctx.identifyBlocks === true}>
+            <AddToCart
+              product={resolved.purchase}
+              formatMinor={(minor) =>
+                formatMoney(minor, resolved.purchase?.currency ?? "USD", ctx.locale)
+              }
+              labels={addToCartLabels(ctx.t)}
+            />
+          </div>
+        ) : null}
+        {resolved.projects.length ? (
+          <section className="grid gap-3" aria-labelledby={`service-${resolved.product.id}-projects`}>
+            <h2 id={`service-${resolved.product.id}-projects`} className="text-lg font-bold tracking-tight text-ink">
+              {ctx.t("projects.public.relatedWork")}
+            </h2>
+            <ul className="grid list-none gap-3 p-0 sm:grid-cols-2">
+              {resolved.projects.map((project) => (
+                <li key={project.id} className="rounded-lg border border-rule p-4">
+                  <a
+                    href={ctx.localizeHref?.(project.href) ?? project.href}
+                    className="font-semibold text-ink"
+                  >
+                    {project.title}
+                  </a>
+                  {project.summary ? <p className="mt-1 text-sm text-ink-muted">{project.summary}</p> : null}
+                </li>
+              ))}
+            </ul>
+          </section>
+        ) : null}
+      </div>
+    );
+  },
+});
+
+/**
+ * The cart line in the chrome (C3.25 slice 3).
+ *
+ * §32's shell contains no hardcoded structure, so the widget is vocabulary
+ * like any other block: the owner places it in the header Section (fresh
+ * instances get it in the default header), and the routing layer hands the
+ * request's cart snapshot through the render context. Without that snapshot —
+ * an email render, the editor preview — the block renders nothing rather than
+ * a dead link.
+ */
+export const cartWidget = defineBlock({
+  type: "cartWidget",
+  labelKey: "cms.block.cartWidget",
+  contexts: ["chrome", "page"],
+  schema: z.object({}),
+  starter: () => ({}),
+  resolve: async (_props, ctx) => (ctx.shopperCart ? ctx.shopperCart() : null),
+  render: ({ resolved, ctx }) => {
+    if (!resolved) return null;
+    const cartPath = ctx.localizeHref?.("/cart") ?? "/cart";
+    const checkoutPath = ctx.localizeHref?.("/checkout") ?? "/checkout";
+    return (
+      <div className="relative inline-flex items-center gap-2 text-sm">
+        <details className="group relative">
+          <summary
+            className="inline-flex cursor-pointer list-none items-center gap-2 rounded-md border border-rule bg-paper px-3 py-1.5 font-semibold text-ink"
+            aria-label={ctx.t("cms.block.cartWidget.summary", { count: resolved.lineCount })}
+          >
+            {ctx.t("cms.block.cartWidget.count", { count: resolved.lineCount })}
+            <span className="text-ink-muted">
+              {formatMoney(resolved.subtotalMinor, resolved.currency, ctx.locale)}
+            </span>
+          </summary>
+          <div className="absolute end-0 z-30 mt-2 w-72 rounded-lg border border-rule bg-surface p-3 shadow-float">
+            {resolved.lines.length === 0 ? (
+              <p className="text-sm text-ink-muted">{ctx.t("cms.block.cartWidget.empty")}</p>
+            ) : (
+              <ul className="grid list-none gap-2 p-0">
+                {resolved.lines.map((line) => (
+                  <li key={line.variantId} className="flex items-baseline justify-between gap-2 text-sm">
+                    <span className="text-ink">
+                      {line.productName}
+                      <span className="ms-1 text-ink-muted">× {line.quantity}</span>
+                    </span>
+                    <span className="text-ink-muted">
+                      {line.lineTotalMinor === null
+                        ? "—"
+                        : formatMoney(line.lineTotalMinor, resolved.currency, ctx.locale)}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+            <div className="mt-3 flex items-center gap-2">
+              <a
+                href={cartPath}
+                className="rounded-md border border-rule px-3 py-1.5 font-semibold text-ink"
+              >
+                {ctx.t("cms.block.cartWidget.view")}
+              </a>
+              {resolved.lines.length > 0 ? (
+                <a
+                  href={checkoutPath}
+                  className="rounded-md bg-accent px-3 py-1.5 font-semibold text-on-accent"
+                >
+                  {ctx.t("cms.block.cartWidget.checkout")}
+                </a>
+              ) : null}
+            </div>
+          </div>
+        </details>
+      </div>
+    );
+  },
+});
+
+export const locationsIndex = defineBlock({
+  type: "locationsIndex",
+  labelKey: "cms.block.locationsIndex",
+  contexts: ["page"],
+  schema: z.object({
+    showAddress: z.boolean().default(true),
+  }),
+  starter: () => ({}),
+  resolve: async () => {
+    const { listLocations } = await import("@/core/locations/service");
+    return listLocations.call({}, { kind: "anonymous" });
+  },
+  render: ({ props, resolved, ctx }) => {
+    if (!resolved || resolved.length === 0) return null;
+    return (
+      <ul className="grid list-none gap-4 p-0">
+        {resolved.map((location) => {
+          const nap = renderNAP(location);
+          return (
+            <li key={location.id} className="border-b border-rule pb-4 last:border-0">
+              <a
+                href={ctx.localizeHref?.(`/locations/${location.slug}`) ?? `/locations/${location.slug}`}
+                className="font-semibold text-ink"
+              >
+                {location.name}
+              </a>
+              {props.showAddress && nap.addressLine ? (
+                <address className="mt-1 not-italic text-sm text-ink-muted">
+                  {nap.addressLine}
+                </address>
+              ) : null}
+            </li>
+          );
+        })}
+      </ul>
+    );
+  },
+});
+
+/**
+ * A live instance of a reusable Section (C2.12). The page stores a key, not a
+ * copy of the tree — editing the Section updates every instance. Detach is
+ * how a page keeps a local copy instead.
+ */
+export const sectionInstance = defineBlock({
+  type: "sectionInstance",
+  labelKey: "cms.block.sectionInstance",
+  contexts: ["page"],
+  schema: z.object({
+    sectionKey: z.string().min(1).max(80),
+  }),
+  starter: () => ({ sectionKey: "section" }),
+  resolve: async (props, ctx) => {
+    const { getSection } = await import("../service");
+    const { parseBlockTree } = await import("./registry");
+    const { renderBlocks } = await import("../render");
+    const section = await getSection.call(
+      { key: props.sectionKey, locale: ctx.locale },
+      { kind: "anonymous" },
+    );
+    if (!section) return null;
+    const tree = parseBlockTree(section.blocks, "page");
+    return {
+      name: section.name,
+      nodes: await renderBlocks(tree, ctx),
+    };
+  },
+  render: ({ resolved, ctx }) => {
+    if (!resolved) {
+      return ctx.identifyBlocks ? (
+        <p className="text-sm text-ink-muted">{ctx.t("cms.section.missing")}</p>
+      ) : null;
+    }
+    return <div className="grid gap-6">{resolved.nodes}</div>;
+  },
+});
+
+/**
+ * A/B (and n-way) experiment (C2.17). Children are `variant` blocks. The
+ * public renderer keeps only the assigned variant in the HTML.
+ */
+export const experiment = defineBlock({
+  type: "experiment",
+  labelKey: "cms.block.experiment",
+  contexts: ["page", "chrome"],
+  container: true,
+  schema: z.object({
+    experimentKey: z.string().trim().min(1).max(80),
+  }),
+  starter: () => ({ experimentKey: "experiment" }),
+  selectChildren: ({ props, children, ctx }) =>
+    selectAssignedVariants(
+      props.experimentKey,
+      children,
+      ctx.experimentAssignments,
+      ctx.visitorId,
+      ctx.identifyBlocks === true,
+    ),
+  render: ({ props, children, ctx }) =>
+    ctx.identifyBlocks ? (
+      <div data-experiment={props.experimentKey} className="grid gap-4">
+        {children}
+      </div>
+    ) : (
+      <>{children}</>
+    ),
+});
+
+export const EMAIL_VARIABLE_SLOTS = [
+  "contact.first_name",
+  "contact.email",
+  "business.name",
+  "invoice.total",
+  "booking.starts_at_local",
+] as const;
+
+export const variable = defineBlock({
+  type: "variable",
+  labelKey: "cms.block.variable",
+  contexts: ["email"],
+  schema: z.object({
+    slot: z.enum(EMAIL_VARIABLE_SLOTS),
+  }),
+  starter: () => ({ slot: "contact.first_name" as const }),
+  render: ({ props }) => <span>{`{{${props.slot}}}`}</span>,
+});
+
+export const variant = defineBlock({
+  type: "variant",
+  labelKey: "cms.block.variant",
+  contexts: ["page", "chrome"],
+  container: true,
+  schema: z.object({
+    name: z.string().trim().min(1).max(40),
+    weight: z.number().int().min(1).max(100).default(50),
+  }),
+  starter: () => ({ name: "control", weight: 50 }),
+  render: ({ props, children, ctx }) =>
+    ctx.identifyBlocks ? (
+      <div data-variant={props.name} className="grid gap-3 border border-dashed border-rule p-3">
+        <p className="text-xs font-semibold uppercase tracking-wide text-ink-muted">
+          {ctx.t("cms.experiment.variant", { name: props.name, weight: props.weight })}
+        </p>
+        {children}
+      </div>
+    ) : (
+      <>{children}</>
+    ),
+});

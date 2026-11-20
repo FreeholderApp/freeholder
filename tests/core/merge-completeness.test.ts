@@ -1,0 +1,348 @@
+// Copyright (C) 2026 Tony Aly
+// SPDX-License-Identifier: Apache-2.0
+// The merge completeness gate (CLAUDE.md non-negotiable, MASTER.md §2
+// principle 3).
+//
+// `contacts.merge` repoints foreign keys from a hand-maintained list, because
+// only a human can decide what a merge means for a table whose contact_id sits
+// in a unique constraint. The failure mode of a hand-maintained list is that
+// somebody forgets — and the symptom is orphaned rows discovered months later
+// by an owner merging two duplicates, which is exactly the silent fork of the
+// spine that principle 3 exists to prevent.
+//
+// So the list stays hand-written and this test reflects over the schema to
+// prove it is complete. Add a `contact_id` column without adding an entry to
+// CONTACT_REFERENCES and the build goes red in the same PR.
+//
+// This runs against the schema definitions, not a database, so it gates every
+// contributor's machine whether or not they have Postgres running.
+import { beforeAll, describe, expect, it } from "vitest";
+import { is } from "drizzle-orm";
+import { getTableConfig, PgTable } from "drizzle-orm/pg-core";
+import manifests from "@/modules";
+import { contacts } from "@/core/contacts/schema";
+import {
+  contactReferenceColumns,
+  contactReferences,
+  registerContactReference,
+} from "@/core/contacts/service";
+import { ready } from "@/core/runtime";
+import { contactPrivacySources } from "@/core/privacy/service";
+
+/**
+ * Every table any installed module owns — not core's barrel alone.
+ *
+ * The gate read only `@/core/tables` until forms became the first module to
+ * add a `contact_id` column, at which point it was checking a list that could
+ * no longer contain the answer. The same lesson `truncateSpine` learned:
+ * "what does this instance own" is a question for the manifests (§11), and any
+ * hand-list of them drifts.
+ */
+let tables: PgTable[] = [];
+
+beforeAll(async () => {
+  // Boot first: a module registers its repoint from its services module, and
+  // boot is what imports that.
+  await ready();
+  const found: PgTable[] = [];
+  for (const manifest of manifests) {
+    if (!manifest.tables) continue;
+    const owned: Record<string, unknown> = await manifest.tables();
+    for (const value of Object.values(owned)) {
+      if (is(value, PgTable)) found.push(value);
+    }
+  }
+  tables = found;
+});
+
+function allTables(): PgTable[] {
+  return tables;
+}
+
+const contactsTableName = getTableConfig(contacts).name;
+
+/**
+ * Every (table, column) in the schema that points at `contacts.id`, found by
+ * reflection rather than by reading the same list the code under test reads —
+ * a gate that consults the answer key proves nothing.
+ */
+function tablesReferencingContacts(): Array<{
+  table: string;
+  column: string;
+}> {
+  const found: Array<{ table: string; column: string }> = [];
+  for (const table of allTables()) {
+    const config = getTableConfig(table);
+    for (const foreignKey of config.foreignKeys) {
+      const reference = foreignKey.reference();
+      if (getTableConfig(reference.foreignTable).name !== contactsTableName) {
+        continue;
+      }
+      for (const column of reference.columns) {
+        found.push({ table: config.name, column: column.name });
+      }
+    }
+  }
+  return found;
+}
+
+/**
+ * Contact columns the merge deliberately leaves alone, each with the human
+ * decision written next to it. An entry here is a documented exception, not
+ * an escape hatch — the assertion below fails on any *undocumented* column.
+ */
+const DELIBERATE_MERGE_EXCLUSIONS: Record<string, string> = {
+  "import_reader_merge_items.before_contact_id":
+    "Normalized immutable merge witness: the original pre-merge subject must survive duplicate deletion so exact undo can restore it. Current ownership is repointed through import_reader_ownership_receipts.contact_id.",
+  "import_reader_merge_items.after_contact_id":
+    "The accepted post-merge subject is immutable comparison evidence. Repointing this witness would hide later ownership changes and make unsafe undo appear valid; the reader privacy source owns these minimal historical records.",
+  "contact_merge_operations.surviving_contact_id":
+    "The merge ledger is an immutable audit snapshot: rewriting who merged into whom would falsify history, and undo reads these ids as they were.",
+  "contact_merge_operations.duplicate_contact_id":
+    "Same ledger, same reason — the duplicate id names a contact that no longer exists, which is the point of the record.",
+};
+
+/**
+ * Every column *named* like a contact reference, whatever its declaration.
+ * The FK-based reflection above only sees `.references()`; a bare
+ * `uuid("contact_id")` column would sail through it — this scan is written in
+ * the same terms as the CLAUDE.md rule, the column name.
+ */
+function columnsNamedLikeContactReferences(): Array<{
+  table: string;
+  column: string;
+}> {
+  const found: Array<{ table: string; column: string }> = [];
+  for (const table of allTables()) {
+    const config = getTableConfig(table);
+    if (config.name === contactsTableName) continue;
+    for (const column of config.columns) {
+      if (/(^|_)contact_id$/.test(column.name)) {
+        found.push({ table: config.name, column: column.name });
+      }
+    }
+  }
+  return found;
+}
+
+/**
+ * `table.column` for every column a registered repoint *declares*.
+ *
+ * Limit, stated rather than hidden: this trusts the declaration. Whether each
+ * repoint really moves every column it names is proven per module by its own
+ * merge test (documents, referrals-commission, …), not by this reflection —
+ * seeding every table's required parents generically is not something a
+ * schema scan can do honestly.
+ */
+function repointedColumns(): Set<string> {
+  return new Set(
+    contactReferences().flatMap((reference) =>
+      contactReferenceColumns(reference).map((column) => `${reference.table}.${column}`),
+    ),
+  );
+}
+
+/** The discriminator/id pairs a polymorphic pointer is written with. */
+const POLYMORPHIC_PAIRS: ReadonlyArray<readonly [kind: string, id: string]> = [
+  ["subject_type", "subject_id"],
+  ["subject_kind", "subject_id"],
+  ["target_type", "target_id"],
+  ["target_kind", "target_id"],
+  ["entity_type", "entity_id"],
+  ["parent_type", "parent_id"],
+  ["owner_type", "owner_id"],
+  ["resource_type", "resource_id"],
+];
+
+/**
+ * `table.id_column` for every polymorphic pointer (`subject_type` +
+ * `subject_id`, `subject_kind`, `target_type`, `entity_type`, …). When the
+ * pointer can name a contact, the id column is a contact reference no foreign
+ * key will ever show — so each needs a decision.
+ */
+function polymorphicPointers(): string[] {
+  const found: string[] = [];
+  for (const table of allTables()) {
+    const config = getTableConfig(table);
+    const names = new Set(config.columns.map((column) => column.name));
+    for (const [kind, id] of POLYMORPHIC_PAIRS) {
+      if (names.has(kind) && names.has(id)) found.push(`${config.name}.${id}`);
+    }
+  }
+  return [...new Set(found)];
+}
+
+/**
+ * Polymorphic pointers the merge leaves alone, with why. Every other pointer
+ * that can name a contact must be declared in its table's
+ * registerContactReference() columns and repointed.
+ */
+const POLYMORPHIC_EXCLUSIONS: Record<string, string> = {
+  "audit_log.subject_id":
+    "The audit log is an immutable record of what happened to which id; rewriting it would falsify history.",
+  "timeline_events.subject_id":
+    "A timeline entry's subject records the id the event was about at the time; the entry itself follows its contact_id.",
+  "demo_records.subject_id":
+    "Demo bookkeeping names the fixture rows it created so a reset removes exactly those; a merged demo contact is removed by its surviving id.",
+  "content_revisions.subject_id": "CMS revisions are about pages and sections, never contacts.",
+  "money_state_events.subject_id":
+    "Money state history is an append-only ledger of invoice/payment/refund transitions, never contacts.",
+  "reviews.subject_id":
+    "A review's subject is the thing reviewed (a product, service or location), never a contact; the reviewer follows contact_id.",
+  "review_requests.subject_id": "Same as reviews: the subject is what is to be reviewed, never a contact.",
+  "contract_documents.subject_id":
+    "A contract's subject is the quote, booking, rental or project it governs; the signer follows contact_id.",
+  "runs.subject_id": "RUN_SUBJECTS is agent_task | automation (an enum); a run is never about a contact.",
+  "run_approvals.subject_id": "Same RUN_SUBJECTS enum as runs: an approval belongs to an agent task.",
+  "media_consents.subject_id":
+    "The consent covers a project (subject_kind 'project'); the person who gave it follows contact_id.",
+  "entity_translations.entity_id":
+    "Translations belong to published content (pages, events, locations, catalogue), never to a contact record.",
+  "content_layouts.entity_id": "LAYOUT_ENTITY_TYPES is an enum of content types, none of them contacts.",
+  "member_reports.target_id":
+    "REPORT_TARGETS are member-network objects (posts, comments, messages, listings, reviews, members), not CRM contacts.",
+  "member_attachments.parent_id": "ATTACHMENT_PARENTS is post | comment | message.",
+  "media_capture_sessions.target_id": "A capture lands on the library, a product or a page, never a contact.",
+};
+
+describe("contacts.merge covers the whole spine", () => {
+  it("finds the contact_id foreign keys by reflection", () => {
+    // Guards the gate itself: a reflection that silently stops seeing foreign
+    // keys (a Drizzle upgrade changing the shape, say) would pass every
+    // assertion below while checking nothing at all.
+    const referencing = tablesReferencingContacts();
+    expect(referencing.length).toBeGreaterThan(0);
+    expect(referencing).toContainEqual({
+      table: "timeline_events",
+      column: "contact_id",
+    });
+    // And a module's table, so the widening cannot silently regress.
+    expect(referencing).toContainEqual({
+      table: "form_submissions",
+      column: "contact_id",
+    });
+  });
+
+  it("repoints every column that references contacts.id", () => {
+    // Per column, not per table: a table with two contact columns whose
+    // repoint covers one of them used to pass because the table was listed.
+    const covered = repointedColumns();
+    const missing = tablesReferencingContacts()
+      .map(({ table, column }) => `${table}.${column}`)
+      .filter((column) => !covered.has(column) && !(column in DELIBERATE_MERGE_EXCLUSIONS));
+
+    expect(
+      missing,
+      missing.length === 0
+        ? ""
+        : `These columns reference contacts.id but contacts.merge does not repoint them: ` +
+            `${missing.join(", ")}.\n\n` +
+            `Merging two duplicates would orphan their rows — the spine forks silently, ` +
+            `which is the failure MASTER.md §2 principle 3 exists to prevent.\n\n` +
+            `Core's tables are listed in src/core/contacts/service.ts; a module registers ` +
+            `its own with registerContactReference() from its services module, naming ` +
+            `every contact column it repoints in \`columns\`. Decide deliberately what a ` +
+            `merge means if the column participates in a unique constraint.`,
+    ).toEqual([]);
+  });
+
+  it("accounts for every column merely *named* like a contact reference", () => {
+    // A `uuid("contact_id")` without `.references()` is invisible to the
+    // FK reflection, so the gate would pass while the merge orphaned its
+    // rows. Every name-shaped contact column must be either repointed or a
+    // documented deliberate exclusion.
+    const covered = repointedColumns();
+    const unaccounted = columnsNamedLikeContactReferences().filter(
+      ({ table, column }) =>
+        !covered.has(`${table}.${column}`) &&
+        !(`${table}.${column}` in DELIBERATE_MERGE_EXCLUSIONS),
+    );
+
+    expect(
+      unaccounted,
+      unaccounted.length === 0
+        ? ""
+        : `These columns are named like contact references but are neither repointed by ` +
+            `contacts.merge nor documented as deliberate exclusions: ` +
+            `${unaccounted.map((c) => `${c.table}.${c.column}`).join(", ")}.\n\n` +
+            `Either add .references(() => contacts.id) plus a registerContactReference() ` +
+            `entry, or record the human decision in DELIBERATE_MERGE_EXCLUSIONS in this file.`,
+    ).toEqual([]);
+  });
+
+  it("decides what a merge means for every polymorphic pointer that can be a contact", () => {
+    const covered = repointedColumns();
+    const pointers = polymorphicPointers();
+    // Guards the reflection itself, across the pair shapes it reads.
+    expect(pointers).toContain("commission_events.subject_id");
+    expect(pointers).toContain("documents.subject_id");
+    expect(pointers).toContain("attestations.subject_id");
+    expect(pointers).toContain("runs.subject_id");
+    expect(pointers).toContain("entity_translations.entity_id");
+    const undecided = pointers.filter(
+      (pointer) => !covered.has(pointer) && !(pointer in POLYMORPHIC_EXCLUSIONS),
+    );
+    expect(
+      undecided,
+      undecided.length === 0
+        ? ""
+        : `These polymorphic pointers can name a contact but contacts.merge neither repoints ` +
+            `them nor records why they are left alone: ${undecided.join(", ")}. Repoint the id ` +
+            `where the kind is 'contact' (and name it in columns), or document the decision in ` +
+            `POLYMORPHIC_EXCLUSIONS.`,
+    ).toEqual([]);
+    const stale = Object.keys(POLYMORPHIC_EXCLUSIONS).filter((pointer) => !pointers.includes(pointer));
+    expect(stale).toEqual([]);
+  });
+
+  it("lists no column that has stopped referencing contacts", () => {
+    // The list rotting in the other direction: a dropped column leaves an entry
+    // whose repoint would throw at merge time, on the one code path an owner
+    // reaches only when they already have a duplicate problem.
+    const real = new Set([
+      ...tablesReferencingContacts().map(({ table, column }) => `${table}.${column}`),
+      ...columnsNamedLikeContactReferences().map(({ table, column }) => `${table}.${column}`),
+      ...polymorphicPointers(),
+    ]);
+    const stale = [...repointedColumns()].filter((column) => !real.has(column));
+
+    expect(
+      stale,
+      stale.length === 0
+        ? ""
+        : `contacts.merge lists ${stale.join(", ")}, which no longer reference ` +
+            `contacts. Remove or correct the stale entries.`,
+    ).toEqual([]);
+  });
+
+  it("refuses a second registration that would silently cover other columns", () => {
+    const existing = contactReferences().find((reference) => reference.table === "commission_events")!;
+    expect(() =>
+      registerContactReference({ ...existing, columns: ["contact_id"] }),
+    ).toThrow(/already has a repoint/);
+    // Re-evaluating the same declaration is harmless.
+    expect(() => registerContactReference(existing)).not.toThrow();
+  });
+});
+
+describe("privacy rights cover the whole spine", () => {
+  it("registers export and erasure behavior for every contact foreign key", () => {
+    const covered = new Set(
+      contactPrivacySources().flatMap((source) => source.tables),
+    );
+    const missing = [
+      ...new Set(
+        tablesReferencingContacts()
+          .map((reference) => reference.table)
+          .filter((table) => !covered.has(table)),
+      ),
+    ];
+    expect(
+      missing,
+      missing.length === 0
+        ? ""
+        : `These tables can hold contact data but have no export/erasure handler: ${missing.join(", ")}. ` +
+          "Register the table with registerContactPrivacySource() beside its service.",
+    ).toEqual([]);
+  });
+});

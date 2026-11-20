@@ -1,0 +1,355 @@
+// Copyright (C) 2026 Tony Aly
+// SPDX-License-Identifier: Apache-2.0
+// The design tokens (MASTER.md §32: "design tokens, not themes").
+//
+// This file is the single source of truth for the platform's look, and it is
+// deliberately plain data — no CSS, no React, no framework. That is what lets
+// three very different consumers share one design:
+//
+//   • the web app, which emits these as CSS custom properties per request
+//   • the React Native app (§35), which reads the same object at runtime
+//   • packages/templates, whose themes are overrides of these values
+//
+// Tokens are *semantic*, not literal: components ask for `surface` or `accent`,
+// never for a hex code. Rebranding is then a remapping rather than an edit to
+// every component, which is what makes an owner's brand a settings save (§32)
+// and what keeps the platform's chrome from fighting the business it hosts.
+//
+// The default set is "Bench": a working surface for a one-person business —
+// cool paper, graphite ink, one saturated cobalt that means "this is the
+// action", and monospaced labels for the things you read as data.
+
+export interface ColorTokens {
+  /** Page ground. */
+  paper: string;
+  /** Cards, panels, anything lifted off the page. */
+  surface: string;
+  /** Rails, headers, footers — a step away from `surface`. */
+  surfaceMuted: string;
+  /** Input interiors. Distinct from `surface` so fields read as editable. */
+  field: string;
+  /** Body text and headings. */
+  ink: string;
+  /** Secondary text, labels, captions. */
+  inkMuted: string;
+  /** Hairlines and dividers. Decorative — see `ruleStrong` for controls. */
+  rule: string;
+  /**
+   * The edge of something you can operate: inputs, selects, checkboxes.
+   *
+   * Separate from `rule` because WCAG 1.4.11 asks 3:1 of a *control's*
+   * boundary and nothing of a decorative divider. `rule` was 1.17:1 against
+   * every ground, so field edges were invisible to low-vision users — and
+   * raising `rule` itself would have darkened all 828 hairlines in the
+   * product to fix the 60 that are controls. Reported by a third party.
+   */
+  ruleStrong: string;
+  /** The one colour that means "act". Used sparingly, on purpose. */
+  accent: string;
+  /** Text and icons placed on `accent`. */
+  onAccent: string;
+  /** Accent at low emphasis: selected rows, quiet highlights. */
+  accentSoft: string;
+  /** Semantic states — deliberately separate from the accent hue. */
+  success: string;
+  successSoft: string;
+  warning: string;
+  warningSoft: string;
+  danger: string;
+  dangerSoft: string;
+  /**
+   * Text and icons placed on solid `danger`. A literal white here fails AA
+   * the moment a dark scheme lightens the danger fill — which is exactly
+   * what Bench's does — so the pairing is a token like `onAccent`.
+   */
+  onDanger: string;
+  /** Keyboard focus. Must clear 3:1 against both paper and surface. */
+  focus: string;
+}
+
+export interface ThemeTokens {
+  light: ColorTokens;
+  dark: ColorTokens;
+}
+
+/**
+ * Cool paper rather than cream, and a neutral carrying a faint blue bias
+ * toward the accent — a pure grey next to a saturated blue reads as an
+ * oversight rather than a choice.
+ */
+export const colors: ThemeTokens = {
+  light: {
+    paper: "#fafaf8",
+    surface: "#ffffff",
+    surfaceMuted: "#f4f4f1",
+    field: "#ffffff",
+    ink: "#23262a",
+    // Darker than the original #6b7076: that pair was 4.53:1 on surfaceMuted,
+    // which axe fails on 11px labels and quiet controls (C11 settings).
+    inkMuted: "#5a5f66",
+    rule: "#e3e3de",
+    // 3.32:1 on the lightest ground it borders, with headroom over the 3:1
+    // floor rather than sitting on it.
+    ruleStrong: "#868681",
+    accent: "#2551e0",
+    onAccent: "#ffffff",
+    accentSoft: "#e6ecfd",
+    // Darker than it first looked right: #1a7f52 was 4.32:1 on its soft ground,
+    // and #17734a still failed axe on 11px "On" pills. Contrast, not taste.
+    success: "#146640",
+    successSoft: "#e3f2ea",
+    warning: "#8c5b0e",
+    warningSoft: "#fbeed6",
+    danger: "#b3261e",
+    dangerSoft: "#fbe6e4",
+    onDanger: "#ffffff",
+    focus: "#2551e0",
+  },
+  dark: {
+    paper: "#121316",
+    surface: "#191b1f",
+    surfaceMuted: "#1f2126",
+    field: "#141619",
+    ink: "#eceef0",
+    inkMuted: "#9aa0a8",
+    rule: "#2b2e34",
+    // 3.41:1 against `surfaceMuted`, the lightest dark ground.
+    ruleStrong: "#6e747c",
+    // Lifted and desaturated: the light-mode cobalt is unreadable on a dark
+    // ground, and a theme that merely inverts is how contrast gets lost.
+    accent: "#5c86ff",
+    onAccent: "#0d1016",
+    accentSoft: "#1a2440",
+    success: "#4fb488",
+    successSoft: "#14291f",
+    warning: "#e0ae55",
+    warningSoft: "#2c2312",
+    danger: "#f08d85",
+    dangerSoft: "#2e1917",
+    // Dark ink, not white: the dark scheme's danger is a light fill.
+    onDanger: "#2b0f0c",
+    focus: "#5c86ff",
+  },
+};
+
+/** A 1.2 (minor third) scale from 13px, which keeps dense admin screens calm. */
+export const fontSize = {
+  xs: "0.6875rem", // 11px — mono labels, metadata
+  sm: "0.8125rem", // 13px — secondary text, table cells
+  base: "0.875rem", // 14px — interface default
+  md: "1rem", // 16px — body copy on public pages
+  lg: "1.25rem", // 20px — card and section titles
+  xl: "1.5rem", // 24px — page titles
+  "2xl": "2rem", // 32px — public headings
+  "3xl": "2.75rem", // 44px — hero
+} as const;
+
+export const fontFamily = {
+  /** Schibsted Grotesk: warm grotesque, open apertures, legible small. */
+  sans: '"Schibsted Grotesk", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif',
+  /** JetBrains Mono: field labels, IDs, currency — anywhere digits align. */
+  mono: '"JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace',
+} as const;
+
+/**
+ * 4px base. Every gap in the interface is a multiple, so spacing is a decision
+ * from a set rather than a number somebody typed.
+ */
+export const space = {
+  "0.5": "0.125rem",
+  "1": "0.25rem",
+  "2": "0.5rem",
+  "3": "0.75rem",
+  "4": "1rem",
+  "5": "1.25rem",
+  "6": "1.5rem",
+  "8": "2rem",
+  "10": "2.5rem",
+  "12": "3rem",
+  "16": "4rem",
+} as const;
+
+/** Soft, not pill: 8px reads as built rather than decorative. */
+export const radius = {
+  sm: "0.25rem",
+  base: "0.375rem",
+  md: "0.5rem",
+  lg: "0.75rem",
+  full: "9999px",
+} as const;
+
+/**
+ * Restrained on purpose. Depth in this interface comes from the rule colour
+ * and surface steps; heavy shadows would make an admin screen feel like a
+ * consumer app and would not survive a dark theme intact.
+ */
+export const shadow = {
+  none: "none",
+  sm: "0 1px 2px rgb(16 18 22 / 0.06)",
+  md: "0 2px 8px rgb(16 18 22 / 0.08)",
+  /** The pressed-edge inset on solid buttons. One definition, not nine copies. */
+  press: "inset 0 -2px 0 rgb(0 0 0 / 0.16)",
+  /** A heavier pressed edge plus lift, for the one emphasized hero action. */
+  raised: "inset 0 -3px 0 rgb(0 0 0 / 0.18), 0 12px 28px rgb(0 0 0 / 0.12)",
+  /** Elevation for floating chrome such as the public chat launcher. */
+  float: "0 12px 32px rgb(0 0 0 / 0.2)",
+} as const;
+
+export const motion = {
+  fast: "120ms",
+  base: "180ms",
+  easing: "cubic-bezier(0.2, 0, 0.2, 1)",
+} as const;
+
+export const tokens = {
+  colors,
+  fontSize,
+  fontFamily,
+  space,
+  radius,
+  shadow,
+  motion,
+} as const;
+
+export type Tokens = typeof tokens;
+
+export const COLOR_ROLES = [
+  "paper",
+  "surface",
+  "surfaceMuted",
+  "field",
+  "ink",
+  "inkMuted",
+  "rule",
+  "ruleStrong",
+  "accent",
+  "onAccent",
+  "accentSoft",
+  "success",
+  "successSoft",
+  "warning",
+  "warningSoft",
+  "danger",
+  "dangerSoft",
+  "onDanger",
+  "focus",
+] as const;
+
+export type ColorRole = (typeof COLOR_ROLES)[number];
+
+export const HEX = /^#[0-9a-f]{6}$/;
+
+export function luminance(hex: string): number {
+  const channels = [1, 3, 5].map((i) => {
+    const c = parseInt(hex.slice(i, i + 2), 16) / 255;
+    return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+  });
+  return 0.2126 * channels[0]! + 0.7152 * channels[1]! + 0.0722 * channels[2]!;
+}
+
+export function contrastRatio(a: string, b: string): number {
+  const [hi, lo] = [luminance(a), luminance(b)].sort((x, y) => y - x);
+  return (hi! + 0.05) / (lo! + 0.05);
+}
+
+export interface ContrastFailure {
+  scheme: "light" | "dark";
+  pair: string;
+  ratio: number;
+  need: number;
+}
+
+/** The same pairings `tests/core/tokens.test.ts` requires of Bench. */
+export function contrastFailures(theme: ThemeTokens): ContrastFailure[] {
+  const out: ContrastFailure[] = [];
+  for (const scheme of ["light", "dark"] as const) {
+    const c = theme[scheme];
+    const fail = (pair: string, ratio: number, need: number) => {
+      if (ratio < need) out.push({ scheme, pair, ratio, need });
+    };
+    for (const ground of ["paper", "surface", "surfaceMuted", "field"] as const) {
+      fail(`ink on ${ground}`, contrastRatio(c.ink, c[ground]), 4.5);
+    }
+    fail("inkMuted on paper", contrastRatio(c.inkMuted, c.paper), 4.5);
+    fail("inkMuted on surface", contrastRatio(c.inkMuted, c.surface), 4.5);
+    fail("inkMuted on surfaceMuted", contrastRatio(c.inkMuted, c.surfaceMuted), 4.5);
+    fail("onAccent on accent", contrastRatio(c.onAccent, c.accent), 4.5);
+    fail("success on successSoft", contrastRatio(c.success, c.successSoft), 4.5);
+    fail("warning on warningSoft", contrastRatio(c.warning, c.warningSoft), 4.5);
+    fail("danger on dangerSoft", contrastRatio(c.danger, c.dangerSoft), 4.5);
+    fail("onDanger on danger", contrastRatio(c.onDanger, c.danger), 4.5);
+    // WCAG 1.4.11: a control's boundary needs 3:1, on every ground a
+    // control sits on. `rule` is exempt because a divider is decoration.
+    for (const ground of ["paper", "surface", "surfaceMuted", "field"] as const) {
+      fail(
+        `ruleStrong on ${ground}`,
+        contrastRatio(c.ruleStrong, c[ground]),
+        3,
+      );
+    }
+    fail("focus on paper", contrastRatio(c.focus, c.paper), 3);
+    fail("focus on surface", contrastRatio(c.focus, c.surface), 3);
+  }
+  return out;
+}
+
+export interface TokenExtras {
+  fontSans?: string;
+  fontMono?: string;
+  radius?: string;
+  motion?: string;
+  measure?: string;
+  gutter?: string;
+}
+
+const CSS_VAR_PREFIX = "fh";
+
+function toKebab(key: string): string {
+  return key.replace(/([a-z0-9])([A-Z])/g, "$1-$2").toLowerCase();
+}
+
+/**
+ * Colour tokens as CSS custom-property declarations.
+ *
+ * §32 requires these to be emitted at request time, because an owner's brand
+ * lives in settings rows rather than in a stylesheet — so a rebrand takes
+ * effect on the next page load and never needs a build.
+ */
+export function colorsToCss(scheme: ColorTokens): string {
+  return Object.entries(scheme)
+    .map(([key, value]) => `--${CSS_VAR_PREFIX}-${toKebab(key)}: ${value};`)
+    .join("\n  ");
+}
+
+function extrasToCss(extras?: TokenExtras): string {
+  if (!extras) return "";
+  const lines: string[] = [];
+  if (extras.fontSans) lines.push(`--${CSS_VAR_PREFIX}-font-sans: ${extras.fontSans};`);
+  if (extras.fontMono) lines.push(`--${CSS_VAR_PREFIX}-font-mono: ${extras.fontMono};`);
+  if (extras.radius) lines.push(`--${CSS_VAR_PREFIX}-radius: ${extras.radius};`);
+  if (extras.motion) lines.push(`--${CSS_VAR_PREFIX}-motion: ${extras.motion};`);
+  if (extras.measure) lines.push(`--${CSS_VAR_PREFIX}-measure: ${extras.measure};`);
+  if (extras.gutter) lines.push(`--${CSS_VAR_PREFIX}-gutter: ${extras.gutter};`);
+  return lines.length ? `\n  ${lines.join("\n  ")}` : "";
+}
+
+/** Scheme-independent tokens: shadows are the same on both grounds. */
+function staticTokensCss(): string {
+  return Object.entries(shadow)
+    .map(([key, value]) => `--${CSS_VAR_PREFIX}-shadow-${toKebab(key)}: ${value};`)
+    .join("\n  ");
+}
+
+/** The `<style>` body that themes a document, both schemes included. */
+export function themeStylesheet(
+  theme: ThemeTokens = colors,
+  extras?: TokenExtras,
+): string {
+  const extra = extrasToCss(extras);
+  return [
+    `:root {\n  ${colorsToCss(theme.light)}\n  ${staticTokensCss()}${extra}\n}`,
+    `@media (prefers-color-scheme: dark) {\n  :root {\n    ${colorsToCss(theme.dark)}${extra}\n  }\n}`,
+    `:root[data-theme="dark"] {\n  ${colorsToCss(theme.dark)}${extra}\n}`,
+    `:root[data-theme="light"] {\n  ${colorsToCss(theme.light)}${extra}\n}`,
+  ].join("\n");
+}

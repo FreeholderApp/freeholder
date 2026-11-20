@@ -1,0 +1,167 @@
+// Copyright (C) 2026 Tony Aly
+// SPDX-License-Identifier: Apache-2.0
+"use server";
+
+import { cookies } from "next/headers";
+import { revalidatePath } from "next/cache";
+import { redirect } from "next/navigation";
+import { SESSION_COOKIE } from "@/core/auth/sessions";
+import { actorFromToken } from "@/core/http/actor";
+import { ServiceError } from "@/core/service";
+import { ownerFacing } from "./action-helpers";
+import { importGraphVersionSchema } from "@/core/import/graph-version";
+import {
+  commitImport,
+  mapImport,
+  previewImport,
+  previewFromUrl,
+  publishImport,
+  reconcileImport,
+  reviewImportConflicts,
+  rollbackImport,
+  startImport,
+} from "@/core/import/service";
+
+export interface ImportActionState {
+  error?: string;
+}
+
+function text(form: FormData, key: string): string {
+  const value = form.get(key);
+  return typeof value === "string" ? value.trim() : "";
+}
+function observedGraph(form: FormData) {
+  const value = text(form, "graph");
+  if (!value) return undefined;
+  try { return importGraphVersionSchema.parse(JSON.parse(value)); }
+  catch { throw new ServiceError("validation", "Review the current source version before continuing."); }
+}
+
+export async function startImportAction(
+  _prev: ImportActionState,
+  form: FormData,
+): Promise<ImportActionState> {
+  const actor = await actorFromToken((await cookies()).get(SESSION_COOKIE)?.value);
+  let started: { id: string };
+  try {
+    started = await startImport.call(
+      {
+        origin: text(form, "origin"),
+        approvedMediaOrigins: text(form, "approvedMediaOrigins").split(/\r?\n/).map(value => value.trim()).filter(Boolean),
+        kind: text(form, "kind") as
+          | "wordpress-rest"
+          | "wordpress-wxr"
+          | "sitemap"
+          | "rss"
+          | "atom"
+          | "html"
+          | "archive",
+      },
+      actor,
+    );
+  } catch (error) {
+    return {
+      error: error instanceof ServiceError ? ownerFacing(error.message) : "That import could not start.",
+    };
+  }
+  revalidatePath("/admin/imports");
+  redirect(`/admin/imports/${started.id}`);
+}
+
+export async function mapImportAction(form: FormData): Promise<void> {
+  const actor = await actorFromToken((await cookies()).get(SESSION_COOKIE)?.value);
+  const id = text(form, "id");
+  await mapImport.call(
+    {
+      id,
+      mapping: [
+        {
+          url: text(form, "url"),
+          slug: text(form, "slug"),
+          title: text(form, "title"),
+          kind: text(form, "kind") === "post" ? "post" : "page",
+        },
+      ],
+    },
+    actor,
+  );
+  revalidatePath(`/admin/imports/${id}`);
+}
+
+export async function reviewImportConflictsAction(form: FormData): Promise<void> {
+  const actor = await actorFromToken((await cookies()).get(SESSION_COOKIE)?.value);
+  const id = text(form, "id");
+  const renamed = text(form, "renamedSlug");
+  await reviewImportConflicts.call(
+    {
+      id,
+      graph: observedGraph(form),
+      conflicts: [
+        {
+          slug: text(form, "slug"),
+          resolution: (["keep-existing", "replace", "rename"].includes(text(form, "resolution"))
+            ? text(form, "resolution")
+            : "keep-existing") as "keep-existing" | "replace" | "rename",
+          ...(renamed ? { renamedSlug: renamed } : {}),
+        },
+      ],
+    },
+    actor,
+  );
+  revalidatePath(`/admin/imports/${id}`);
+}
+
+export async function previewImportAction(form: FormData): Promise<void> {
+  const actor = await actorFromToken((await cookies()).get(SESSION_COOKIE)?.value);
+  const id = text(form, "id");
+  await previewImport.call(
+    {
+      id,
+      pages: [{ url: text(form, "url"), slug: text(form, "slug"), title: text(form, "title") }],
+    },
+    actor,
+  );
+  revalidatePath(`/admin/imports/${id}`);
+}
+
+export async function commitImportAction(form: FormData): Promise<void> {
+  const actor = await actorFromToken((await cookies()).get(SESSION_COOKIE)?.value);
+  const id = text(form, "id");
+  await commitImport.call({ id }, actor);
+  revalidatePath(`/admin/imports/${id}`);
+}
+
+export async function reconcileImportAction(form: FormData): Promise<void> {
+  const actor = await actorFromToken((await cookies()).get(SESSION_COOKIE)?.value);
+  const id = text(form, "id");
+  // The service recounts what the commit wrote; nothing is asserted from here.
+  await reconcileImport.call({ id }, actor);
+  revalidatePath(`/admin/imports/${id}`);
+}
+
+export async function publishImportAction(form: FormData): Promise<void> {
+  const actor = await actorFromToken((await cookies()).get(SESSION_COOKIE)?.value);
+  const id = text(form, "id");
+  await publishImport.call({ id }, actor);
+  revalidatePath(`/admin/imports/${id}`);
+}
+
+export async function rollbackImportAction(form: FormData): Promise<void> {
+  const actor = await actorFromToken((await cookies()).get(SESSION_COOKIE)?.value);
+  const id = text(form, "id");
+  await rollbackImport.call({ id }, actor);
+  revalidatePath(`/admin/imports/${id}`);
+}
+
+
+export async function crawlImportAction(_previous: ImportActionState, form: FormData): Promise<ImportActionState> {
+  const actor = await actorFromToken((await cookies()).get(SESSION_COOKIE)?.value);
+  const id = text(form, "id");
+  try {
+    const result = await previewFromUrl.call({ id, url: text(form, "sourceUrl") }, actor);
+    revalidatePath(`/admin/imports/${id}`);
+    return result.error ? { error: result.error } : {};
+  } catch (error) {
+    return { error: error instanceof ServiceError ? ownerFacing(error.message) : "That source could not be read. Check its public URL and try again." };
+  }
+}

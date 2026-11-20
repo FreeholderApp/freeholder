@@ -1,0 +1,520 @@
+// Copyright (C) 2026 Tony Aly
+// SPDX-License-Identifier: Apache-2.0
+// The availability resolver (C6.03, MASTER.md §4.4).
+//
+// Availability is computed from seven things, and getting any one of them
+// wrong offers a slot the business cannot honour — which is worse than
+// offering fewer. So each subtraction is tested on its own, against the same
+// simple week, so a failure names the thing that broke.
+import { afterAll, beforeEach, describe, expect, it } from "vitest";
+import { users } from "@/core/auth/schema";
+import { connectedAccounts, externalCalendars, externalEvents } from "@/core/connections/schema";
+import { db } from "@/core/db";
+import { ready } from "@/core/runtime";
+import { createCalendar, setServiceCalendars, updateCalendar } from "@/core/scheduling/service";
+import { setAvailability, addAvailabilityException } from "@/core/scheduling/availability-service";
+import { createBooking, setBookingStatus } from "@/core/scheduling/bookings";
+import { externalBusyBlocks } from "@/core/scheduling/schema";
+import { resolveSlots } from "@/core/scheduling/resolver";
+import { businessDayBounds } from "@/core/scheduling/business-day";
+import { availableSlots } from "@/core/scheduling/resolver-service";
+import { createAudience, setAudienceServices } from "@/core/scheduling/audiences";
+import {
+  createProduct,
+  upsertServiceOffering,
+} from "@/modules/catalog/service";
+import {
+  ANONYMOUS,
+  closeDb,
+  hasDatabase,
+  OWNER,
+  truncateSpine,
+} from "../helpers/spine";
+
+const SERVICE = "00000000-0000-4000-8000-0000000000e0";
+// 2026-09-14 is a Monday.
+const MONDAY = "2026-09-14";
+/** Well before the week under test, so lead time never interferes by accident. */
+const NOW = new Date("2026-09-01T00:00:00.000Z");
+
+async function slots(overrides: Record<string, unknown> = {}) {
+  return db().transaction((tx) =>
+    resolveSlots(tx, {
+      serviceOfferingId: SERVICE,
+      from: MONDAY,
+      to: MONDAY,
+      timezone: "UTC",
+      durationMin: 60,
+      granularityMin: 60,
+      now: NOW,
+      ...overrides,
+    }),
+  );
+}
+
+/** Just the start times, in a form a failure message can be read from. */
+function times(found: { startsAt: Date }[]): string[] {
+  return found.map((slot) => slot.startsAt.toISOString().slice(11, 16));
+}
+
+describe.runIf(hasDatabase)("the availability resolver", { timeout: 60_000 }, () => {
+  beforeEach(async () => {
+    await ready();
+    await truncateSpine();
+    await db()
+      .insert(users)
+      .values({ id: OWNER.userId, email: "owner@example.test", role: "owner" })
+      .onConflictDoNothing();
+  }, 60_000);
+
+  afterAll(async () => {
+    await truncateSpine();
+    await closeDb();
+  });
+
+  /** A person who works Mondays, nine to five, on this service. */
+  async function therapist(name = "Sam", capacityDefault = 1) {
+    const calendar = await createCalendar.call(
+      { kind: "resource", name, capacityDefault, timezone: "UTC" },
+      OWNER,
+    );
+    await setAvailability.call(
+      {
+        calendarId: calendar.id,
+        rules: [{ weekday: 1, starts: "09:00", ends: "17:00", kind: "bookable" }],
+      },
+      OWNER,
+    );
+    return calendar;
+  }
+
+  async function serves(members: { calendarId: string; role: "primary" | "resource" }[]) {
+    await setServiceCalendars.call(
+      {
+        serviceOfferingId: SERVICE,
+        members: members.map((member) => ({ ...member, priority: 0 })),
+      },
+      OWNER,
+    );
+  }
+
+  it("cuts open hours into slots of the service's length", async () => {
+    const sam = await therapist();
+    await serves([{ calendarId: sam.id, role: "primary" }]);
+    // Nine to five, hourly: eight slots, the last starting at four.
+    expect(times(await slots())).toEqual([
+      "09:00", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "16:00",
+    ]);
+  });
+
+  it("composes the public slot service through the catalog and business spine", async () => {
+    // Use a future UTC day so this remains a real public-service test instead
+    // of depending on the fixed historical clock used by the resolver units.
+    const day = new Date();
+    day.setUTCDate(day.getUTCDate() + 14);
+    const date = day.toISOString().slice(0, 10);
+    const calendar = await createCalendar.call(
+      { kind: "resource", name: "Public chair", timezone: "UTC" },
+      OWNER,
+    );
+    await setAvailability.call(
+      {
+        calendarId: calendar.id,
+        rules: [
+          {
+            weekday: day.getUTCDay(),
+            starts: "09:00",
+            ends: "11:00",
+            kind: "bookable",
+          },
+        ],
+      },
+      OWNER,
+    );
+    const product = await createProduct.call(
+      { name: "Public consultation", slug: "public-consultation", kind: "service" },
+      OWNER,
+    );
+    const offering = await upsertServiceOffering.call(
+      { productId: product.id, durationMin: 60, locationType: "in_person" },
+      OWNER,
+    );
+    await setServiceCalendars.call(
+      {
+        serviceOfferingId: offering.id,
+        members: [{ calendarId: calendar.id, role: "primary", priority: 0 }],
+      },
+      OWNER,
+    );
+    const audience = await createAudience.call(
+      { name: "Public", who: "public", hours: "calendar" },
+      OWNER,
+    );
+    await setAudienceServices.call(
+      { id: audience.id, serviceOfferingIds: [offering.id] },
+      OWNER,
+    );
+
+    const found = await availableSlots.call(
+      {
+        serviceOfferingId: offering.id,
+        productId: product.id,
+        from: date,
+        to: date,
+        granularityMin: 60,
+      },
+      ANONYMOUS,
+    );
+    expect(times(found)).toEqual(["09:00", "10:00"]);
+  });
+
+  it("offers nothing on a day the calendar is closed", async () => {
+    const sam = await therapist();
+    await serves([{ calendarId: sam.id, role: "primary" }]);
+    await addAvailabilityException.call(
+      { calendarId: sam.id, startsOn: MONDAY, kind: "closed", reason: "Bank holiday" },
+      OWNER,
+    );
+    expect(await slots()).toEqual([]);
+  });
+
+  it("subtracts what is already booked", async () => {
+    const sam = await therapist();
+    await serves([{ calendarId: sam.id, role: "primary" }]);
+    await createBooking.call(
+      {
+        calendarId: sam.id,
+        contact: { email: "rae@example.test" },
+        startsAt: `${MONDAY}T11:00:00.000Z`,
+        endsAt: `${MONDAY}T12:00:00.000Z`,
+      },
+      OWNER,
+    );
+    expect(times(await slots())).not.toContain("11:00");
+    expect(times(await slots())).toContain("10:00");
+  });
+
+  it("subtracts busy time synced from a connected calendar", async () => {
+    const sam = await therapist();
+    await serves([{ calendarId: sam.id, role: "primary" }]);
+
+    // §4.4: imported busy time is never shown to customers and always
+    // respected. It reaches the resolver through the calendar's link.
+    const accountId = "00000000-0000-4000-8000-0000000000e1";
+    await db().insert(connectedAccounts).values({
+      id: accountId,
+      userId: OWNER.userId,
+      provider: "google",
+      providerAccountId: "resolver-account",
+      email: "sam@example.test",
+      status: "active",
+      sharedWithBusiness: true,
+    });
+    const [synced] = await db()
+      .insert(externalCalendars)
+      .values({ connectedAccountId: accountId, externalId: "primary", name: "Sam's own" })
+      .returning({ id: externalCalendars.id });
+    await db().insert(externalEvents).values({
+      externalCalendarId: synced!.id,
+      externalId: "dentist",
+      startsAt: new Date(`${MONDAY}T14:00:00.000Z`),
+      endsAt: new Date(`${MONDAY}T15:00:00.000Z`),
+      busy: true,
+    });
+    await updateCalendar.call({ id: sam.id, externalCalendarId: synced!.id }, OWNER);
+
+    const found = times(await slots());
+    expect(found).not.toContain("14:00");
+    expect(found).toContain("13:00");
+    // Nothing about the appointment itself travelled: the resolver returns
+    // times and a calendar name, and C4.12 never stored a title to leak.
+    expect(JSON.stringify(await slots())).not.toContain("dentist");
+  });
+
+  it("leaves room for the buffers either side", async () => {
+    const sam = await therapist();
+    await serves([{ calendarId: sam.id, role: "primary" }]);
+    await createBooking.call(
+      {
+        calendarId: sam.id,
+        contact: { email: "rae@example.test" },
+        startsAt: `${MONDAY}T12:00:00.000Z`,
+        endsAt: `${MONDAY}T13:00:00.000Z`,
+      },
+      OWNER,
+    );
+    // Half an hour either side: the eleven o'clock would end at noon with no
+    // gap, and the one o'clock would start the moment the last one ended.
+    const guarded = times(await slots({ bufferBeforeMin: 30, bufferAfterMin: 30 }));
+    expect(guarded).not.toContain("11:00");
+    expect(guarded).not.toContain("13:00");
+    expect(guarded).toContain("10:00");
+    expect(guarded).toContain("14:00");
+  });
+
+  it("counts travel time as part of the gap after", async () => {
+    const sam = await therapist();
+    await serves([{ calendarId: sam.id, role: "primary" }]);
+    await createBooking.call(
+      {
+        calendarId: sam.id,
+        contact: { email: "rae@example.test" },
+        startsAt: `${MONDAY}T12:00:00.000Z`,
+        endsAt: `${MONDAY}T13:00:00.000Z`,
+      },
+      OWNER,
+    );
+    // A photographer is not booked back-to-back across town.
+    expect(times(await slots({ travelTimeMin: 45 }))).not.toContain("11:00");
+  });
+
+  it("refuses to offer anything inside the notice period", async () => {
+    const sam = await therapist();
+    await serves([{ calendarId: sam.id, role: "primary" }]);
+    await updateCalendar.call({ id: sam.id, minNoticeMin: 24 * 60 }, OWNER);
+    // Asking at nine on the morning itself: a day's notice rules the day out.
+    const sameDay = await slots({ now: new Date(`${MONDAY}T08:00:00.000Z`) });
+    expect(sameDay).toEqual([]);
+  });
+
+  it("refuses to offer anything past the horizon", async () => {
+    const sam = await therapist();
+    await serves([{ calendarId: sam.id, role: "primary" }]);
+    await updateCalendar.call({ id: sam.id, bookingHorizonDays: 7 }, OWNER);
+    // The Monday is thirteen days out, and the horizon is seven.
+    expect(await slots()).toEqual([]);
+  });
+
+  it("counts existing appointments against the daily cap, not the offered choices", async () => {
+    const sam = await therapist();
+    await serves([{ calendarId: sam.id, role: "primary" }]);
+    await updateCalendar.call({ id: sam.id, maxPerDay: 3 }, OWNER);
+    // Three appointments may be booked at any of the eight offered hours.
+    expect(await slots()).toHaveLength(8);
+    let firstBookingId: string | undefined;
+    for (const hour of [9, 10, 11]) {
+      const booking = await createBooking.call({
+        calendarId: sam.id,
+        contact: { email: `cap-${hour}@example.test` },
+        startsAt: `${MONDAY}T${hour.toString().padStart(2, "0")}:00:00.000Z`,
+        endsAt: `${MONDAY}T${(hour + 1).toString().padStart(2, "0")}:00:00.000Z`,
+      }, OWNER);
+      firstBookingId ??= booking.id;
+      if (hour === 11) {
+        // Work already completed today still counts against the daily limit.
+        await setBookingStatus.call({ id: booking.id, status: "confirmed" }, OWNER);
+        await setBookingStatus.call({ id: booking.id, status: "completed" }, OWNER);
+      }
+    }
+    expect(await slots()).toEqual([]);
+    // Moving an existing appointment does not consume a fourth daily place.
+    expect(times(await slots({ excludeBookingId: firstBookingId }))).toContain("16:00");
+  });
+
+  it("only offers a slot where the person and the room are both free", async () => {
+    const sam = await therapist("Sam");
+    const roomA = await therapist("Room A");
+    await serves([
+      { calendarId: sam.id, role: "primary" },
+      { calendarId: roomA.id, role: "resource" },
+    ]);
+    await createBooking.call(
+      {
+        calendarId: roomA.id,
+        contact: { email: "someone@example.test" },
+        startsAt: `${MONDAY}T10:00:00.000Z`,
+        endsAt: `${MONDAY}T11:00:00.000Z`,
+      },
+      OWNER,
+    );
+
+    const found = await slots();
+    // Sam is free at ten; the only room is not. Choosing them together is what
+    // stops a slot being offered that cannot be honoured.
+    expect(times(found)).not.toContain("10:00");
+    expect(found[0]?.resourceCalendarIds).toEqual([roomA.id]);
+  });
+
+  it("uses a second room when the first is taken", async () => {
+    const sam = await therapist("Sam");
+    const roomA = await therapist("Room A");
+    const roomB = await therapist("Room B");
+    await serves([
+      { calendarId: sam.id, role: "primary" },
+      { calendarId: roomA.id, role: "resource" },
+      { calendarId: roomB.id, role: "resource" },
+    ]);
+    await createBooking.call(
+      {
+        calendarId: roomA.id,
+        contact: { email: "someone@example.test" },
+        startsAt: `${MONDAY}T10:00:00.000Z`,
+        endsAt: `${MONDAY}T11:00:00.000Z`,
+      },
+      OWNER,
+    );
+    const found = await slots();
+    const ten = found.find((slot) => slot.startsAt.toISOString().includes("T10:00"));
+    expect(ten?.resourceCalendarIds).toEqual([roomB.id]);
+  });
+
+  it("offers the named person first without hiding the others", async () => {
+    const sam = await therapist("Sam");
+    const kim = await therapist("Kim");
+    await serves([
+      { calendarId: sam.id, role: "primary" },
+      { calendarId: kim.id, role: "primary" },
+    ]);
+    const found = await slots({ preferredCalendarId: kim.id, assignment: "pool" });
+    // A preference, not a filter: Kim is offered first for a given time, and
+    // Sam is still there.
+    expect(found[0]?.calendarId).toBe(kim.id);
+    expect(found.some((slot) => slot.calendarId === sam.id)).toBe(true);
+  });
+
+  it("keeps the earliest times when a limit cuts across several calendars", async () => {
+    // Kim sorts first but only works afternoons. Stopping once Kim filled the
+    // limit hid Sam's morning, and /book's first free day (C6.19) asks with a
+    // limit of one.
+    const kim = await therapist("Kim");
+    const sam = await therapist("Sam");
+    await setAvailability.call(
+      { calendarId: kim.id, rules: [{ weekday: 1, starts: "14:00", ends: "17:00", kind: "bookable" }] },
+      OWNER,
+    );
+    await serves([
+      { calendarId: kim.id, role: "primary" },
+      { calendarId: sam.id, role: "primary" },
+    ]);
+    const two = await slots({ assignment: "pool", maxSlots: 2 });
+    expect(times(two)).toEqual(["09:00", "10:00"]);
+    expect(two.every((slot) => slot.calendarId === sam.id)).toBe(true);
+    expect(times(await slots({ assignment: "round_robin", maxSlots: 1 }))).toEqual(["09:00"]);
+  });
+
+  it("bounds a business day to its instants before the limit, 25 hours on the day the clocks go back", async () => {
+    const calendar = await createCalendar.call({ kind: "resource", name: "Desk", timezone: "America/Los_Angeles" }, OWNER);
+    await serves([{ calendarId: calendar.id, role: "primary" }]);
+    const day = businessDayBounds("2026-11-01", "America/Los_Angeles");
+    const found = await slots({
+      from: "2026-10-31",
+      to: "2026-11-02",
+      audienceHours: { mode: "any" },
+      notBefore: day.notBefore,
+      notAfter: day.notAfter,
+      // The three calendar days hold 73 hourly starts; the business day 25.
+      maxSlots: 25,
+    });
+    expect(found).toHaveLength(25);
+    expect(found[0]!.startsAt.toISOString()).toBe("2026-11-01T07:00:00.000Z");
+    expect(found.at(-1)!.startsAt.toISOString()).toBe("2026-11-02T07:00:00.000Z");
+  });
+
+  it("offers only the named person when the service names one", async () => {
+    const sam = await therapist("Sam");
+    const kim = await therapist("Kim");
+    await serves([
+      { calendarId: sam.id, role: "primary" },
+      { calendarId: kim.id, role: "primary" },
+    ]);
+    const found = await slots({
+      preferredCalendarId: kim.id,
+      assignment: "specific",
+    });
+    expect(found.every((slot) => slot.calendarId === kim.id)).toBe(true);
+  });
+
+  it("shows a time once and spreads the work when it is round-robin", async () => {
+    const sam = await therapist("Sam");
+    const kim = await therapist("Kim");
+    await serves([
+      { calendarId: sam.id, role: "primary" },
+      { calendarId: kim.id, role: "primary" },
+    ]);
+    const found = await slots({ assignment: "round_robin" });
+    // A customer picking a time should be shown the time once; which of two
+    // available people they get is the business's decision.
+    expect(times(found)).toEqual([
+      "09:00", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "16:00",
+    ]);
+    const forSam = found.filter((slot) => slot.calendarId === sam.id).length;
+    const forKim = found.filter((slot) => slot.calendarId === kim.id).length;
+    expect(Math.abs(forSam - forKim)).toBeLessThanOrEqual(1);
+  });
+
+  it("counts places on a shared calendar and stops when they run out", async () => {
+    const room = await therapist("Yoga room", 3);
+    await serves([{ calendarId: room.id, role: "primary" }]);
+    await createBooking.call(
+      {
+        calendarId: room.id,
+        contact: { email: "rae@example.test" },
+        startsAt: `${MONDAY}T10:00:00.000Z`,
+        endsAt: `${MONDAY}T11:00:00.000Z`,
+        capacityUsed: 2,
+      },
+      OWNER,
+    );
+
+    const found = await slots();
+    const ten = found.find((slot) => slot.startsAt.toISOString().includes("T10:00"));
+    expect(ten?.seatsAvailable).toBe(1);
+    // A party of two cannot have the one remaining place.
+    const forTwo = await slots({ seats: 2 });
+    expect(times(forTwo)).not.toContain("10:00");
+    expect(times(forTwo)).toContain("11:00");
+  });
+
+  it("limits a party to both the service capacity and the calendar capacity", async () => {
+    const room = await therapist("Shared room", 10);
+    await serves([{ calendarId: room.id, role: "primary" }]);
+    expect(await slots({ capacity: 2, seats: 3 })).toEqual([]);
+    expect((await slots({ capacity: 2, seats: 2 }))[0]?.seatsAvailable).toBe(2);
+    await createBooking.call({
+      calendarId: room.id, contact: { email: "already@example.test" },
+      startsAt: `${MONDAY}T10:00:00.000Z`, endsAt: `${MONDAY}T11:00:00.000Z`, capacityUsed: 2,
+    }, OWNER);
+    expect(times(await slots({ capacity: 2 }))).not.toContain("10:00");
+    const chair = await therapist("Single chair", 1);
+    await serves([{ calendarId: chair.id, role: "primary" }]);
+    expect(await slots({ capacity: 10, seats: 2 })).toEqual([]);
+  });
+
+  it("respects imported busy time and occupied buffer capacity on shared calendars", async () => {
+    const room = await therapist("Shared room", 3);
+    await serves([{ calendarId: room.id, role: "primary" }]);
+    await db().insert(externalBusyBlocks).values({
+      calendarId: room.id, sourceRef: "external-meeting",
+      startsAt: new Date(`${MONDAY}T14:00:00.000Z`), endsAt: new Date(`${MONDAY}T15:00:00.000Z`),
+    });
+    await createBooking.call({
+      calendarId: room.id, contact: { email: "full-class@example.test" }, capacityUsed: 3,
+      startsAt: `${MONDAY}T12:00:00.000Z`, endsAt: `${MONDAY}T13:00:00.000Z`,
+    }, OWNER);
+    const found = times(await slots({ bufferBeforeMin: 30, bufferAfterMin: 30 }));
+    expect(found).not.toContain("14:00");
+    expect(found).not.toContain("11:00");
+    expect(found).not.toContain("13:00");
+    expect(found).toContain("10:00");
+    expect(found).toContain("16:00");
+  });
+
+  it("offers nothing for a service nobody is set up to do", async () => {
+    const sam = await therapist();
+    // Hours, but no membership: the service draws on no calendars.
+    void sam;
+    expect(await slots()).toEqual([]);
+  });
+
+  it("ignores an archived calendar", async () => {
+    const sam = await therapist("Sam");
+    const kim = await therapist("Kim");
+    await serves([
+      { calendarId: sam.id, role: "primary" },
+      { calendarId: kim.id, role: "primary" },
+    ]);
+    await updateCalendar.call({ id: kim.id, status: "archived" }, OWNER);
+    const found = await slots();
+    expect(found.every((slot) => slot.calendarId === sam.id)).toBe(true);
+  });
+});

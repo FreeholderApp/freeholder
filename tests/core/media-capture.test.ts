@@ -1,0 +1,529 @@
+// Copyright (C) 2026 Tony Aly
+// SPDX-License-Identifier: Apache-2.0
+// Capture and phone ingest (MASTER.md §4.5, C1.28, C1.29).
+
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
+import sharp from "sharp";
+import {
+  attachCaptureUpload,
+  confirmCapture,
+  createCaptureSession,
+  createUploadLink,
+  discardCapture,
+  expireCaptureSessions,
+  getCaptureSession,
+  grantCapturePermission,
+  reviewCapture,
+  startCapture,
+  stopCapture,
+} from "@/core/media/capture";
+import { getAsset, listAssets } from "@/core/media/service";
+import { storage } from "@/adapters/storage";
+import {
+  ANONYMOUS,
+  closeDb,
+  failure,
+  hasDatabase,
+  OWNER,
+  truncateSpine,
+} from "../helpers/spine";
+
+async function png(): Promise<Uint8Array<ArrayBuffer>> {
+  const buffer = await sharp({
+    create: { width: 8, height: 8, channels: 3, background: "#336699" },
+  })
+    .png()
+    .toBuffer();
+  return new Uint8Array(buffer);
+}
+
+describe.runIf(hasDatabase)("media capture sessions", { timeout: 30_000 }, () => {
+  beforeEach(truncateSpine);
+  afterAll(closeDb);
+
+  it("requires media authority for a session id while preserving the phone token lane", async () => {
+    const link = await createUploadLink.call({ source: "upload_link" }, OWNER);
+    const customer = { kind: "user" as const, userId: OWNER.userId, role: "customer" as const, grants: [] };
+    for (const actor of [ANONYMOUS, customer, { kind: "agent" as const, keyName: "capture-test", scopes: ["contacts.list"] }]) {
+      expect((await failure(getCaptureSession.call({ id: link.id }, actor))).code).toBe("permission");
+      expect((await failure(attachCaptureUpload.call({ id: link.id, filename: "test.png", contentType: "image/png", bytes: await png() }, actor))).code).toBe("permission");
+      expect((await failure(confirmCapture.call({ id: link.id }, actor))).code).toBe("permission");
+    }
+    expect((await getCaptureSession.call({ token: link.token }, ANONYMOUS))?.id).toBe(link.id);
+    expect((await getCaptureSession.call({ id: link.id }, OWNER))?.id).toBe(link.id);
+    const reader = { kind: "agent" as const, keyName: "capture-reader", scopes: ["media.getCaptureSession"] };
+    expect(await getCaptureSession.call({ id: link.id }, reader)).toMatchObject({ id: link.id, captureUrl: null, uploadId: null });
+  });
+
+  it("refuses to record without an explicit permission grant", async () => {
+    const session = await createCaptureSession.call({ source: "screen" }, OWNER);
+    const blocked = await failure(startCapture.call({ id: session.id }, OWNER));
+    expect(blocked.code).toBe("validation");
+    expect(blocked.message).toContain("permission");
+  });
+
+  it("records, reviews, confirms and keeps provenance on a normal Asset", async () => {
+    const session = await createCaptureSession.call({ source: "camera" }, OWNER);
+    await grantCapturePermission.call({ id: session.id, displaySurface: "browser" }, OWNER);
+    await startCapture.call({ id: session.id }, OWNER);
+    await stopCapture.call({ id: session.id }, OWNER);
+    const attached = await attachCaptureUpload.call(
+      {
+        id: session.id,
+        filename: "desk.png",
+        contentType: "image/png",
+        bytes: await png(),
+      },
+      OWNER,
+    );
+    expect(attached.session.status).toBe("preview");
+    expect(attached.session.staged).toBe(true);
+    expect(attached.asset).toBeNull();
+    expect((await listAssets.call({}, OWNER)).total).toBe(0);
+    await reviewCapture.call(
+      {
+        id: session.id,
+        caption: "The studio desk",
+        trimStartMs: 0,
+        trimEndMs: 1_000,
+        focalX: 2_500,
+        focalY: 7_500,
+      },
+      OWNER,
+    );
+    const confirmed = await confirmCapture.call({ id: session.id }, OWNER);
+    expect(confirmed.status).toBe("confirmed");
+    expect(confirmed.assetId).toBeTruthy();
+    const asset = await getAsset.call({ id: confirmed.assetId! }, OWNER);
+    expect(asset.altText).toBe("The studio desk");
+    expect(asset.source).toBe("capture");
+    expect(asset.focalX).toBe(2_500);
+    expect(asset.focalY).toBe(7_500);
+    expect(asset.metadata).toMatchObject({ trimStartMs: 0, trimEndMs: 1_000 });
+    expect(asset.provenance).toMatchObject({ captureSessionId: session.id });
+  });
+
+  it("discards a preview so the staged file does not stay in the library", async () => {
+    const session = await createCaptureSession.call({ source: "microphone" }, OWNER);
+    await grantCapturePermission.call({ id: session.id }, OWNER);
+    const attached = await attachCaptureUpload.call(
+      {
+        id: session.id,
+        filename: "clip.png",
+        contentType: "image/png",
+        bytes: await png(),
+      },
+      OWNER,
+    );
+    expect(attached.asset).toBeNull();
+    expect(attached.session.staged).toBe(true);
+    await discardCapture.call({ id: session.id }, OWNER);
+    expect((await listAssets.call({ includeTrashed: true }, OWNER)).total).toBe(0);
+    const gone = await getCaptureSession.call({ id: session.id }, OWNER);
+    expect(gone?.status).toBe("discarded");
+    expect(gone?.staged).toBe(false);
+  });
+
+  it("lets a phone finish an expiring upload link without a staff session", async () => {
+    const link = await createUploadLink.call({ source: "upload_link" }, OWNER);
+    expect(link.captureUrl).toContain("/capture/");
+    expect(link.qrSvg).toContain("<svg");
+    const attached = await attachCaptureUpload.call(
+      {
+        token: link.token,
+        filename: "phone.png",
+        contentType: "image/png",
+        bytes: await png(),
+      },
+      ANONYMOUS,
+    );
+    expect(attached.session.status).toBe("preview");
+    expect(attached.session.staged).toBe(true);
+    expect((await listAssets.call({}, OWNER)).total).toBe(0);
+    const confirmed = await confirmCapture.call({ token: link.token }, ANONYMOUS);
+    expect(confirmed.status).toBe("confirmed");
+    expect(confirmed.assetId).toBeTruthy();
+    expect(await getCaptureSession.call({ token: link.token }, ANONYMOUS)).toMatchObject({
+      status: "confirmed",
+      uploadCount: 1,
+    });
+  });
+
+  it("persists recording chunks and assembles them after an interruption", async () => {
+    const session = await createCaptureSession.call({ source: "screen" }, OWNER);
+    await grantCapturePermission.call({ id: session.id }, OWNER);
+    const original = await png();
+    const split = Math.max(1, Math.floor(original.byteLength / 2));
+    const { appendCaptureChunk, assembleCapture } = await import("@/core/media/capture");
+    await appendCaptureChunk.call(
+      { id: session.id, sequence: 0, contentType: "image/png", bytes: original.subarray(0, split) },
+      OWNER,
+    );
+    await appendCaptureChunk.call(
+      { id: session.id, sequence: 1, contentType: "image/png", bytes: original.subarray(split) },
+      OWNER,
+    );
+    const assembled = await assembleCapture.call(
+      { id: session.id, filename: "assembled.png" },
+      OWNER,
+    );
+    expect(assembled.session.status).toBe("preview");
+    expect(assembled.session.staged).toBe(true);
+    expect(assembled.asset).toBeNull();
+    const confirmed = await confirmCapture.call({ id: session.id }, OWNER);
+    const asset = await getAsset.call({ id: confirmed.assetId! }, OWNER);
+    expect(asset.bytes).toBe(original.byteLength);
+  });
+
+  // §11: assembling used to delete the chunk objects before the assembled
+  // original was stored or committed, so one failed write lost the recording.
+  it("keeps a recording recoverable when storing the assembled original fails", async () => {
+    const session = await createCaptureSession.call({ source: "screen" }, OWNER);
+    await grantCapturePermission.call({ id: session.id }, OWNER);
+    const original = await png();
+    const split = Math.max(1, Math.floor(original.byteLength / 2));
+    const { appendCaptureChunk, assembleCapture, deleteCaptureObjects } = await import(
+      "@/core/media/capture"
+    );
+    const { mediaCaptureChunks, mediaObjects } = await import("@/core/media/schema");
+    const { db } = await import("@/core/db");
+    const { eq } = await import("drizzle-orm");
+    await appendCaptureChunk.call(
+      { id: session.id, sequence: 0, contentType: "image/png", bytes: original.subarray(0, split) },
+      OWNER,
+    );
+    await appendCaptureChunk.call(
+      { id: session.id, sequence: 1, contentType: "image/png", bytes: original.subarray(split) },
+      OWNER,
+    );
+    const chunkKeys = (
+      await db()
+        .select()
+        .from(mediaCaptureChunks)
+        .where(eq(mediaCaptureChunks.sessionId, session.id))
+    ).map((chunk) => chunk.storageKey);
+    expect(chunkKeys).toHaveLength(2);
+    // Logical chunk ownership and the physical receipt both survive until
+    // the successful assembly transaction retires each chunk pointer.
+    for (const key of chunkKeys) {
+      expect(await db().select().from(mediaObjects).where(eq(mediaObjects.key, key))).toMatchObject([{key,state:"pending"}]);
+      const {pendingObjectIsOwned}=await import("@/core/media/object-ledger");expect(await pendingObjectIsOwned(key)).toBe(true);
+    }
+
+    const store = storage();
+    const put = store.put.bind(store);
+    const failing = vi.spyOn(store, "put").mockImplementation(async (key, ...rest) => {
+      if (key.includes("/item/")) throw new Error("object store unavailable");
+      return put(key, ...rest);
+    });
+    try {
+      await expect(
+        assembleCapture.call({ id: session.id, filename: "assembled.png" }, OWNER),
+      ).rejects.toThrow(/unavailable/);
+    } finally {
+      failing.mockRestore();
+    }
+    for (const key of chunkKeys) expect(await store.get(key)).toBeDefined();
+    expect(
+      await db().select().from(mediaCaptureChunks).where(eq(mediaCaptureChunks.sessionId, session.id)),
+    ).toHaveLength(2);
+
+    // The retry still has every byte, and the chunk objects outlive the
+    // commit until the post-commit delete job runs.
+    const assembled = await assembleCapture.call(
+      { id: session.id, filename: "assembled.png" },
+      OWNER,
+    );
+    expect(assembled.session.staged).toBe(true);
+    for (const key of chunkKeys) expect(await store.get(key)).toBeDefined();
+    await deleteCaptureObjects(chunkKeys);
+    for (const key of chunkKeys) expect(await store.get(key)).toBeUndefined();
+    const confirmed = await confirmCapture.call({ id: session.id }, OWNER);
+    const asset = await getAsset.call({ id: confirmed.assetId! }, OWNER);
+    expect(asset.bytes).toBe(original.byteLength);
+  });
+
+  it("queues the losing object when one timeslice is uploaded twice at once", async () => {
+    const session = await createCaptureSession.call({ source: "screen" }, OWNER);
+    await grantCapturePermission.call({ id: session.id }, OWNER);
+    const { appendCaptureChunk } = await import("@/core/media/capture");
+    const { mediaCaptureChunks } = await import("@/core/media/schema");
+    const { startJobProducer } = await import("@/core/jobs");
+    const { db } = await import("@/core/db");
+    const { eq } = await import("drizzle-orm");
+    const store = storage();
+    const put = store.put.bind(store);
+    const written: string[] = [];
+    const recording = vi.spyOn(store, "put").mockImplementation(async (key, ...rest) => {
+      written.push(key);
+      return put(key, ...rest);
+    });
+    try {
+      const bytes = new Uint8Array([1, 2, 3]);
+      await Promise.all([
+        appendCaptureChunk.call({ id: session.id, sequence: 0, contentType: "video/webm", bytes }, OWNER),
+        appendCaptureChunk.call({ id: session.id, sequence: 0, contentType: "video/webm", bytes }, OWNER),
+      ]);
+    } finally {
+      recording.mockRestore();
+    }
+    expect(written).toHaveLength(2);
+    const [kept] = await db()
+      .select()
+      .from(mediaCaptureChunks)
+      .where(eq(mediaCaptureChunks.sessionId, session.id));
+    const loser = written.find((key) => key !== kept!.storageKey)!;
+    const jobs = (await (await startJobProducer())!.findJobs("core.deleteCaptureObjects")) as Array<{
+      data: { keys: string[] };
+    }>;
+    // Without a lock both applies saw no earlier chunk, and the loser's
+    // object was left in storage with nothing pointing at it.
+    expect(jobs.some((job) => job.data.keys.includes(loser))).toBe(true);
+  });
+
+  it("retires only original subject-owned capture pointers before physical erasure",async()=>{
+    const {db}=await import("@/core/db"),{users}=await import("@/core/auth/schema"),{contacts}=await import("@/core/contacts/schema"),{eq}=await import("drizzle-orm");
+    const {createContact}=await import("@/core/contacts/service"),{assignRole}=await import("@/core/roles/service"),{createDataRequest,verifyDataRequest,fulfillDataRequest}=await import("@/core/privacy/service");
+    const {appendCaptureChunk}=await import("@/core/media/capture"),{mediaCaptureSessions,mediaCaptureChunks}=await import("@/core/media/schema"),{mediaObjectWrites}=await import("@/core/media/write-schema");
+    const {dataRequests}=await import("@/core/privacy/schema"),{getJob}=await import("@/core/jobs"),{eraseMediaStorageOperations,MEDIA_WRITE_ERASURE_JOB}=await import("@/core/media/write-privacy"),{eraseMultipartOperations,MULTIPART_ERASURE_JOB}=await import("@/core/media/multipart-privacy");
+    const editor={...OWNER,userId:"00000000-0000-4000-8000-000000000003",role:"editor",grants:[{module:"media",access:"manage" as const}]};
+    await db().insert(users).values([{id:OWNER.userId,email:"owner@example.test",role:"owner"},{id:editor.userId,email:"original-editor@example.test",role:"editor"}]);
+    const contact=await createContact.call({name:"Original recording editor",email:"original-editor@example.test"},OWNER);await db().update(contacts).set({userId:editor.userId}).where(eq(contacts.id,contact.id));
+    const session=await createCaptureSession.call({source:"screen"},editor);await grantCapturePermission.call({id:session.id},editor);await appendCaptureChunk.call({id:session.id,sequence:0,contentType:"video/webm",bytes:new Uint8Array([1,2,3])},editor);
+    const unrelated=await createCaptureSession.call({source:"screen"},OWNER);await grantCapturePermission.call({id:unrelated.id},OWNER);await appendCaptureChunk.call({id:unrelated.id,sequence:0,contentType:"video/webm",bytes:new Uint8Array([4,5,6])},OWNER);
+    const writes=await db().select().from(mediaObjectWrites),original=writes.find(row=>row.contactId===contact.id)!,other=writes.find(row=>row.contactId===null)!;expect(original.contactId).toBe(contact.id);
+    await assignRole.call({userId:editor.userId,roleKey:"customer"},OWNER);
+    const request=await createDataRequest.call({contactId:contact.id,request:{kind:"erasure"}},OWNER);await verifyDataRequest.call({id:request.id,method:"Synthetic former editor identity verification"},OWNER);const result=await fulfillDataRequest.call({id:request.id,confirmation:"ERASE"},OWNER);
+    expect(await db().select().from(mediaCaptureChunks).where(eq(mediaCaptureChunks.sessionId,session.id))).toHaveLength(0);expect((await db().select().from(mediaCaptureSessions).where(eq(mediaCaptureSessions.id,session.id)))[0]).toMatchObject({status:"discarded",createdBy:"erased",token:null});
+    const scopes=(result.artifact.body as {outcomes:Array<{scope:string;pendingJobs?:string[]}>}).outcomes;
+    for(const scope of scopes)for(const id of scope.pendingJobs??[]){const name=scope.scope==="media.storageOperations"?MEDIA_WRITE_ERASURE_JOB:scope.scope==="media.multipartOperations"?MULTIPART_ERASURE_JOB:null;if(!name)continue;const job=await getJob(name,id);await(name===MEDIA_WRITE_ERASURE_JOB?eraseMediaStorageOperations(job!.data):eraseMultipartOperations(job!.data));}
+    expect(await storage().get(original.key)).toBeUndefined();expect((await db().select().from(dataRequests).where(eq(dataRequests.id,request.id)))[0]?.status).toBe("completed");
+    expect(await storage().get(other.key)).toEqual(new Uint8Array([4,5,6]));expect((await db().select().from(mediaCaptureSessions).where(eq(mediaCaptureSessions.id,unrelated.id)))[0]?.status).toBe("live");expect(await db().select().from(mediaCaptureChunks).where(eq(mediaCaptureChunks.sessionId,unrelated.id))).toHaveLength(1);
+  });
+
+  it("does not reopen a capture confirmed while its recording was assembled", async () => {
+    const session = await createCaptureSession.call({ source: "screen" }, OWNER);
+    await grantCapturePermission.call({ id: session.id }, OWNER);
+    const { appendCaptureChunk, assembleCapture } = await import("@/core/media/capture");
+    const { mediaCaptureSessions } = await import("@/core/media/schema");
+    const { db } = await import("@/core/db");
+    const { eq } = await import("drizzle-orm");
+    await appendCaptureChunk.call(
+      { id: session.id, sequence: 0, contentType: "image/png", bytes: await png() },
+      OWNER,
+    );
+    const store = storage();
+    const put = store.put.bind(store);
+    const racing = vi.spyOn(store, "put").mockImplementation(async (key, ...rest) => {
+      if (key.includes("/item/")) {
+        await db()
+          .update(mediaCaptureSessions)
+          .set({ status: "confirmed", completedAt: new Date() })
+          .where(eq(mediaCaptureSessions.id, session.id));
+      }
+      return put(key, ...rest);
+    });
+    try {
+      const closed = await failure(assembleCapture.call({ id: session.id, filename: "late.png" }, OWNER));
+      expect(closed.code).toBe("conflict");
+    } finally {
+      racing.mockRestore();
+    }
+    expect((await getCaptureSession.call({ id: session.id }, OWNER))?.status).toBe("confirmed");
+  });
+
+  it("refuses to assemble a recording with a missing chunk", async () => {
+    // Local playback on the recording device always looks whole, so the
+    // server is the only place a dropped upload can be caught before the
+    // owner believes the recording is safe.
+    const session = await createCaptureSession.call({ source: "screen" }, OWNER);
+    await grantCapturePermission.call({ id: session.id }, OWNER);
+    const original = await png();
+    const split = Math.max(1, Math.floor(original.byteLength / 2));
+    const { appendCaptureChunk, assembleCapture } = await import("@/core/media/capture");
+    await appendCaptureChunk.call(
+      { id: session.id, sequence: 0, contentType: "image/png", bytes: original.subarray(0, split) },
+      OWNER,
+    );
+    await appendCaptureChunk.call(
+      { id: session.id, sequence: 2, contentType: "image/png", bytes: original.subarray(split) },
+      OWNER,
+    );
+    const gap = await failure(
+      assembleCapture.call({ id: session.id, filename: "holes.png" }, OWNER),
+    );
+    expect(gap.code).toBe("conflict");
+    // A lost *tail* is contiguous, so only the recorder's count can catch it.
+    await appendCaptureChunk.call(
+      { id: session.id, sequence: 1, contentType: "image/png", bytes: original.subarray(0, split) },
+      OWNER,
+    );
+    const short = await failure(
+      assembleCapture.call(
+        { id: session.id, filename: "short.png", expectedChunks: 4 },
+        OWNER,
+      ),
+    );
+    expect(short.code).toBe("conflict");
+    const assembled = await assembleCapture.call(
+      { id: session.id, filename: "whole.png", expectedChunks: 3 },
+      OWNER,
+    );
+    expect(assembled.session.staged).toBe(true);
+  });
+
+  it("binds a resumable upload started with a capture token", async () => {
+    const link = await createUploadLink.call({ source: "upload_link" }, OWNER);
+    const { uploadAsset } = await import("@/core/media/service");
+    const uploaded = await uploadAsset.call(
+      {
+        filename: "phone.png",
+        contentType: "image/png",
+        bytes: await png(),
+        source: "capture",
+        provenance: { captureToken: link.token, captureSessionId: link.id },
+      },
+      ANONYMOUS,
+    );
+    const { bindCaptureAsset } = await import("@/core/media/capture");
+    const otherLink = await createUploadLink.call({ source: "upload_link" }, OWNER);
+    expect((await failure(bindCaptureAsset.call(
+      { token: otherLink.token, assetId: uploaded.id }, ANONYMOUS,
+    ))).code).toBe("permission");
+    const bound = await bindCaptureAsset.call(
+      { token: link.token, assetId: uploaded.id },
+      ANONYMOUS,
+    );
+    expect(bound.assetId).toBe(uploaded.id);
+    expect(bound.status).toBe("preview");
+  });
+
+  it("admits anonymous uploads only through a live capture link (C11.10)", async () => {
+    const { beginUpload, uploadAsset } = await import("@/core/media/service");
+    const link = await createUploadLink.call({ source: "upload_link" }, OWNER);
+    const forged = "f".repeat(64);
+    const bytes = await png();
+    const proxied = (provenance: Record<string, string>) =>
+      uploadAsset.call(
+        { filename: "x.png", contentType: "image/png", bytes, source: "capture", provenance },
+        ANONYMOUS,
+      );
+    expect((await failure(proxied({ captureToken: forged }))).code).toBe("permission");
+    expect((await failure(proxied({ captureSessionId: link.id }))).code).toBe("permission");
+    const customer = { kind: "user" as const, userId: OWNER.userId, role: "customer" as const, grants: [] };
+    expect((await failure(uploadAsset.call(
+      { filename: "x.png", contentType: "image/png", bytes, source: "capture", provenance: { captureSessionId: link.id } },
+      customer,
+    ))).code).toBe("permission");
+    expect((await failure(beginUpload.call(
+      { filename: "x.png", contentType: "image/png", bytes: 100, provenance: { captureToken: forged } },
+      ANONYMOUS,
+    ))).code).toBe("permission");
+    await discardCapture.call({ id: link.id }, OWNER);
+    expect((await failure(proxied({ captureToken: link.token }))).code).toBe("permission");
+    expect((await listAssets.call({}, OWNER)).total).toBe(0);
+  });
+
+  it("does not let an anonymous caller attach by id alone", async () => {
+    const session = await createCaptureSession.call({ source: "camera" }, OWNER);
+    const blocked = await failure(
+      attachCaptureUpload.call(
+        {
+          id: session.id,
+          filename: "nope.png",
+          contentType: "image/png",
+          bytes: await png(),
+        },
+        ANONYMOUS,
+      ),
+    );
+    expect(blocked.code).toBe("permission");
+  });
+
+  it("expires an unconfirmed session and forgets the staged recording", async () => {
+    const session = await createCaptureSession.call({ source: "screen" }, OWNER);
+    await attachCaptureUpload.call(
+      {
+        id: session.id,
+        filename: "desk.png",
+        contentType: "image/png",
+        bytes: await png(),
+      },
+      OWNER,
+    );
+    const { mediaCaptureSessions } = await import("@/core/media/schema");
+    const { db } = await import("@/core/db");
+    const { eq } = await import("drizzle-orm");
+    await db()
+      .update(mediaCaptureSessions)
+      .set({ expiresAt: new Date(Date.now() - 1_000) })
+      .where(eq(mediaCaptureSessions.id, session.id));
+    const swept = await expireCaptureSessions.call({}, OWNER);
+    expect(swept.expired).toContain(session.id);
+    expect((await listAssets.call({ includeTrashed: true }, OWNER)).total).toBe(0);
+    expect(await getCaptureSession.call({ id: session.id }, OWNER)).toMatchObject({
+      status: "expired",
+      staged: false,
+    });
+  });
+
+  it("stages a phone batch and only creates library assets on confirm", async () => {
+    const link = await createUploadLink.call({ source: "camera_roll" }, OWNER);
+    await attachCaptureUpload.call(
+      {
+        token: link.token,
+        filename: "one.png",
+        contentType: "image/png",
+        bytes: await png(),
+      },
+      ANONYMOUS,
+    );
+    const second = await attachCaptureUpload.call(
+      {
+        token: link.token,
+        filename: "two.png",
+        contentType: "image/png",
+        bytes: await png(),
+      },
+      ANONYMOUS,
+    );
+    expect(second.session.items).toHaveLength(2);
+    expect((await listAssets.call({}, OWNER)).total).toBe(0);
+    const confirmed = await confirmCapture.call({ token: link.token }, ANONYMOUS);
+    expect(confirmed.status).toBe("confirmed");
+    expect((await listAssets.call({}, OWNER)).total).toBe(2);
+  });
+
+  it("confirms a phone batch onto a product media target", async () => {
+    const { createProduct } = await import("@/modules/catalog/service");
+    const { createTaxCategory } = await import("@/modules/invoicing/tax-service");
+    const { listProductMedia } = await import("@/modules/catalog/merchandising");
+    const { updateBusiness } = await import("@/core/settings/service");
+    await updateBusiness.call(
+      { name: "Studio", country: "CA", baseCurrency: "CAD", timezone: "America/Vancouver" },
+      OWNER,
+    );
+    const tax = await createTaxCategory.call({ code: "standard", name: "Standard" }, OWNER);
+    const product = await createProduct.call(
+      { name: "Print set", slug: "print-set", kind: "physical", taxCategoryId: tax.id },
+      OWNER,
+    );
+    const link = await createUploadLink.call(
+      { source: "upload_link", targetType: "product", targetId: product.id },
+      OWNER,
+    );
+    await attachCaptureUpload.call(
+      {
+        token: link.token,
+        filename: "hero.png",
+        contentType: "image/png",
+        bytes: await png(),
+      },
+      ANONYMOUS,
+    );
+    await confirmCapture.call({ token: link.token }, ANONYMOUS);
+    const media = await listProductMedia.call({ productId: product.id }, OWNER);
+    expect(media).toHaveLength(1);
+    expect(media[0]?.asset.source).toBe("capture");
+  });
+});

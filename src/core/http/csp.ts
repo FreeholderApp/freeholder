@@ -1,0 +1,143 @@
+// Copyright (C) 2026 Tony Aly
+// SPDX-License-Identifier: Apache-2.0
+// Edge-safe Content Security Policy construction (MASTER.md C1.19, §36).
+// Exact origins only: a wildcard quietly grants every tenant on a host.
+
+export const CSP_NONCE_HEADER = "x-nonce";
+export const CSP_REPORT_GROUP = "freeholder-csp";
+export const CSP_REPORT_PATH = "/api/security/csp-report";
+/** Separate from anonymous analytics consent: creative code is a different risk. */
+export const THIRD_PARTY_CREATIVE_CONSENT_COOKIE = "fh_tc";
+
+const CSP_SKIPPED =
+  /^\/(?:api|media|privacy\/artifacts|sitemaps)(?:\/|$)|\.(?:xml|txt|ico|png|jpe?g|svg|webp|avif)$/i;
+
+export function cspAppliesToPath(path: string): boolean {
+  return !CSP_SKIPPED.test(path);
+}
+
+export function parseCspOrigins(value: string | null | undefined): string[] {
+  if (!value?.trim()) return [];
+  const origins = value.split(/[\s,]+/).filter(Boolean).map((candidate) => {
+    const url = new URL(candidate);
+    const local = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+    if (
+      (url.protocol !== "https:" && !(url.protocol === "http:" && local)) ||
+      url.username ||
+      url.password ||
+      url.pathname !== "/" ||
+      url.search ||
+      url.hash ||
+      url.hostname.includes("*")
+    ) {
+      throw new Error(
+        `CSP origin "${candidate}" must be one exact HTTPS origin with no path, query, credentials, or wildcard.`,
+      );
+    }
+    return url.origin;
+  });
+  return [...new Set(origins)].sort();
+}
+
+function sources(values: string[]): string {
+  return values.length > 0 ? ` ${values.join(" ")}` : "";
+}
+
+export interface ContentSecurityPolicyOptions {
+  nonce: string;
+  path: string;
+  production: boolean;
+  mediaOrigins?: string[];
+  uploadOrigins?: string[];
+  creativeOrigins?: string[];
+  thirdPartyCreativeConsent?: boolean;
+  /** C12.24: the site's own SFU, reachable only from group call pages. */
+  callOrigins?: string[];
+  assistantOrigins?: string[];
+  /**
+   * C3.32: the chosen measurement provider's edge. The caller passes it only
+   * for a visitor who explicitly allowed measurement; it is never implied by
+   * first-party analytics or by the third-party-creative choice, and admin
+   * pages never receive it.
+   */
+  measurementOrigins?: string[];
+}
+
+/**
+ * A nonce-based strict policy compatible with Next's dynamic App Router.
+ *
+ * `style-src-attr 'unsafe-inline'` is intentionally narrower than allowing all
+ * inline style elements: React uses bounded style attributes for bar widths
+ * and image crop anchors, while every `<style>` element still needs the nonce.
+ */
+/** Calls are offered on Contact only, including the original path before locale rewrite. */
+export function isPreviewAssistantContactPath(path: string): boolean {
+  return /^\/(?:[a-z]{2,3}(?:-[a-z0-9]{2,8})*\/)?contact\/?$/i.test(path);
+}
+
+export function contentSecurityPolicy(options: ContentSecurityPolicyOptions): string {
+  const media = [...new Set(options.mediaOrigins ?? [])].sort();
+  const upload = options.path.startsWith("/admin")
+    ? [...new Set(options.uploadOrigins ?? [])].sort()
+    : [];
+  const creative = options.thirdPartyCreativeConsent
+    ? [...new Set(options.creativeOrigins ?? [])].sort()
+    : [];
+  // The policy sees the original path before proxy strips a locale prefix.
+  // Match the same locale shape as proxy; keep signalling out of other pages.
+  const groupCall = /^\/(?:[a-z]{2}(?:-[A-Za-z]{2,4})?\/)?call\/group\//.test(options.path);
+  const call = groupCall ? [...new Set(options.callOrigins ?? [])].sort() : [];
+  const assistant = isPreviewAssistantContactPath(options.path) ? [...new Set(options.assistantOrigins ?? [])].sort() : [];
+  const memberWasm = /^\/(?:[a-z]{2,3}(?:-[a-z0-9]{2,8})*\/)?(?:messages(?:\/|$)|report(?:\/|$)|call\/group\/)/i.test(options.path);
+  const assistantWasm = isPreviewAssistantContactPath(options.path) || options.path.startsWith("/managed-assistant/");
+  const measurement = options.path.startsWith("/admin")
+    ? []
+    : [...new Set(options.measurementOrigins ?? [])].sort();
+  const preview = options.path === "/preview" || options.path.startsWith("/preview/");
+  const embed = options.path === "/embed" || options.path.startsWith("/embed/");
+  const development = options.production
+    ? ""
+    : " 'unsafe-eval'";
+  const policy = [
+    "default-src 'self'",
+    `script-src 'nonce-${options.nonce}' 'strict-dynamic' 'self'${assistantWasm || memberWasm ? " 'wasm-unsafe-eval'" : ""}${development}${sources([...creative, ...measurement])}`,
+    "script-src-attr 'none'",
+    `style-src 'self' 'nonce-${options.nonce}'${sources(creative)}`,
+    "style-src-attr 'unsafe-inline'",
+    `img-src 'self' data: blob:${sources([...media, ...creative, ...measurement])}`,
+    `font-src 'self' data:${sources(creative)}`,
+    `media-src 'self' blob:${sources([...media, ...creative])}`,
+    `connect-src 'self'${sources([...upload, ...creative, ...call, ...assistant, ...measurement])}`,
+    `frame-src 'self'${sources(creative)}`,
+    "worker-src 'self' blob:",
+    "manifest-src 'self'",
+    "object-src 'none'",
+    "base-uri 'self'",
+    "form-action 'self'",
+    // Embeds (C9.36) are meant to be framed on other sites. Everything else
+    // stays unframeable, including admin. `*` here is the point of an embed;
+    // clickjacking a review wall is not a credential theft.
+    `frame-ancestors ${embed ? "*" : preview ? "'self'" : "'none'"}`,
+    `report-uri ${CSP_REPORT_PATH}`,
+    `report-to ${CSP_REPORT_GROUP}`,
+    ...(options.production ? ["upgrade-insecure-requests"] : []),
+  ];
+  return policy.join("; ");
+}
+
+export function reportingEndpointsHeader(): string {
+  return `${CSP_REPORT_GROUP}="${CSP_REPORT_PATH}"`;
+}
+
+export function thirdPartyCreativeConsentGranted(
+  value: string | null | undefined,
+): boolean {
+  return value === "granted";
+}
+
+export function parseThirdPartyCreativeConsent(
+  value: string | null | undefined,
+): "granted" | "denied" | undefined {
+  if (value === "granted" || value === "denied") return value;
+  return undefined;
+}

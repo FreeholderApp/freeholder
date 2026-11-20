@@ -1,0 +1,1079 @@
+# C11.10 independent security-review packet
+
+C3.31 mail-record increment (2026-11-11, agent evidence only): review
+`deploy/mail-record-retention.md`, `src/core/mail/record-retention.ts`,
+`record-privacy.ts`, `record-services.ts`, `ownership.ts`, `receipts.ts` and
+`db/migrations/0071_mail_record_retention.sql`. The random encrypted site key,
+private HMAC receipts, statement-before-row stale-writer fences, immutable
+contact ownership, nullable metadata cleanup, holds and original pending receipt
+form one boundary. Actual peer failures cover callback resurrection, uncertain
+derived physical attempts, hidden retained block exports and stale snapshot
+writes. Final actual-main composition passed 97 actual controls across eight
+native suites, including both system-refusal controls, without database skips.
+Address reassignment, current supporting-fact ownership and
+original pending job identities are separate; completed replays are no-ops and
+missing originals require exact backup. SDK 8/audit 7, full fast 373 plus its one
+documented exclusion and production scrub 20,330 files / 242,435,915 bytes passed.
+Four fresh-database locale 320px owner-browser journeys passed in both themes
+with keyboard, Axe, bounds and service/audit assertions. Protected
+[PR #672](https://github.com/CampDenman/freeholder/pull/672) merged at `4039dfe6`
+after [merge-group qualification](https://github.com/CampDenman/freeholder/actions/runs/43103837092).
+Required enabled
+SMTP/transactional physical-dispatch recovery continues separately without
+inventing old route/attempt facts or clearing unknowns on elapsed time. All live
+mail provider acceptance and Tony's independent review remain open. No launch
+approval is inferred from agent checks.
+
+C3.31 physical-worker increment (2026-11-11, agent evidence only): review
+`dispatch-route.ts`, `dispatch-state.ts`, `dispatch-services.ts`,
+`dispatch-settlement.ts`, `service.ts` and
+`db/migrations/0072_mail_physical_dispatches.sql`. Frozen request/route receipts,
+durable pre-I/O callers, positive reply retention before mutable apply checks,
+strict old-image admission and fresh-person-only recovery form one boundary.
+Human evidence is labeled human; old per-call/account facts are not invented.
+Unknowns and named holds survive clock expiry and later outcomes. Actual-main
+targeted native 19 completed across one fixture-only retry; the additional
+observed-positive/apply-fence case, live SDK 8, full fast 380 plus one documented
+exclusion and production scrub 20,353 files / 242,882,917 bytes passed. Four
+fresh-database owner journeys passed in en/es/fr/ar at 320px in both themes
+with keyboard, Axe, bounds, private receipt omission and both unknown/retry
+and retained-positive flows; English light and Arabic dark screenshots were
+inspected. Protected qualification remains required. The reviewer must
+distinguish a worker invocation from multiple carrier consent/retry HTTP
+operations. No live inbox placement, external account acceptance or independent
+sign-off is supplied here. See `deploy/mail-dispatch-recovery.md`.
+
+This is a briefing packet for an independent reviewer. It is **not** the
+review. C11.10 stays open until a reviewer who did not author the surfaces
+below has resolved every critical/high finding and dispositioned every lower
+one.
+
+Prepared 2026-09-12 from the tree at this change. Threat surfaces, existing
+tests, and known residuals only — no claim that the list is empty.
+
+## 2026-11-10 review assignment and alert remediation
+
+Tony Aly selected himself to perform the review and requested completion of
+the full current specification before stable publication. This records the
+review assignment, not a completed review or owner signature. `MASTER.md`
+§43 remains the status authority; C11.10 and C11.17 are open.
+
+The audited baseline is main `4d86abc06db4345da37346e18b7918a516e681c6`.
+[Its protected main CI](https://github.com/CampDenman/freeholder/actions/runs/42596963219)
+passed, including database tests, browser journeys/accessibility, CodeQL,
+dependency evidence, and the backup/restore and image/upgrade jobs. Local fast
+gates passed 367 contract tests in 40 files, with one test skipped. These runs
+are supporting evidence for the review.
+
+The two remaining CodeQL password-hashing alerts were traced to their exact
+sources and dispositioned as false positives, with the rationale retained on
+each alert:
+
+- [Alert 5](https://github.com/CampDenman/freeholder/security/code-scanning/5):
+  `mintApiKey` generates 32 cryptographically random bytes. `hashApiKey` uses
+  keyed HMAC-SHA256 for indexed token lookup. It does not store a human password
+  verifier. The reported source was a minted token in `apikeys.test.ts`.
+- [Alert 6](https://github.com/CampDenman/freeholder/security/code-scanning/6):
+  `equalSecretText` hashes two transient Basic authorization values to equal
+  lengths for `timingSafeEqual`. Neither hash is persisted as a password
+  verifier. `verifyPostmarkAuthorization` refuses a mismatch before parsing or
+  recording a delivery event.
+
+Human passwords use salted scrypt in `src/core/auth/passwords.ts`. The local
+API-key, mail-webhook and password suites passed 23 tests; their 22
+database-dependent tests skipped locally and are covered by the baseline's
+protected main CI. This classification must be revisited if token generation,
+credential storage or the comparison data flow changes. The CodeQL rule
+[addresses stored password hashes](https://codeql.github.com/codeql-query-help/javascript/js-insufficient-password-hash/).
+The rule and security scan remain enabled.
+
+The separate Expo lockfile had real dependency vulnerabilities. Its patch
+updates node-forge to 1.4.3 and decode-uri-component to 0.5.1, removes the
+vulnerable zod/deepmerge paths through compatible dependency updates, and
+overrides only `@expo/fingerprint`'s glob/minimatch dependencies to patched
+14.0.4/11.0.5 releases. Expo's major version is unchanged. Pull-request CI and
+the scheduled security workflow now audit `apps/mobile/package-lock.json`
+independently at the moderate threshold. Native compatibility checks belong
+to the repair PR: a clean `npm ci`, TypeScript check, Android and iOS exports,
+and two identical fingerprint generations (65 sources) passed. The final npm
+audit reports zero vulnerabilities at every severity. This does not close the
+deferred mobile acceptance items.
+
+The reviewer must also examine the new plugin permission/consent/runtime
+controls (C3.40), the newly implemented network wrapper (C3.41) and publisher-
+signature boundary (C3.42), member cryptography
+(C12.39), and current upload/payout/preview-assistant boundaries. A closed
+automated alert does not establish their security. Live provider acceptance,
+cross-target object-byte recovery and actual platform launches retain their
+own open checklist items.
+
+## Original live refund callers (C5.06/C11.10, 2026-11-12)
+
+Review `invoicing/legacy-refund-dispatch.ts`, `invoice-service.ts`,
+`payment-provider-service.ts` and `pos-service.ts` together. This no-DDL repair
+authenticates server-created reservation/admission/finished facts in the existing
+money-event journal. New signatures use purpose-derived HMAC from configured
+`CREDENTIAL_KEY` or the mandatory `SESSION_SECRET`; `CREDENTIAL_KEY_PREVIOUS`
+is verification-only. The journal is not claimed database append-only. Check
+full refund/payment/request binding, configured rotation, private completion
+capability omission from audit/customer projections, and the independent
+physical-result transaction before logical application. A HMAC proves server
+evidence, never provider quiescence or noncreation.
+
+The actual unchanged-main BEFORE lost an accepted 1000 refund after cancelling
+its live caller and sending a replacement. Frozen repair `878a6e4b` passes that
+unchanged control and all 17 unique fault controls in disjoint groups of 4/6/7,
+with actual ledger and drained-backend evidence. They cover live/duplicate and
+human refusal, current prepared/historical unmarked reservations, unknown
+throws, projection/persistence failure, altered bindings/journal/restored rows,
+key rotation and authenticated terminal failure after a pending caller finished.
+See `deploy/legacy-refund-live-caller-2026-11-12.md` for exact logs and source
+provenance. Sixteen existing adjacent native regressions and the local source
+gates also passed; protected checks remain required. Older failed/cancelled
+ambiguity, process-loss recovery, later bank
+returns and recipient/fee reconciliation remain explicit unfinished scope.
+These are agent-authored proofs; Tony's review and real-provider acceptance
+remain open, and no sign-off is inferred.
+
+## Payment-provider privacy cleanup repair (2026-11-11)
+
+Review `invoicing/provider-erasure.ts`, the existing `commerce.money` source,
+Stripe's customer erasure method and late-feedback guards in the authenticated
+provider processor. Before-failing database controls proved false
+completion after local deletion and card/customer recreation after erasure.
+Durable work now snapshots original provider/account/customer references before
+local deletion, acknowledges only actual cleanup and shares the existing money
+retention hold. Unsupported/failed tasks remain pending. Stripe subscription
+cancellation is disclosed before the owner's fresh-verification/typed action.
+
+Check same-customer references on different accounts, saved-method-only bindings,
+original-key redrive, actual tombstone replay and the nonwaiting identity guard
+across a real erasure/settlement race. Real money must still settle after erasure
+without restoring personal provider copies. Tests use synthetic provider HTTP;
+actual enabled account acceptance and the independent C11.10 review remain open.
+Two additional actual controls reproduced an ordinary source-field edit and a
+stale prepared edit clearing the erased marker. Shared contacts.update now
+refuses that change at the final atomic write. The real lock-barrier race and
+late feedback control cover the repaired boundary. Another real control found
+a later erasure discarding the first request’s pending receipt. Common
+fulfilment now refuses another in-progress erasure; a lost applied receipt
+fails closed. Review the checksum-verified original receipt restoration and
+original job replay control and the recovery limits in `deploy/privacy-rights.md`.
+
+The merge-group chronology regression in guidance is repaired with exact SQL
+start boundaries and operation-time start/reset/form-capture writes. Five new
+real database controls cover earlier/later work within one millisecond or
+composed transaction. The audit actor/action/subject fields are unchanged.
+
+## Contact merge/undo privacy lineage repair (2026-11-11)
+
+Review `core/privacy/contact-identity.ts`, the merge-history/timeline/audit privacy
+sources and the shared nonwaiting contact-identity guard. Real service/database
+controls reproduced disclosure of a separate undone contact, retained transitive
+snapshots, borrowed-address attribution, owner recovery payload disclosure and
+shared timeline payload retention. Subject exports now redact ambiguous/shared
+history and exclude recovery checkpoints; erasure removes shared personal
+payloads without destroying another separated contact's before-image. Named
+scope holds and retained action/reference history remain explicit limits;
+existing login-actor anonymization still applies.
+
+Review actual operation-time timestamps for audit/timeline/merge/undo writes and
+the guard taken before fulfilment reads a profile, including composed transaction
+and competing identity controls in `tests/core/contact-privacy-lineage.test.ts`.
+Legacy transaction-start ambiguity is handled conservatively. This is a coding
+agent's repair evidence, not Tony Aly's independent security sign-off. C11.10
+and stable publication remain open.
+
+### Erased-contact merge cutover (C1.07/C1.08/C11.10)
+
+Three actual before-failing service controls reproduced a fresh relationship
+merged with an erased participant in either direction, and an original late
+signed payment recreating erased provider-customer data after its retained
+invoice moved to a fresh survivor with its own acquisition source. Review the
+early `contacts.merge` refusal under the existing identity/ordered row locks
+alongside `tests/core/payment-provider-erasure.test.ts`. No candidate, pointer
+or snapshot may change on refusal. Ordinary merge/undo remains supported;
+genuine late money still settles without restoring personal copies. This is
+agent source evidence and does not supply independent sign-off.
+
+## OpenMLS migration boundary (C12.39, source qualification)
+
+Review `native/openmls/src/lib.rs`, the pinned upstream/compiler/runtime and
+license manifest, and `src/modules/members/e2ee/crypto.ts`, `server-init.ts`,
+`legacy.ts` and `engine.ts`. The isolated bridge imports existing raw/PKCS#8
+identities, frames and re-signs legacy GroupInfo, and recovers public commits
+older clients skipped. New messages, call controls, KeyPackages, signatures and
+history HPKE use the same Rust runtime on browser and server boundaries.
+
+Check exact pending receipt recovery, creator response loss, sender-ratchet
+persistence before delivery, member/external CAS conflicts, cross-tab/history
+locking, late Welcomes after erasure and the distinction between private
+historical pins and fresh outgoing authority. Public keys erased from the site
+must not be restored server-side. New ciphertext/export requires the actual
+MLS leaves, current directory and current entitlement/epoch to agree. Legacy
+fallback must not resume new-message encryption after migration or bypass an
+older server's missing refresh capability.
+
+Review `e2ee/authority.ts`, `authority-locks.ts`, member privacy erasure and the
+shared privacy context seam. A reproduced after-encryption erasure race showed
+that epoch equality alone was insufficient. Verify that every commit, application and
+call-key write requires the exact pre-encryption delivery witness and compares
+it under the conversation lock, that old writers cannot omit it, and that
+privacy/device/membership changes use the profile-then-conversation lock order.
+No transport may attach fresh authority to stale ciphertext. Erasure must
+continue to hard-delete directory keys rather than retain a public history map.
+
+Check the bounded private outgoing application/control journal: ratchet and
+candidate persist before transport; an exact own acknowledgement/log receipt
+alone materializes a readable message or confirmed call key; unknown outcomes
+never trigger blind retransmission; explicit refusals remove only the candidate.
+Queue exhaustion refuses a new send without advancing its ratchet. Competing
+call-key candidates must never overwrite a confirmed winning key, and confirmed
+older generations must remain available to prove rekey holding.
+
+Review generation-specific SFU rooms in `members/call-seats.ts`,
+`members/group-calls.ts` and `call/group/GroupCallRoom.tsx`. Self-hosted LiveKit
+does not invalidate a cached JWT on participant removal. The authorized local
+probe confirmed this documented behavior. Check transactional retirement of
+the previous room, generation-bound reauthorization, the original room alias
+used before this change, and preservation of microphone/camera choices.
+Short credential lifetimes do not replace this boundary. A removed credential
+must never reach legitimate peers in the new generation; the actual browser
+regression uses only the synthetic loopback SFU.
+
+`deploy/openmls-migration-2026-11-11.md` records fourteen native, seventeen
+core, twenty-nine PostgreSQL, eight SDK and twenty-five actual browser journeys,
+plus the final four affected reruns, eight locale/theme variants, transient-WASM
+retry, accepted-response loss and cached-old-credential SFU isolation.
+Protected PR/merge-group checks passed and #653 merged as `20dc07ba`;
+independent acceptance remains open. RustSec reports zero vulnerabilities with a visible informational
+maintenance warning for an uncompiled verification dependency; no advisory is
+ignored. OpenMLS's historical audit does not audit this upstream revision,
+binding or Freeholder's directory/history protocol. The compromised-server
+warning remains. Coding-agent tests and this packet do not supply independent
+review, a completed C11.10 sign-off or C11.17 release approval.
+
+## Shared cart stock and photograph identity (C5.16/C5.20/C8.08)
+
+Review `catalog/cart-stock.ts`, cart/order mutations and the optional real
+parent context supplied to contact-reference repoint callbacks. A reservation
+belongs to its actual cart/order holder and stock item; a supplied line pointer
+must not authorize releasing a different buyer's units. Multiple photographs
+keep separate line identities while their quantities share one reservation.
+Check variant/line/cart matching, ordered cart/reservation/inventory locks,
+guest/contact merging, saved snapshots, expired demand and shipment accounting.
+
+The contact callback verifies the same transaction and composes stock services
+through the genuine merge context. Existing three-argument callbacks remain
+compatible; no key scope is added. A contacts.merge-only staff actor can merge
+through the authorized spine while direct stock reservation remains refused.
+113 PostgreSQL controls and ten actual browser journeys pass; evidence and
+remaining protected qualification are in `deploy/cart-photo-stock-2026-11-11.md`.
+
+## Original trial-setup requests and outstanding provider work (2026-11-11)
+Review migration70 and subscriptions' card-setup, setup-dispatch, setup-erasure
+and setup-reconciliation sources. Every physical POST commits its own pending
+row before I/O; post-I/O recording is system-only and does not borrow the erased
+human's identity. All actual customer responses remain available for cleanup.
+Unknown outcomes cannot be discarded or completed from time/search absence.
+Check late completion during erasure, competing responses, exact reused-card
+proof, original routing and the named money/setup retention dependencies.
+
+Human reconciliation must remain explicit: fresh interactive verification,
+actual original-account operation/support evidence and evidence every original
+caller stopped. A found completed resource also requires positive original
+metadata checks. This is human provider confirmation, not automatic final-call
+verification. Without the actual final completion/cancellation guarantee, the
+unknown call remains pending. Review the owner form and its four locales,
+agent/system/personal-key/stale refusal controls, and original actor audit.
+
+The SQL trial, immutable dispatch, missing JSON-proof, parent deletion and
+erasure-completion guards are deliberate prior-image refusal boundaries. Full
+rollback requires the actual pre-upgrade database/object snapshot. Synthetic
+provider HTTP and browser state fixtures do not supply account acceptance or
+Tony Aly's independent C11.10 sign-off.
+
+A separate actual before-failing control found the original email retained in
+generic reconciliation audit input even after setup cleanup completed. Review
+the setup consumers of the existing `auditInputFields` seam: generic copies
+retain operation IDs/outcomes, private dispatches retain concrete evidence
+until cleanup/hold resolution, and original actor/action/subject remain intact.
+The regression requires exact minimal audit diff equality after erasure.
+
+An actual least-privilege control also reproduced a freshly verified view-only
+subscription role reading the private recovery record through the API. The
+shared service now requires subscription management for both inspection and
+confirmation, matching the owner UI. The response projects concrete evidence
+fields, and authorized managers can review the recorded evidence in the page.
+Agents, personal keys and view-only roles remain refused.
+
+The setup-aware merge witness repairs an actual before-failing undo that moved
+a new merged-identity customer snapshot back to a separated subscription. Read
+the parent-owned `columns: []` reference: it locks setup rows in ID order and
+stores only SHA-256 fingerprints of exact SQL setup/dispatch JSON. It refuses
+new or changed evidence without copying PII into merge history. Unchanged
+pre-merge undo still passes. Review migration70's legacy witness backfill and
+prior-image INSERT fence, plus the populated69→70 rehearsal and adjacent
+lineage controls.
+
+## Seller collection-policy and original-account boundary (C12.38, partial)
+
+Review the private invoice/subscription policy snapshots and payment routing
+in `src/modules/invoicing/market-policy.ts`,
+`src/modules/invoicing/merchant-charge.ts`,
+`src/modules/subscriptions/market-policy.ts` and
+`src/modules/members/market-merchant.ts`. Check account/actual-fee evidence,
+saved customer/method account isolation, original-account refunds and recurring
+operations, response privacy, trial policy capture, and preservation of unknown
+charge outcomes. Migration 67 must not turn a historical transfer account into
+an authorized merchant. `deploy/seller-merchant-source-2026-11-10.md` records
+the limited source evidence and remaining integration. The direct model stays
+unavailable; this packet supplies neither activation nor independent sign-off.
+
+The continuation also needs review of signed Connect-to-payment forwarding,
+account-scoped trial setup and card selectors, recurring InvoicePayment and
+PaymentIntent enrichment outside database transactions, canonical period/fee
+checks, and `src/modules/invoicing/merchant-settlement.ts`. Check that a direct
+seller earning cannot trigger a second transfer, owner settlement cannot invent
+a direct charge/refund, and order/invoice recorders cannot duplicate earnings.
+Synthetic provider evidence and seeded browser setup are explicitly limited
+in the source document; they are not live-provider or independent acceptance.
+
+### Customer invoice issuer and collection preview
+
+The authorized `invoicing.customerInvoice` projection now exposes only the
+immutable public merchant name, after the existing customer/private-link
+ownership check. Review the explicit output and original-account verification
+in `customer-service.ts`: default adapters, private routing/fee fields and
+current seller profile names must not replace the original invoice identity.
+Changed or unavailable collection must keep the original document readable
+without offering a default offline flow. The portal isolates bidirectional
+names and wraps long names; the live SDK includes only the public scalar.
+Review token retirement, other-customer refusals, original provider capability,
+account replacement and the four-locale browser controls. This source slice
+does not enable direct collection or supply independent/provider acceptance.
+
+### Public commercial support and financial identity ownership (in progress)
+
+Review `src/core/commerce/merchant-identity.ts`, the Stripe Connect public-only
+normalizer, `members/merchant-identity-privacy.ts`, and migration74. Customer
+invoice/receipt DTOs may expose only the frozen public supplier name and support
+details, after existing ownership or exact payment-token validation. The
+provider response must name the original account; private representative/home
+fields, current defaults and current seller details must not fill missing
+historical values. An erased merchant stays visibly unavailable rather than
+being relabelled as the platform.
+
+The new private contact FK must follow real merge/undo, export, active named
+holds and erasure even after login deletion. Review the bounded SQL-row hash
+witnesses, conservative pre74 undo fence, old-writer completion fence and
+credential-only versus member-wide holds. Opaque financial routing and actor
+identities remain accounting evidence; support values must not acquire extra
+audit/recovery copies. Migration74 now follows the frozen71–73 journal chain;
+protected checks remain required. This
+section records review targets, not acceptance or independent sign-off. Local
+native/recorded-provider controls and eight four-locale browser journeys have
+passed. The final graph73 composition also passed empty0→74 and an actual
+schema71 populated→74 upgrade, with original financial rows/routing unchanged,
+no guessed support, genuine owner backfill and conservatively fenced old undo.
+The actual schema71 writer refused its next merge after upgrade. A first
+comparison harness used inconsistent Date/raw timestamp decoders; that harness
+error was classified and a new disposable database repeated the complete
+rehearsal with exact server-side JSON snapshots. Final composed SDK generation
+passed eight controls in 3.04 seconds with no artifact change. Protected CI remains open.
+An actual old-image merge interleaved after migration 74's legacy backfill and before
+trigger installation was blocked by the complete migration transaction and
+failed closed after commit, with original ownership/history unchanged. Keep
+that transactional migration boundary intact. Provider branding must also
+refuse the private erased-identity marker as a live public merchant name.
+
+The later Stripe card-setup increment resolves an unexpanded SetupIntent only
+after raw signature/account validation, on the same account. Review succeeded
+off-session status, original reference, customer/method binding and matching
+contact/subscription metadata before the method enters the shared ledger.
+Incomplete evidence returns a retryable refusal without recording money or
+exposing client secrets. Review durable pre-I/O customer/request snapshots and
+exact fresh-session proof for reused cards in the original trial-setup section
+above; full C12.38 integration and actual acceptance remain required.
+
+### Refund parent and definite cancellation repair
+
+Actual before-failing controls reproduced a refund accepting another payment
+reference on the correct account and signed Stripe cancellation being ignored.
+The shared processor now checks the original payment/account/amount/currency
+before transitions or terminal replay. Actual cancellation is an unsuccessful
+refund with `provider_cancelled` evidence; it never records returned money.
+Review both the signed callback and immediate response paths against
+`tests/core/payment-provider-service.test.ts` and
+`tests/core/payment-adapters.test.ts`.
+
+Peer review also reproduced expanded Checkout storing its session ID while the
+later refund identified the PaymentIntent. Both Checkout accessors and refund
+normalization now preserve the same expanded/string payment ID. The real
+signed Checkout→payment→refund control proves the linkage without weakening
+wrong-parent refusal. These are source controls, not actual-provider acceptance
+or independent sign-off; complete dashboard recovery remains C12.38 work.
+
+## Authenticated provider-evidence boundary (C11.10)
+
+The C12.30 PhotoDNA review must also check unsupported formats and malformed
+provider answers. Six pre-repair regressions reproduced fail-open behavior:
+unsupported images and absent/string verdicts could be accepted as clean;
+untyped positive-match metadata could enter evidence processing. The repair
+requires a typed boolean verdict, numeric success status and bounded match
+metadata, caps streamed replies at 256 KiB and rejects invalid UTF-8. Actual
+PostgreSQL upload tests must prove unchecked images stay quarantined without
+evidence or account suspension, remain deletable, and can be rescanned after
+a valid negative response. Provider access, live acceptance and legal reporting
+remain open; synthetic fixtures do not supply independent sign-off.
+
+The audit found that `invoicing.processPaymentProviderEvents` was declared as
+financially scoped and appeared in generated external discovery despite its
+intended webhook-only contract. The repair makes it system-only and explicitly
+private. Financial administrators, API keys and invoicing-capable plugins must
+be refused before ledger access; HTTP, OpenAPI, MCP and SDK projections must
+omit it. `tests/core/internal-services.test.ts` exercises these boundaries.
+Existing signed-webhook, provider-ledger and subscription regressions keep
+the actual verification path working. The reviewer should verify both the
+refusals and the positive signed route. On the merged merchant-policy baseline,
+54 focused financial/discovery regressions and all eight live SDK checks
+passed. Required local fast gates passed 368 contract checks with one deliberate
+skip, plus typechecking, lint, licensing, release notes and plan consistency.
+These results do not supply live-provider acceptance or independent sign-off.
+
+## Newly published XML parser advisory
+
+The 2026-11-10 C3.42 protected CI run independently caught
+[GHSA-474x-hrwr-fgx4](https://github.com/advisories/GHSA-474x-hrwr-fgx4),
+published in GitHub's advisory database that day. It affects fast-xml-parser
+through 5.11.2; the upstream patched release is 5.12.0. The direct storage
+inventory parser and the inherited `@replit/object-storage` →
+`@google-cloud/storage` path both move to the patched 5.x version. No exception
+was added and the audit policy stays unchanged. The unchanged live audit
+reports no known advisories, 13 storage-inventory acceptance/refusal tests pass,
+and the production build/standalone artifact gate pass with the patched
+parser. Twenty publisher CLI/activity-label checks pass on Node 22.23.2,
+including actual artifact and catalogue signing. Protected exact-head CI is
+required. This remains automated remediation evidence, not the independent
+C11.10 review.
+
+## 2026-10-03 automated-alert triage (preliminary)
+
+This update is preparation for C11.10, not independent sign-off. GitHub CodeQL
+reported thirteen open alerts when this round began. The storefront and visual
+editor changed after the original packet was written, so the reviewer must
+walk their public and owner paths as well as the surfaces below.
+
+| Alerts | Initial disposition and evidence to check |
+| --- | --- |
+| #4, #2, #22 | This change restricts rich-text links to web/mail/phone/relative URLs, removes modulo bias from recovery-password generation, and replaces a slow mobile slug trim with linear scans. Focused regressions cover each. Confirm CodeQL closes these on `main`. |
+| #1 | The recovery CLI deliberately displays a newly generated password once. It does not run inside an HTTP request, but redirected terminal output can retain the secret. Review its operator instructions and whether a TTY-only display is warranted before dismissing the alert. |
+| #5, #6 | API keys are 32 random bytes authenticated with HMAC-SHA256; the mail webhook hashes two presented Basic values for constant-time comparison, not for stored password verification. Confirm those assumptions and key lifetimes before treating the password-hash warnings as false positives. |
+| #7, #11–#13, #18 | The importer uses regex for partial HTML extraction and entity decoding. Committed content passes through the parse5 allowlist in `src/modules/cms/blocks/html.ts`, but preview and malformed-input behavior still need a direct review. |
+| #9, #10 | These are in `scripts/a11y-smoke.mjs`, a test utility rather than a served route. Confirm no untrusted CI input reaches its generated markup. |
+
+The alert numbers refer to the repository's Code Scanning list. No alert is
+treated as resolved merely because this table names it.
+
+## 2026-10-05 release security repairs (awaiting independent review)
+
+The current automated scan has ten open alerts. This repair addresses importer
+alerts #7, #11–#13 and #18 with parse5 text extraction and CMS-allowlisted preview
+markup; `tests/core/importers.test.ts` covers malformed script attributes, encoded
+URL schemes, numeric references and one-pass decoding. The accessibility helper
+(#9/#10) uses JSDOM outside-only execution; it no longer enables page scripts and
+then attempts regex removal. The browser-like parser determines document structure.
+`tests/core/a11y-smoke.test.ts` exercises scripts with closing angles in attributes.
+
+Recovery CLI alert #1 is addressed by never echoing supplied/generated passwords.
+Generated credentials go to an exclusive mode-0600 file in a mode-0700 directory;
+stdout contains only the path and salted scrypt SQL. Tests prove compatibility
+with the app verifier, filesystem permissions and secret absence from output.
+Operators must retrieve/delete the private file on the machine or container where
+they ran recovery. The supplied-password form can still leave shell-history and
+process-argument exposure; prefer generated recovery in a secure local shell.
+
+Alerts #5/#6 remain candidates for false-positive disposition, not dismissed here:
+API keys contain 32 cryptographically random bytes and use a keyed HMAC for an
+indexed lookup, not a human-password digest. Postmark compares hashes only to
+normalize timing of two transient presented Basic values; neither hash is stored
+as a password verifier. An independent reviewer must confirm these assumptions.
+The refreshed CodeQL run must also confirm the repaired alerts close on main.
+This section does not check C11.10 or supply independent sign-off.
+
+## 2026-10-08 adversarial implementation audit
+
+Three agents reviewed auth/customer privacy, customer money/booking paths and
+platform/MCP/consent. The integrating agent reproduced public CMS disclosure
+and editor races. Repairs, baseline assertions and operational limits are in
+`security/adversarial-audit-2026-10-08.md`. Review the published-field projection,
+trusted renderer, gallery privacy backfill and archive invalidation, atomic
+reset redemption, customer record projections, billing ownership/settlement
+checks and durable unsubscribe delivery in particular.
+
+These are implementation tests by coding agents, not independent review.
+C11.10 remains unchecked. Validate private object-provider policy and external
+mail/payment acceptance separately; a green mocked provider is not evidence of
+live delivery or settlement.
+
+## 2026-10-21 pre-launch audit
+
+Four read-only agent reviews found access-control, money-path and
+transaction-boundary defects. Each repair (#559–#565) was reviewed by a
+separate agent until nothing blocking remained.
+`security/pre-launch-audit-2026-10-21.md` maps every finding to its PR and
+lists the open residuals. Give these the closest look: the playground
+allow-list, unverified site chat, payout retry and resend rules, the payment
+claim/apply phases and their system elevation, and per-client rate limits
+where no trusted client-IP header is set. This is agent work, not independent
+review. C11.10 stays open.
+
+## Return refund evidence (C5.19/C11.10)
+
+The subsequent original-provider action reserves every installment and a draft
+credit before provider I/O. Original account/fee routing remains private in
+the shared payment orchestrator. Durable refund confirmations close the RMA
+only after the entire assigned amount succeeds; unknown outcomes retain their
+reservation and a new attempt after definite refusal covers only the remaining
+balance. Both return money actions require fresh human verification and refuse
+keys/plugins. Original discounted consideration and tax use cumulative integer
+allocation, including earlier draft credits. Review the private reservation and
+reconciliation services, partial-success retry, original-account feedback and
+concurrent rounding cases. This source work supplies no independent sign-off.
+
+The audit reproduced `catalog.refundReturn` recording a purported provider
+refund without contacting the provider, closing a return after refunding only
+the first payment's available balance, and failing a safe replay of an
+installment return. The repair reserves and settles only fully covered,
+human-attested offline refunds, requires fresh verification, refuses agent
+keys/personal keys/plugins, and binds credit/refund identities to the return
+and original payments. Return requests lock their order and bound quantities
+across duplicate lines and previous non-rejected returns. Review these
+boundaries in `src/modules/catalog/fulfillment.ts` and
+`tests/core/catalog-fulfillment.test.ts`.
+
+Three pre-repair regressions reproduced the failures. All 11 repaired
+financial/manual journey cases and eight live SDK checks passed. Four real
+Chromium owner journeys cover explicit confirmation and full installment
+recording, keyboard use, 320px, both-theme Axe scans and all four locales in
+`tests/browser/return-refund.spec.ts`. Settlements are seeded offline evidence,
+not a real provider transaction. The production build/artifact scrub passed.
+
+The next source repair introduces migration68 immutable original-tender plans,
+separate exact offline attestations and actual provider/balance confirmation,
+and masked own-customer return request/progress services in four locales.
+Failed provider attempts retain their owed payment budget. Shared service and
+database guards reject generic manufactured settlement of prepared returns;
+old-image settlement fails closed. Review lock ordering, legacy-plan import,
+account routing, mixed sequencing, budget/confirmation triggers and customer
+ownership. Agent review found no remaining issue in these bounded money
+changes. The 32 return/private/journey and 49 adjacent targets have passing
+native coverage, with a final fresh-process 11-case recovery run; eight SDK checks, static
+gates, production scrub, actual 67→68 upgrade, 16 browser journeys and 4 final
+affected owner/customer reruns pass. Browser provider feedback remains seeded.
+C5.19 remains open for actual enabled-provider and full fulfillment acceptance. The subsequent
+provider action and original discount/tax allocation above extend the source
+repair; neither supplies C11.10 sign-off. Historical/manual C11.02 evidence
+retains its explicit scope. No historical ledger was rewritten by this repair.
+
+## How to use this packet
+
+1. Read `SECURITY.md` for reporting, dependency policy, and 2FA/recovery.
+2. Work the surfaces in the order below. Each names the code, the tests that
+   already exist, and the residual that a reviewer still has to judge.
+3. Disposition findings in the pull request that closes C11.10. Do not treat a
+   green CI run as the review.
+
+## Surfaces
+
+### Auth
+
+**What it is.** Email + password for staff, TOTP/WebAuthn/recovery for
+privileged grants, magic links for customers, session cookies, API keys,
+CSRF, rate limits, security headers, CSP.
+
+**Code.** `src/core/auth/`, `src/core/http/csrf.ts`, `src/core/http/csp.ts`,
+`src/core/http/headers.ts`, `src/core/security/rate-limit.ts`,
+`src/core/apikeys/`, `app/api/auth/`, `app/(admin)/login/`,
+`app/(admin)/security/`.
+
+**Existing tests.** `tests/core/passwords.test.ts`, `two-factor.test.ts`,
+`session-management.test.ts`, `http-auth.test.ts`, `http.test.ts`,
+`csrf.test.ts`, `csp.test.ts`, `csp-reports.test.ts`,
+`security-headers.test.ts`, `rate-limit.test.ts`, `apikeys.test.ts`,
+`change-password.test.ts`, `password-reset.test.ts`,
+`customer-magic-links.test.ts`, `invitations.test.ts`, `roles.test.ts`.
+
+**Residuals for the reviewer.**
+
+- Privileged grants require 2FA before module grants become usable; confirm
+  there is no grant path that skips enrollment (invitations, role edits, API
+  keys).
+- `SESSION_SECRET` rotation invalidates sessions, API keys, pending links,
+  TOTP seeds and recovery codes. Break-glass is a CLI; confirm it cannot be
+  reached from HTTP.
+- Customer magic links vs staff passwords: confirm a stolen customer link
+  cannot mint a staff session.
+- CSP report ingestion is minimized; confirm it cannot be used as a storage
+  oracle.
+
+### Payments
+
+**What it is.** Hosted checkout adapters, offline ledger, authenticated
+provider events, refunds, disputes, saved methods. Money is integer minor
+units.
+
+**Code.** `src/adapters/payments/`, `src/modules/invoicing/`,
+`app/api/` payment webhook routes, `deploy/commerce-payments.md`.
+
+**Existing tests.** `tests/core/payment-adapters.test.ts`,
+`payment-provider-service.test.ts`, `invoicing.test.ts`,
+`money-arithmetic.test.ts`, `advanced-money.test.ts`.
+
+**Residuals for the reviewer.**
+
+- Live Stripe/PayPal settlement is still adapter doubles in the C11.05
+  journey. The webhook HMAC and idempotent event table are real; a live
+  charge is not claimed.
+- Duplicate provider events must not double-apply money
+  (`onConflictDoNothing` on `provider_event_id`). Confirm amount-drift
+  refusal still holds when the first event was `ignored`.
+- Manual/offline money is owner-attested. Confirm it cannot be raised from
+  an API key without step-up.
+
+### Webhooks (outbound)
+
+**What it is.** Signed outbound deliveries, SSRF allowlist, pinned
+transport, retry/backoff, pause after repeated failure, replay.
+
+**Code.** `src/core/webhooks/`, `deploy/webhook-delivery.md`.
+
+**Existing tests.** `tests/core/webhooks.test.ts` (signature, replay window,
+metadata SSRF, 500 retry, pause, inspect/replay).
+
+**Residuals for the reviewer.**
+
+- Delivery URLs refuse cloud metadata and private ranges. Confirm IPv6, DNS
+  rebinding, and redirect-follow behaviour on the pinned transport.
+- Signature timestamp tolerance is 300s. Confirm receivers documented in
+  `deploy/webhook-delivery.md` match the implementation.
+- Replay is a new delivery with a new idempotency key, not a byte-for-byte
+  resend. Confirm that is the intended contract.
+
+### MCP / agents
+
+**What it is.** JSON-RPC MCP over HTTP, tools derived from the service
+registry, agent autonomy/budgets/approvals, untrusted-input envelope.
+
+**Code.** `src/mcp/`, `src/core/agents/`, `src/core/apikeys/`.
+
+**Existing tests.** `tests/core/mcp.test.ts`, `agents.test.ts`,
+`agents-injection.test.ts`, `agents-autonomy.test.ts`,
+`agents-budgets.test.ts`, `agents-approvals.test.ts`,
+`agents-pause.test.ts`, `internal-services.test.ts`.
+
+**Residuals for the reviewer.**
+
+- MCP tests speak the protocol as this tree understands it; they do not
+  prove a real MCP client. Probe with one.
+- System services are hidden from MCP (`permission !== "system"`). Confirm
+  `external: false` and `hiddenFromMcp` cannot be bypassed by tool-name
+  guessing.
+- Untrusted input is marked and must not interpolate into owner-facing
+  prose. Injection tests exist; a reviewer should add a payload the suite
+  does not already contain.
+- Autonomous writes are budgeted and approval-gated. Confirm a paused or
+  over-budget agent cannot complete an in-flight run.
+
+### OAuth (mail and calendar)
+
+**What it is.** One-time hashed state, least-privilege scopes, encrypted
+refresh tokens bound to row AAD, claim-before-exchange so a failed token
+call cannot replay state.
+
+**Code.** `src/core/mail/oauth.ts`, `src/core/connections/oauth-core.ts`,
+`src/core/connections/calendar-oauth.ts`, `src/core/connections/crypto.ts`.
+
+**Existing tests.** `tests/core/mail-oauth.test.ts`,
+`mail-oauth-callback.test.ts`, `calendar-oauth.test.ts`,
+`connection-grants.test.ts`, `connections.test.ts`.
+
+**Residuals for the reviewer.**
+
+- State is consumed before the provider is called. A reviewer should confirm
+  every OAuth family (mail send, mail read, calendar) shares that order.
+- Tokens never appear in API responses. Confirm logs and doctor output match.
+- Losing `CREDENTIAL_KEY` without `CREDENTIAL_KEY_PREVIOUS` makes every
+  connection `needs_reconnect`. Confirm ciphertext is not deleted.
+
+### Plugins
+
+**What it is.** Signed registry index, hashed install directory, isolate
+loader, permission contract, update/rollback.
+
+**Code.** `src/core/plugins/`, `packages/plugin-kit/`,
+`deploy/first-party-plugins.md`.
+
+**Existing tests.** `tests/core/plugin-contract.test.ts`,
+`plugins-lifecycle.test.ts`, `first-party-plugins.test.ts`,
+`plugin-scaffold.test.ts`, `plugin-publisher-trust.test.ts`,
+`plugin-publisher-trust-postgres.test.ts`, and the real owner-browser
+`tests/browser/plugin-publisher-trust.spec.ts`.
+
+**Residuals for the reviewer.**
+
+- Review owner-only, freshly verified trust roots; agents, personal API keys,
+  staff and system composition cannot add keys. Private PEM is rejected before
+  audit retention. Check that the independently obtained fingerprint identifies
+  the intended publisher, rather than trusting an artifact-supplied key.
+- Ed25519 signatures bind the complete length-framed artifact or a canonical
+  registry index plus its URL, with separate signing purposes. Review the
+  1 GiB/100,000-entry/64-level bounds, streaming file-change checks and refusal
+  of links, nonregular files and ambiguous names. Filesystem owners must keep
+  release folders immutable; signature checks do not sandbox in-process code.
+- Native tests prove modified bytes are refused on enable, confirmed revocation
+  disables matching registrations, retries preserve actual rollback history,
+  and revoked/modified previous artifacts cannot roll back. Doctor independently
+  checks enabled bytes and cached catalogue trust. Review these boundaries.
+- Migration 0065 disables every legacy registration without inventing trust.
+  A real 64→65 rehearsal preserved legacy metadata; review the migration and
+  owner recovery path in `deploy/plugin-publisher-trust.md`.
+- Successful mutations are audited transactionally. Refused calls leave state
+  unchanged; this feature does not add persistent denial logging.
+- Review C3.41's manifest-bound provider HTTP and recording-download defaults.
+  Missing network scope is refused before transport; every DNS answer is
+  checked and the connection pinned with core's private-address refusal.
+  Redirects, time/byte bounds, cancellation and header handling have native
+  tests, including actual local receiver controls. Deliberately bypassing the
+  wrapper with raw Node APIs remains possible for trusted in-process code;
+  this is not the deferred C3.43 sandbox. Inspect provider factories and the
+  social-plugin fixture for accidental unbounded/global fetch defaults.
+- Review C3.40's exact-scope consent (`permission-policy.ts`, `permissions.ts`),
+  owner-only approval/revocation, `plugin:<name>` service/timeline audit attribution,
+  and plugin execution ALS boundaries in `service.ts` and `context.ts`.
+  Cross-module calls replace supplied system/owner identities; permitted core
+  operations retain core composition authority and plugin audit cause. Inspect
+  the narrow own-scope privacy erasure bridge and imported-order refund bridge
+  (`invoicing.reconcilePluginRefund`: own source prefix, currency, idempotency,
+  remaining credit bounds), denial of generic human-review actions,
+  own-namespace event/timeline/job context operations and core callback isolation.
+- Inspect `runtime.ts`, CMS rendering/JSON-LD and boot isolation: unexpected
+  contribution errors force the current shared transaction to roll back, with
+  generic runtime disable persisted after rollback. Earlier committed phases
+  are not undone. Expected adapter/provider errors retry. Client widget errors
+  have only a local boundary; there is no anonymous disable endpoint.
+- Check migration 0066, consent backup/restore, invalid synthetic demo approvals
+  on real instances, stale compiled scopes, revocation and actual owner recovery.
+  Outbox enrollment records exclude plugins inactive at event commit while
+  preserving retry of previously accepted work. Tests include new native
+  permission/context cases and actual owner-browser review/widget recovery.
+  `deploy/plugin-publisher-trust.md` records the owner procedure and limitations.
+  These coding-agent checks do not provide independent security sign-off.
+- Rollback of a plugin is not rollback of data it wrote. Call that out.
+
+### Updater
+
+**What it is.** Signed release feed, preflight, snapshot, smoke, cutover,
+automatic rollback, target-specific image swap.
+
+**Code.** `src/core/update/`, `deploy/update-*.md`.
+
+**Existing tests.** `tests/core/update-apply.test.ts`, `update-preflight.test.ts`,
+`update-feed.test.ts`, `update-policy.test.ts`, `update-check.test.ts`,
+`update-escalation.test.ts`, `update-targets.test.ts`, `update-cli.test.ts`,
+`update-admin.test.ts`.
+
+**Residuals for the reviewer.**
+
+- `failAt` is a test seam on the local target. Confirm production targets
+  cannot pass it from HTTP.
+- Feed signatures and key rotation are documented in `deploy/release-feed.md`.
+  Confirm the embedded public key matches what CI publishes.
+- An interrupted cutover must roll back. C11.13 drills exercise migrate/
+  smoke/cutover; a reviewer should still try a killed PID on a real target.
+
+### Uploads / media
+
+**What it is.** Storage adapter (S3/Replit/local), key sanitization,
+malware scanner seam, renditions, watermarks, capture sessions.
+
+**Code.** `src/adapters/storage/`, `src/adapters/malware/`,
+`src/core/media/`, `app/media/`.
+
+**Existing tests.** `tests/core/storage.test.ts`, `malware.test.ts`,
+`media.test.ts`, `media-capture.test.ts`, `media-watermark.test.ts`,
+`media-transfer.test.ts`.
+
+**Residuals for the reviewer.**
+
+- `storageKey()` and the local adapter both refuse path escape. Confirm S3
+  keys cannot overwrite another prefix.
+- ClamAV is optional; `none` states that plainly. Confirm production
+  recipes do not silently ship `none` as if scanned.
+- Local storage refuses production unless `FREEHOLDER_UNSAFE_LOCAL_STORAGE=1`.
+
+### Customer privacy
+
+**What it is.** Consent evidence, data requests, export/erasure artifacts,
+portal self-service, retention TTL on artifacts.
+
+**Code.** `src/core/privacy/`, `app/privacy/`, `app/(admin)/` privacy
+screens, `deploy/privacy-rights.md`.
+
+**Existing tests.** `tests/core/contact-privacy-rights.test.ts`,
+`record-participation.test.ts`, `ownership-export.test.ts`,
+`analytics-consent.test.ts`, `sms-consent.test.ts`.
+
+**Residuals for the reviewer.**
+
+- Artifact download is session-bound and `no-store`. Confirm a guessed UUID
+  404s without leaking existence beyond timing.
+- Erasure vs retention exceptions: confirm a legal hold actually blocks
+  fulfill, and that merge does not resurrect erased rows.
+- C11.14 still names undelete-every-row as open. Retention is a bounded
+  per-kind policy registry plus `core.applyRetention`, not a TTL on every
+  table. Product-wide search is `search.query` over a live registry; do not
+  treat contact-privacy tests as coverage of every user-owned table.
+
+## Cross-cutting controls already in CI
+
+| Control | Where |
+|---|---|
+| Dependency audit, no high/critical, expiring exceptions | `scripts/dependency-audit.mjs`, `security/dependency-audit-exceptions.json` |
+| Secret scan | TruffleHog in `.github/workflows/ci.yml` |
+| CodeQL | `codeql` job |
+| Dependency review | `security` job on pull_request |
+| Pinned Actions, no `pull_request_target` | `scripts/workflow-integrity-gate.mjs` |
+| License headers | `scripts/license-headers.mjs` |
+| Service-layer gate (no Drizzle in routes/MCP) | contract suites |
+| Money gate (no float on charge paths) | `tests/core/money-arithmetic.test.ts` |
+
+The ledger of accepted dependency advisories is currently empty.
+
+## Out of scope for this packet (named so they are not forgotten)
+
+- Independent WCAG review (C11.12).
+- Performance budgets (C11.11) — harness ships beside this packet; budgets
+  are in MASTER.md §15.1.
+- Failure drills (C11.13) — `tests/core/c11-13-failure-drills.test.ts`.
+- Live provider accounts. Adapter doubles and loopback receivers are what
+  CI runs.
+
+## Reviewer sign-off (leave blank)
+
+| Field | Value |
+|---|---|
+| Reviewer | |
+| Date | |
+| Critical/high open | |
+| Lower findings dispositioned | |
+| Follow-up tickets | |
+
+### paradisemodern Comms surface (C3.13)
+
+Paradise Comms is Paradise Modern's hosted voice/video relay, one of two
+interchangeable providers with Daily and not preselected
+(owner decisions 2026-09-27 and 2026-10-22): prod `https://paradisemodern.com/v1`,
+staging `https://comms-staging.paradisemodern.com/v1`; auth is a per-site
+`x-api-key` (carrying comms scopes) or a legacy portfolio bearer token.
+Capabilities `comms.calls/rooms/streams/conversations` are reported by
+`/api/integration/capabilities`.
+
+**Code.** The Paradise adapter —
+`plugins/voice-video/paradise.ts` (HTTP client), `paradise-provider.ts`
+(seam mapping), `settings.ts` (§41-encrypted secrets in module settings),
+`webhook.ts` plus `app/api/plugins/voice-video/webhooks/paradise/route.ts`
+(inbound relay), with `daily.ts` retained as optional non-first-party code.
+**Tests.** `paradise-adapter.test.ts`, `paradise-flow.test.ts`,
+`paradise-webhook.test.ts`, `daily-adapter.test.ts`, `daily-flow.test.ts`,
+`plugin-claims.test.ts`, `internal-services.test.ts`, and the
+unconfigured-provider browser journey.
+
+Provider requests use a fixed HTTPS API origin, bounded bodies, timeouts and
+no redirects. Room and recording identities must match the persisted
+provider account. On the shipped Daily path: transcript downloads use
+public-DNS-pinned transport without the API credential, private rooms
+expire with separate room-bound host/guest tokens expiring within 30
+minutes, provider shutdown expires the room, ejects participants and
+verifies empty presence (local state alone is not accepted as that
+evidence), and expiring leases reject stale provider results with provider
+I/O outside database transactions. On the PM path, credentials are TTL
+JWTs with TURN, room end persists terminal state and awaits LiveKit
+`DeleteRoom` (`media_ended`, with 503 `media_termination_pending`
+retryable), recordings land in DigitalOcean Spaces and are listed, read
+and erased through the 2026-09-28 recording lifecycle (playback URL is a
+public unsigned Spaces URL — a short-lived access window, never a shareable
+link), webhooks are HMAC-SHA256 signed (`Webhook-Signature:
+t=<ts>,v1=<hmac>`) and verified with a five-minute timestamp window before
+any database effect, and the inbound relay is idempotent by envelope id in
+`voice_video_webhook_deliveries`. The prepaid-budget 402 gate applies to
+site-key callers and is surfaced with balance and top-up URL, never retried
+past.
+Token-bearing result fields use explicit `Token` names for central
+redaction and never enter room/artifact list rows. Guest links are
+generated for manual sharing, not sent automatically.
+
+**Residuals.** Review the actual PM surface against a live paradisemodern
+instance: credential TTL and TURN handling, room policy enforcement, the
+media-termination retry, and webhook signature verification end to end.
+Provider-side erasure rides `DELETE /v1/recordings/:id` (retryable 503 keeps
+the PM row and the receipt pending; 409 mid-egress defers to the durable
+job). Transcripts are unavailable until PM ships them. Live paradisemodern
+acceptance remains C3.13 work. Review [provider erasure and recovery](../deploy/provider-recording-erasure.md),
+including the PM-path honesty note and failed-job recovery. This
+implementation and its mocked HTTP tests are not an independent review.
+
+## Explicit private phase authorization (C3.22/C11.10)
+
+The public-source crawler uses private read/apply phases and must work with an
+exact public-operation key. `orchestratedBy` opts a private scoped core phase
+into one same-family public operation's authorization for its original actor.
+`src/core/service-orchestration.ts` bounds this to the active invocation;
+`src/core/service.ts` preserves ordinary authorization, agent/human restrictions,
+transaction rules and audit identity. A query operation cannot authorize a
+mutation phase. Ordinary service composition, another parent or actor, plugin
+phase declarations and dangling async work cannot use this binding. No key
+scopes are added and no caller becomes system. Review the async lifetime and
+reentrancy boundaries alongside `tests/core/orchestration-permissions.test.ts`.
+This source evidence does not complete the independent review.
+
+The follow-up review of the saved-card repair reproduced a partial-metadata setup event bypass: a contact-only expanded payload reached the older normalizer. The repaired boundary ignores setup events missing either contact or subscription binding before normalized events can be returned. The new regression failed before repair; all 30 provider edge controls and the complete static gates passed afterward. This remains source evidence, not independent security sign-off or provider acceptance.
+## Import reader-source erasure (C2.29/C3.22/C11.10)
+
+Four actual PostgreSQL regressions reproduced retained cached reader details
+and recreation through queued cutover, an older opaque upload and an existing
+reader's changed address. Review `src/core/import/privacy.ts`, its contact
+merge/undo pointers, shared CMS contact binding and import publication row locks
+against `tests/core/import-source-privacy.test.ts`. Migration 0069 follows 0068
+and preserves page/media recovery while quarantining ambiguous legacy reader
+input; SQL refuses cutover by the prior image. Named reader holds stay explicit.
+`deploy/import-reader-privacy.md` describes the source recovery and scope. These
+agent-authored repairs and regression runs do not provide independent sign-off.
+
+Review of the reader binding increment also reproduced an exact source-preview
+key learning the existing CRM ID despite contact-read refusal. Explicit public
+run/list projections now remove internal reader bindings while the ledger keeps
+them for privacy and merge. The regression failed before projection and passes
+after it; schemas or production validation fallbacks do not enforce this
+redaction boundary. This is still agent source evidence, not independent review.
+
+Further actual controls reproduced a new import appearing after merge snapshot
+and defeating capture-only NOWAIT, a legacy cache losing its address match, and
+a merged duplicate's audit payload surviving erasure. Both merge pointer phases
+now refuse contention; `src/core/privacy/contact-identity.ts` supplies active
+owned IDs and recorded addresses to reader matching and audit export/erasure.
+Strict empty-payload equality failed against the original audit path and passes
+after repair, while immutable actor/action/subject metadata and undone third
+parties remain separate. These are source regressions, not independent sign-off.
+
+The refreshed import increment consumes the separate contact-history repair in
+PR #662. Its final integrated local run passes 62 checks, all eight SDK controls,
+368 contracts (one deliberate exclusion), and the production artifact scrub
+(19,399 files, 236,789,859 bytes). These checks are engineering evidence; Tony's
+independent review and source-specific acceptance remain outstanding.
+
+After merged-core integration, a fresh contiguous-schema run passed 44 checks
+and the production scrub passed 19,423 files / 237,159,757 bytes. A separate
+actual follow-up reproduced a completed erasure receipt with reader details
+still in an opaque original WXR object. The parsed-cache repair does not cover
+that provider acknowledgement; raw-object work remains required before sign-off.
+
+## Raw source and reader audit follow-up (C2.29/C3.22/C11.10)
+
+Actual local before-failing controls reproduced completed erasure with reader
+bytes still in an opaque WXR, reader details retained in import/comment audit
+inputs, a new source upload after the erasure snapshot, and a direct imported
+comment after its scope. Review `src/core/import/source-erasure.ts`, the
+`imports.readerSources` hook and core job, shared/read identity guards, explicit
+`ServiceDef.auditInputFields`, CMS comment audit cleanup and the matching
+regressions. Provider deletion/absence, active windows, unresolved per-attempt
+writers, legal holds and redrive must remain truthful in the receipt. Typed
+input projection cannot affect original actor/action/subject authorization or
+remove global secret redaction. This is agent source evidence, not Tony's
+independent sign-off or actual-provider acceptance.
+
+Retained-original qualification also reproduced three ordinary-sweep failures
+that deleted explicitly held bytes and a source-only key learning the internal
+hold/request IDs. The source retain callback now records only current upload IDs;
+the keeper checks the actual still-active exception before expiry/terminal
+cleanup. Public import projections remove those private bindings. Review the
+hold, replacement, rollback, removal and exact-key DTO controls alongside provider
+acknowledgement; neither a clock nor lookup absence settles an unresolved PUT.
+
+## Original static archives and atomic media receipts (C3.22/C11.10)
+
+Review `src/core/import/archive.ts`, `archive-source.ts` and `archive-commit.ts`.
+Original private chunks, canonical preview fingerprints and CRC/SHA identities
+bind reviewed bytes to accepted content without extraction or client-selected
+storage keys. Provider I/O remains outside transactions; private ownership,
+unknown PUT witnesses and explicit holds include ignored ZIP entries.
+
+`src/core/import/media-receipts.ts` fences prepared files under the import-run
+lock before asset locks. `media.applyStoredOriginal` accepts an asset and its
+receipt in one transaction, preserving lost-response recovery for archive and
+WordPress sources. Tokens cannot supply the real actor's public import/media/CMS
+permissions. Review expired claims, matching-source rebind, unknown failures and
+private projections against `tests/core/import-media-receipts.test.ts` and
+`tests/core/archive-import-flow.test.ts`. Claims and reader bindings must stay
+private on first acceptance and replay. These agent-authored controls provide
+engineering evidence, not Tony's independent sign-off or C3.22 completion.
+
+Generic HTML/feed integration also uses those receipts. Review
+`src/core/import/generic-plan.ts`, `generic-feed.ts` and the shared commit
+branches for source-controlled URLs, bounded XML/DOM parsing, fresh robots
+checks and exact actor/media grants. Query-bearing media URLs remain distinct;
+unsupported assets remain visible omissions. `tests/core/generic-import-flow.test.ts`
+covers actual CMS/media/redirect/replay/rollback and future-entry refusal.
+`tests/browser/import-generic-content.spec.ts` follows the real native fragment
+target in all four locales. See `deploy/generic-site-import.md`; these controls
+do not supply the independent review or source-specific production acceptance.
+
+For additional hosted media origins, inspect `src/core/import/media-origins.ts`
+and the generic commit policy: exact origin approval must never widen page
+crawling, stale previews must fail before I/O, and each used CDN needs its own
+fresh pinned robots policy. `tests/core/import-hosted-media-flow.test.ts`
+exercises actual local asset acceptance, exact grants and refusal/retry.
+`deploy/hosted-source-media.md` records the current evidence and open provider
+acceptance boundary. Ordinary content scanning and receipt authorization remain
+required for every approved origin.
+
+## Held member login parents (C1.08/C12.15/C11.10)
+
+Review the `requiresLogin` privacy-source metadata and inherited parent hold in
+`core/privacy/service.ts`, the inert credential-retention path, and the
+preserved contact/login ID. All customer credential families and personal keys
+must stop authorizing access, while held member rows remain discoverable for
+a later verified erasure after hold release. Staff-capable accounts must keep
+the existing refusal. Check concurrent session issuance against the locked
+parent and the erased-contact session validation predicate.
+
+Check actual later-request hold bypass and late personal-key creation/verification
+controls. Holds apply through the unified contact across requests; retained
+callbacks receive the original hold request ID and receipts retain its origin.
+Both credential issuers share the locked parent/tombstone guard, and API-key
+verification independently refuses an erased parent from an older writer.
+Two active holds for the same scope must both reach retained-source keepers;
+the receipt lists every origin and the effective continuing retention. Check
+that hold changes cannot race another request's erasure snapshot.
+
+Review the members retain callback's ordered profile/conversation locks,
+suspension, preserved-left seats and real-context call generation retirement.
+A status change alone does not remove a device from the MLS authority witness.
+Reactivation must refuse the erased identity. The PostgreSQL before-failure and
+regressions in `tests/modules/member-held-login.test.ts` support this repair;
+they do not provide an independent sign-off or actual hosted-SFU acceptance.
+
+
+## Original WordPress normalized source copies (C1.08/C3.47/C11.14)
+
+The 2026-11-13 actual protected-main `81271622` control found a completed
+reader erasure after physical source-chunk retirement while private data
+remained in an unaccepted normalized entry and media plan. The original
+full-erasure oracle and populated failure are preserved; the candidate's
+separate containment oracle requires explicit pending recovery and passed
+at `951212de`, alongside all 15 existing raw-source erasure controls. See
+`deploy/import-wxr-index-privacy-2026-11-13.md` for facts and limits. The
+no-DDL completion guard does not erase immutable index rows or repair old
+completed receipts. Full guarded minimization and historical recovery remain
+required. This coding-agent finding and repair supply no independent C11.10
+sign-off.

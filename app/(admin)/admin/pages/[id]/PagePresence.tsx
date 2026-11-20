@@ -1,0 +1,67 @@
+// Copyright (C) 2026 Tony Aly
+// SPDX-License-Identifier: Apache-2.0
+"use client";
+// Heartbeat so other editors can see who is on this page (C2.03).
+import { useEffect, useState } from "react";
+import {
+  heartbeatPresenceAction,
+  leavePresenceAction,
+} from "../../../cms-actions";
+
+export function PagePresence({
+  pageId,
+  self,
+  names,
+  labels,
+}: {
+  pageId: string;
+  self: string;
+  /** Actor id (`user:<uuid>`) → the name people know them by. */
+  names: Record<string, string>;
+  labels: {
+    alone: string;
+    others: string;
+    editing: string;
+    teammate: string;
+  };
+}) {
+  const [actors, setActors] = useState<{ actor: string; editing: boolean }[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const pulse = async (editing: boolean) => {
+      try {
+        const result = await heartbeatPresenceAction(pageId, editing);
+        if (!cancelled && result.actors) setActors(result.actors);
+      } catch {
+        // A missed heartbeat is recoverable: the next tick retries, and the
+        // server expires silent editors by TTL either way.
+      }
+    };
+    void pulse(true);
+    const timer = window.setInterval(() => void pulse(true), 30_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      // Best effort: if this release never lands (tab killed mid-flight),
+      // the presence row expires by TTL rather than lingering forever.
+      leavePresenceAction(pageId).catch(() => undefined);
+    };
+  }, [pageId]);
+
+  const others = actors.filter((row) => row.actor !== self);
+  if (others.length === 0) {
+    return <p className="text-sm text-ink-muted">{labels.alone}</p>;
+  }
+  return (
+    <p className="text-sm text-ink">
+      {labels.others}{" "}
+      {others.map((row) => (
+        <span key={row.actor} className="me-2 text-xs font-medium">
+          {names[row.actor] ?? labels.teammate}
+          {row.editing ? ` (${labels.editing})` : ""}
+        </span>
+      ))}
+    </p>
+  );
+}

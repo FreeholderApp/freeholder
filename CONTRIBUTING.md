@@ -1,0 +1,133 @@
+# Contributing to Freeholder
+
+Thanks for wanting to help build the open-source operating system for a
+one-person business.
+
+## Ground truth
+
+[`MASTER.md`](MASTER.md) is the only product, architecture, status, and
+delivery source of truth. Every product change names an item in its §43
+completion checklist and meets the applicable feature-level definition of
+done. If a change contradicts the master doc, either the change is wrong or the
+doc changes in the same PR — code and doc never disagree silently. Do not
+create a parallel roadmap or backlog in another document.
+
+## How to contribute
+
+1. **Choose the work** from `MASTER.md` §43. Discuss anything non-trivial in a
+   GitHub Discussion or issue, but keep scope and acceptance criteria in the
+   master checklist so an issue never becomes a second product plan. A running
+   instance can also file a bug, feature request or patch through
+   `contribute.submit` (admin, HTTP or MCP). `freeholder.ai` is the default
+   hub. That inbox is not a second product plan: accepted work that changes
+   the product lands as a §43 item here. Security reports stay on
+   [`SECURITY.md`](SECURITY.md).
+2. **Fork and branch** from `main`. Branch names: `feat/...`, `fix/...`,
+   `docs/...`.
+3. **Sign off every commit** (`git commit -s`). This certifies the
+   [Developer Certificate of Origin](DCO.md). PRs with unsigned commits fail
+   CI. There is no CLA.
+4. **Open a PR** against `main`. `main` is protected: PRs only, status checks
+   required, no force pushes.
+
+## Running it locally
+
+Use the exact Node release in `.node-version` (the supported floor is 20.19),
+the package-manager release pinned in `package.json`, and a PostgreSQL 15+
+database you do not mind writing to.
+
+```bash
+pnpm install
+cp .env.example .env          # set DATABASE_URL and SESSION_SECRET
+pnpm db:migrate
+pnpm dev                      # first visit serves the complete demo at /
+```
+
+Development seeds Aurora Coast Photography only when the database has no owner
+and no business profile. Visit `/setup` to claim that demo with the first owner
+account. Set `FREEHOLDER_SEED_DEMO=0` when you deliberately need the blank
+setup journey instead; production remains blank unless the switch is `1`.
+
+**Tests want a second, throwaway database.** Set `TEST_DATABASE_URL` in `.env`
+and the suite maps it onto `DATABASE_URL` for the run; migrations are applied
+by vitest's `globalSetup`, so there is no separate migrate step. Without that
+variable the database-backed suites **skip** rather than run — deliberately, so
+a test run can never truncate the database you were developing against. The
+unit suites always run.
+
+```bash
+pnpm test          # vitest
+pnpm build && pnpm test:browser # real Chromium accessibility + product journeys
+pnpm typecheck     # tsc --noEmit
+pnpm lint          # architecture, money (§15.4), service-layer (§15.5), i18n (§15.3)
+pnpm plan:check    # MASTER.md is the one complete, internally consistent plan
+pnpm license:check # Apache-2.0 headers, manifests, and package license texts
+pnpm dependency:audit # advisories plus SECURITY.md's exception contract
+pnpm ownership:drill  # guarded pg_dump/restore/export rehearsal (needs pg_dump)
+```
+
+The browser gate truncates the throwaway database, never the development
+database. Install its pinned Chromium once with
+`pnpm exec playwright install chromium`; see
+[`deploy/accessibility-testing.md`](deploy/accessibility-testing.md) and
+[`deploy/browser-journeys.md`](deploy/browser-journeys.md) for the coverage
+matrices, artifacts and fixture boundaries.
+
+The ownership drill accepts only a database whose name contains `test` or
+`drill`, creates and removes its own random restore database, and never uses a
+normal local `DATABASE_URL` outside CI. See
+[`deploy/ownership-recovery.md`](deploy/ownership-recovery.md) before handling
+a real backup, logical export, media inventory or credential-key rotation.
+
+CI runs all of the above plus the build, a dependency audit, and a Docker image
+that has to answer a real HTTP request. Run them before opening a PR and the
+review is about the code rather than the checks.
+
+### On an ordinary laptop
+
+The full suite is large (about 4,300 tests, most of them database-backed). CI
+spreads it across 28 parallel jobs, each with its own database. Run end to end
+on one machine it takes hours, so you do not need to. Before pushing:
+
+```bash
+pnpm gates                                   # typecheck, lint, licence, release-note, plan and contract checks (a few minutes)
+pnpm exec vitest run tests/core/<area>.test.ts  # the test files for what you changed
+```
+
+Pass a test file or directory to `vitest run` to limit the run, and let CI run
+everything else. Run one database-backed test command per `TEST_DATABASE_URL`
+at a time. Two runs that share a database truncate each other's tables and
+fail with timeouts and missing rows that have nothing to do with your change.
+
+## Pull requests written with AI agents
+
+Agent-written pull requests are welcome. Point Claude Code, Codex, Cursor or
+any other agent at the repository and let it do the work. The same rules
+apply as for any other change:
+
+- **A human contributor reviews and signs off every commit.** The DCO
+  sign-off (`git commit -s`) is your statement, under your own name, that you
+  have the right to submit the change. An agent can write the commit, but you
+  are the one certifying it, so read it first.
+- **The agent follows [`CLAUDE.md`](CLAUDE.md) and [`AGENTS.md`](AGENTS.md).**
+  They hold the house rules: `MASTER.md` §43 is the plan, money and contacts
+  go through the shared services, colours come from design tokens, and every
+  user-facing change ships a changeset.
+- **It passes `pnpm gates` before you push**, plus the tests for what it
+  changed. CI runs the rest.
+
+## Licensing of contributions
+
+Inbound = outbound: contributions are accepted under Apache-2.0, the same
+license as the Freeholder-authored repository and published packages. See
+[`LICENSING.md`](LICENSING.md). New files carry the SPDX header shown there.
+
+## Code of conduct
+
+Be excellent to each other. The
+[Contributor Covenant](CODE_OF_CONDUCT.md) applies in all project spaces.
+
+## Security issues
+
+Never open a public issue for a vulnerability — see
+[`SECURITY.md`](SECURITY.md).

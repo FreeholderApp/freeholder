@@ -1,0 +1,538 @@
+// Copyright (C) 2026 Tony Aly
+// SPDX-License-Identifier: Apache-2.0
+// Mail routing and delivery evidence (MASTER.md §12, §43 C1.14).
+//
+// Bodies deliberately do not live in the durable delivery ledger. It answers
+// which sender tried which address, through which provider, and what happened.
+// The separate outbox below holds only authenticated ciphertext and is deleted
+// after delivery or its bounded retention window; it cannot become a mailbox.
+import { sql } from "drizzle-orm";
+import {
+  boolean,
+  check,
+  index,
+  integer,
+  jsonb,
+  pgTable,
+  text,
+  timestamp,
+  uniqueIndex,
+  uuid,
+} from "drizzle-orm/pg-core";
+import { users } from "@/core/auth/schema";
+import { contacts } from "@/core/contacts/schema";
+import { connectedAccounts } from "@/core/connections/schema";
+import { createdAtColumn, updatedAtColumn } from "@/core/db/columns";
+import { consentRecords } from "@/core/privacy/schema";
+
+export const mailSenders = pgTable(
+  "mail_senders",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    purpose: text("purpose", { enum: ["transactional", "bulk"] }).notNull(),
+    provider: text("provider", {
+      enum: [
+        "gmail",
+        "outlook",
+        "smtp",
+        "console",
+        "resend",
+        "postmark",
+        "ses",
+        "paradise",
+      ],
+    }).notNull(),
+    /** Required for personal OAuth senders; null for env-backed providers. */
+    connectedAccountId: uuid("connected_account_id").references(
+      () => connectedAccounts.id,
+      { onDelete: "cascade" },
+    ),
+    email: text("email").notNull(),
+    displayName: text("display_name"),
+    /** Provider domain/signature/identity id when one is available. */
+    providerIdentity: text("provider_identity"),
+    verificationStatus: text("verification_status", {
+      enum: ["pending", "verified", "failed"],
+    })
+      .notNull()
+      .default("pending"),
+    status: text("status", {
+      enum: ["active", "paused", "needs_attention"],
+    })
+      .notNull()
+      .default("active"),
+    isDefault: boolean("is_default").notNull().default(false),
+    verificationDetail: jsonb("verification_detail").notNull().default({}),
+    lastVerifiedAt: timestamp("last_verified_at", { withTimezone: true }),
+    lastError: text("last_error"),
+    createdBy: uuid("created_by").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    createdAt: createdAtColumn(),
+    updatedAt: updatedAtColumn(),
+  },
+  (t) => [
+    uniqueIndex("mail_senders_identity_idx").on(
+      t.purpose,
+      t.provider,
+      t.email,
+    ),
+    uniqueIndex("mail_senders_default_idx")
+      .on(t.purpose)
+      .where(sql`${t.isDefault} = true`),
+    index("mail_senders_connection_idx").on(t.connectedAccountId),
+    index("mail_senders_status_idx").on(t.purpose, t.status),
+    check("mail_senders_purpose_allowed", sql`${t.purpose} in ('transactional', 'bulk')`),
+    check(
+      "mail_senders_provider_allowed",
+      sql`${t.provider} in ('gmail', 'outlook', 'smtp', 'console', 'resend', 'postmark', 'ses', 'paradise')`,
+    ),
+    check(
+      "mail_senders_verification_allowed",
+      sql`${t.verificationStatus} in ('pending', 'verified', 'failed')`,
+    ),
+    check(
+      "mail_senders_status_allowed",
+      sql`${t.status} in ('active', 'paused', 'needs_attention')`,
+    ),
+    check("mail_senders_email_lower", sql`${t.email} = lower(${t.email})`),
+    check("mail_senders_email_bounded", sql`length(${t.email}) <= 320`),
+    check(
+      "mail_senders_provider_purpose",
+      sql`(${t.purpose} = 'transactional' and ${t.provider} in ('gmail', 'outlook', 'smtp', 'console', 'paradise')) or (${t.purpose} = 'bulk' and ${t.provider} in ('resend', 'postmark', 'ses', 'paradise'))`,
+    ),
+    check(
+      "mail_senders_connection_consistent",
+      sql`(${t.provider} in ('gmail', 'outlook') and ${t.connectedAccountId} is not null) or (${t.provider} not in ('gmail', 'outlook') and ${t.connectedAccountId} is null)`,
+    ),
+    check(
+      "mail_senders_default_ready",
+      sql`${t.isDefault} = false or (${t.status} = 'active' and ${t.verificationStatus} = 'verified' and ${t.provider} <> 'console')`,
+    ),
+  ],
+);
+
+/** One-time, short-lived state for a server-side mail OAuth consent flow. */
+export const mailOauthStates = pgTable(
+  "mail_oauth_states",
+  {
+    /** SHA-256 of the token returned to the browser; the bearer value is not stored. */
+    tokenHash: text("token_hash").primaryKey(),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    provider: text("provider", { enum: ["google", "microsoft"] }).notNull(),
+    /**
+     * What the person is connecting the account *for* (C4.11).
+     *
+     * A code issued for calendars must not be redeemable by the mail flow, so
+     * the claim matches on this as well as on the token hash. The table's
+     * name is historical — mail built this first and calendars reuse it
+     * exactly; renaming it waits for a major version, because §39.5 requires
+     * the previous release to keep reading the schema this one writes.
+     */
+    purpose: text("purpose", { enum: ["mail", "calendar", "mail_read", "signup_contacts"] })
+      .notNull()
+      .default("mail"),
+    /** Which calendar access was asked for, so completion can check it. */
+    access: text("access", { enum: ["read", "write"] }).notNull().default("read"),
+    returnTo: text("return_to").notNull().default("/admin/settings"),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    consumedAt: timestamp("consumed_at", { withTimezone: true }),
+    createdAt: createdAtColumn(),
+  },
+  (t) => [
+    index("mail_oauth_states_expiry_idx").on(t.expiresAt),
+    check("mail_oauth_states_hash_format", sql`${t.tokenHash} ~ '^[0-9a-f]{64}$'`),
+    check("mail_oauth_states_provider_allowed", sql`${t.provider} in ('google', 'microsoft')`),
+    check(
+      "mail_oauth_states_safe_return",
+      sql`${t.returnTo} ~ '^/(admin|portal/contact-import)(/|$|\\?)'`,
+    ),
+    check("mail_oauth_states_expiry_order", sql`${t.expiresAt} > ${t.createdAt}`),
+    check(
+      "mail_oauth_states_consumed_order",
+      sql`${t.consumedAt} is null or ${t.consumedAt} >= ${t.createdAt}`,
+    ),
+  ],
+);
+
+export const mailDeliveries = pgTable(
+  "mail_deliveries",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    senderId: uuid("sender_id").references(() => mailSenders.id, {
+      onDelete: "set null",
+    }),
+    purpose: text("purpose", { enum: ["transactional", "bulk"] }).notNull(),
+    provider: text("provider", {
+      enum: [
+        "gmail",
+        "outlook",
+        "smtp",
+        "console",
+        "resend",
+        "postmark",
+        "ses",
+        "paradise",
+        "none",
+      ],
+    }).notNull(),
+    recipient: text("recipient").notNull(),
+    subject: text("subject").notNull(),
+    status: text("status", {
+      enum: [
+        "queued",
+        "submitted",
+        "unknown",
+        "delivered",
+        "bounced",
+        "complained",
+        "failed",
+        "suppressed",
+        "held",
+      ],
+    })
+      .notNull()
+      .default("queued"),
+    /**
+     * C3.36: why a private preview held this message in its outbox instead
+     * of delivering it. Set exactly when `status` is `held`.
+     */
+    holdReason: text("hold_reason", { enum: ["recipient", "cap", "no_adapter"] }),
+    providerRef: text("provider_ref"),
+    /** Stable caller key. Null for one-off sends that cannot be retried safely. */
+    idempotencyKey: text("idempotency_key"),
+    /** Private keyed lookups survive removal of the original personal fields. */
+    recipientDigest: text("recipient_digest"),
+    idempotencyDigest: text("idempotency_digest"),
+    providerRefDigest: text("provider_ref_digest"),
+    redactedAt: timestamp("redacted_at", { withTimezone: true }),
+    requestedBy: text("requested_by").notNull(),
+    attempts: integer("attempts").notNull().default(0),
+    lastError: text("last_error"),
+    submittedAt: timestamp("submitted_at", { withTimezone: true }),
+    deliveredAt: timestamp("delivered_at", { withTimezone: true }),
+    /**
+     * Provider timestamp of the last webhook transition applied to `status`.
+     * Delivery webhooks are not ordered, so receipt time cannot safely decide
+     * whether a late event is newer than the state already recorded.
+     */
+    providerStatusAt: timestamp("provider_status_at", { withTimezone: true }),
+    createdAt: createdAtColumn(),
+    updatedAt: updatedAtColumn(),
+  },
+  (t) => [
+    uniqueIndex("mail_deliveries_idempotency_idx")
+      .on(t.idempotencyKey)
+      .where(sql`${t.idempotencyKey} is not null`),
+    uniqueIndex("mail_deliveries_receipt_digest_idx").on(t.idempotencyDigest).where(sql`${t.idempotencyDigest} is not null`),
+    index("mail_deliveries_provider_digest_idx").on(t.provider, t.providerRefDigest),
+    index("mail_deliveries_provider_ref_idx").on(t.provider, t.providerRef),
+    index("mail_deliveries_recipient_idx").on(t.recipient, t.createdAt),
+    index("mail_deliveries_status_idx").on(t.status, t.createdAt),
+    check("mail_deliveries_purpose_allowed", sql`${t.purpose} in ('transactional', 'bulk')`),
+    check(
+      "mail_deliveries_provider_allowed",
+      sql`${t.provider} in ('gmail', 'outlook', 'smtp', 'console', 'resend', 'postmark', 'ses', 'paradise', 'none')`,
+    ),
+    check(
+      "mail_deliveries_status_allowed",
+      sql`${t.status} in ('queued', 'submitted', 'unknown', 'delivered', 'bounced', 'complained', 'failed', 'suppressed', 'held')`,
+    ),
+    check(
+      "mail_deliveries_hold_reason_allowed",
+      sql`${t.holdReason} is null or ${t.holdReason} in ('recipient', 'cap', 'no_adapter')`,
+    ),
+    check(
+      "mail_deliveries_provider_purpose",
+      sql`(${t.purpose} = 'transactional' and ${t.provider} in ('gmail', 'outlook', 'smtp', 'console', 'paradise')) or (${t.purpose} = 'bulk' and ${t.provider} in ('resend', 'postmark', 'ses', 'paradise', 'none'))`,
+    ),
+    check("mail_deliveries_recipient_lower", sql`${t.recipient} = lower(${t.recipient})`),
+    check("mail_deliveries_recipient_bounded", sql`length(${t.recipient}) <= 320`),
+    check("mail_deliveries_subject_bounded", sql`length(${t.subject}) <= 998`),
+    check("mail_deliveries_attempts_nonnegative", sql`${t.attempts} >= 0`),
+    check(
+      "mail_deliveries_terminal_consistent",
+      sql`${t.status} <> 'delivered' or ${t.deliveredAt} is not null`,
+    ),
+  ],
+);
+
+/**
+ * Encrypted body staged only while a delivery is queued or retryable, or (C3.36)
+ * while a private preview holds it for the owner to read.
+ */
+export const mailOutbox = pgTable(
+  "mail_outbox",
+  {
+    deliveryId: uuid("delivery_id")
+      .primaryKey()
+      .references(() => mailDeliveries.id, { onDelete: "cascade" }),
+    encryptedMessage: text("encrypted_message").notNull(),
+    createdAt: createdAtColumn(),
+    updatedAt: updatedAtColumn(),
+  },
+  (t) => [
+    check("mail_outbox_envelope_present", sql`char_length(${t.encryptedMessage}) > 20`),
+    index("mail_outbox_created_idx").on(t.createdAt),
+  ],
+);
+
+/** C3.31/C11.08: immutable staged intent, separate from its physical attempts. */
+export const mailDispatchRequests = pgTable("mail_dispatch_requests", {
+  deliveryId: uuid("delivery_id").primaryKey().references(() => mailDeliveries.id, { onDelete: "restrict" }),
+  routeDigest: text("route_digest").notNull(),
+  payloadDigest: text("payload_digest").notNull(),
+  encryptedRoute: text("encrypted_route"),
+  admittedAttempt: integer("admitted_attempt").notNull().default(1),
+  createdAt: createdAtColumn(),
+}, t => [
+  check("mail_dispatch_requests_route_digest", sql`${t.routeDigest} ~ '^[a-f0-9]{64}$'`),
+  check("mail_dispatch_requests_payload_digest", sql`${t.payloadDigest} ~ '^[a-f0-9]{64}$'`),
+]);
+
+/** A reserved call remains unknown until its own positive outcome is proved. */
+export type CarrierOperation = {
+  id: string; kind: "send" | "consent" | "withdraw"; key: string;
+  resourceDigest: string; payloadDigest: string; coveredGrantIds?: string[];
+  state: "running" | "confirmed" | "refused" | "unknown";
+  httpStatus?: number; providerCode?: string; responseDigest?: string;
+};
+
+export const mailDispatches = pgTable("mail_dispatches", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  deliveryId: uuid("delivery_id").notNull().references(() => mailDeliveries.id, { onDelete: "restrict" }),
+  routeDigest: text("route_digest").notNull(),
+  payloadDigest: text("payload_digest").notNull(),
+  attempt: integer("attempt").notNull(),
+  carrierOperations: jsonb("carrier_operations").$type<CarrierOperation[]>().notNull().default([]),
+  state: text("state", { enum: ["running", "unknown", "submitted", "not_submitted"] }).notNull(),
+  providerRef: text("provider_ref"),
+  replyProviderRef: text("reply_provider_ref"),
+  replyEvidenceDigest: text("reply_evidence_digest"),
+  initialReviewDigest: text("initial_review_digest"),
+  initialReviewedAt: timestamp("initial_reviewed_at", { withTimezone: true }),
+  /** Private keyed evidence receipt; operator prose is never persisted. */
+  resolutionDigest: text("resolution_digest"),
+  resolvedBy: uuid("resolved_by").references(() => users.id, { onDelete: "set null" }),
+  resolutionSource: text("resolution_source", { enum: ["adapter", "human_provider_confirmation"] }),
+  finishedAt: timestamp("finished_at", { withTimezone: true }),
+  redactedAt: timestamp("redacted_at", { withTimezone: true }),
+  createdAt: createdAtColumn(),
+}, t => [
+  uniqueIndex("mail_dispatches_physical_attempt_idx").on(t.deliveryId, t.attempt),
+  index("mail_dispatches_state_idx").on(t.state, t.createdAt),
+  check("mail_dispatches_route_digest", sql`${t.routeDigest} ~ '^[a-f0-9]{64}$'`),
+  check("mail_dispatches_payload_digest", sql`${t.payloadDigest} ~ '^[a-f0-9]{64}$'`),
+  check("mail_dispatches_state_allowed", sql`${t.state} in ('running','unknown','submitted','not_submitted')`),
+  check("mail_dispatches_resolution_source_allowed", sql`${t.resolutionSource} is null or ${t.resolutionSource} in ('adapter','human_provider_confirmation')`),
+  check("mail_dispatches_finished_consistent", sql`(${t.state} in ('running','unknown') and ${t.finishedAt} is null and ${t.resolutionSource} is null) or (${t.state} in ('submitted','not_submitted') and ${t.finishedAt} is not null and ${t.resolutionSource} is not null)`),
+]);
+
+/** Human evidence about incomplete old sends is not invented physical provenance. */
+export const mailLegacyResolutions = pgTable("mail_legacy_resolutions", {
+  deliveryId: uuid("delivery_id").primaryKey().references(() => mailDeliveries.id, { onDelete: "restrict" }),
+  originalDigest: text("original_digest").notNull(),
+  outcome: text("outcome", { enum: ["submitted", "not_submitted"] }).notNull(),
+  evidenceDigest: text("evidence_digest").notNull(),
+  providerRef: text("provider_ref"),
+  redactedAt: timestamp("redacted_at", { withTimezone: true }),
+  resolvedBy: uuid("resolved_by").references(() => users.id, { onDelete: "set null" }),
+  createdAt: createdAtColumn(),
+}, t => [check("mail_legacy_resolutions_outcome", sql`${t.outcome} in ('submitted','not_submitted')`)]);
+
+/** Idempotency receipt plus the normalized provider fact, never the raw body. */
+export const mailProviderEvents = pgTable(
+  "mail_provider_events",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    provider: text("provider", {
+      enum: ["resend", "postmark", "ses"],
+    }).notNull(),
+    externalEventId: text("external_event_id").notNull(),
+    externalEventDigest: text("external_event_digest"),
+    recipientDigest: text("recipient_digest"),
+    providerRefDigest: text("provider_ref_digest"),
+    redactedAt: timestamp("redacted_at", { withTimezone: true }),
+    deliveryId: uuid("delivery_id").references(() => mailDeliveries.id, {
+      onDelete: "set null",
+    }),
+    providerRef: text("provider_ref"),
+    recipient: text("recipient").notNull(),
+    eventType: text("event_type", {
+      enum: [
+        "submitted",
+        "delivered",
+        "delayed",
+        "soft_bounce",
+        "hard_bounce",
+        "complaint",
+        "suppressed",
+        "failed",
+      ],
+    }).notNull(),
+    detail: text("detail"),
+    /** SHA-256 only: proves which payload was processed without retaining it. */
+    rawDigest: text("raw_digest").notNull(),
+    occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull(),
+    createdAt: createdAtColumn(),
+  },
+  (t) => [
+    uniqueIndex("mail_provider_events_external_idx").on(
+      t.provider,
+      t.externalEventId,
+    ),
+    uniqueIndex("mail_provider_events_receipt_digest_idx").on(t.provider, t.externalEventDigest).where(sql`${t.externalEventDigest} is not null`),
+    index("mail_provider_events_delivery_idx").on(t.deliveryId, t.occurredAt),
+    index("mail_provider_events_recipient_idx").on(t.recipient, t.occurredAt),
+    check(
+      "mail_provider_events_provider_allowed",
+      sql`${t.provider} in ('resend', 'postmark', 'ses')`,
+    ),
+    check(
+      "mail_provider_events_type_allowed",
+      sql`${t.eventType} in ('submitted', 'delivered', 'delayed', 'soft_bounce', 'hard_bounce', 'complaint', 'suppressed', 'failed')`,
+    ),
+    check("mail_provider_events_recipient_lower", sql`${t.recipient} = lower(${t.recipient})`),
+    check("mail_provider_events_recipient_bounded", sql`length(${t.recipient}) <= 320`),
+    check(
+      "mail_provider_events_digest_format",
+      sql`${t.rawDigest} ~ '^[0-9a-f]{64}$'`,
+    ),
+  ],
+);
+
+export const mailSuppressions = pgTable(
+  "mail_suppressions",
+  {
+    /** Stable identity remains when the email primary key is minimized. */
+    id: uuid("id").notNull().defaultRandom(),
+    email: text("email").primaryKey(),
+    emailDigest: text("email_digest"),
+    redactedAt: timestamp("redacted_at", { withTimezone: true }),
+    reason: text("reason", {
+      enum: ["hard_bounce", "complaint", "provider", "manual"],
+    }).notNull(),
+    provider: text("provider", {
+      enum: ["resend", "postmark", "ses", "manual"],
+    }).notNull(),
+    sourceEventId: uuid("source_event_id").references(
+      () => mailProviderEvents.id,
+      { onDelete: "set null" },
+    ),
+    detail: text("detail"),
+    active: boolean("active").notNull().default(true),
+    releasedAt: timestamp("released_at", { withTimezone: true }),
+    releasedBy: uuid("released_by").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    createdAt: createdAtColumn(),
+    updatedAt: updatedAtColumn(),
+  },
+  (t) => [
+    uniqueIndex("mail_suppressions_id_idx").on(t.id),
+    uniqueIndex("mail_suppressions_receipt_digest_idx").on(t.emailDigest).where(sql`${t.emailDigest} is not null`),
+    index("mail_suppressions_active_idx")
+      .on(t.createdAt)
+      .where(sql`${t.active} = true`),
+    check(
+      "mail_suppressions_reason_allowed",
+      sql`${t.reason} in ('hard_bounce', 'complaint', 'provider', 'manual')`,
+    ),
+    check(
+      "mail_suppressions_provider_allowed",
+      sql`${t.provider} in ('resend', 'postmark', 'ses', 'manual')`,
+    ),
+    check(
+      "mail_suppressions_source_consistent",
+      sql`(${t.reason} = 'manual' and ${t.provider} = 'manual') or (${t.reason} <> 'manual' and ${t.provider} <> 'manual')`,
+    ),
+    check("mail_suppressions_email_lower", sql`${t.email} = lower(${t.email})`),
+    check("mail_suppressions_email_bounded", sql`length(${t.email}) <= 320`),
+    check(
+      "mail_suppressions_release_consistent",
+      sql`(${t.active} = true and ${t.releasedAt} is null) or (${t.active} = false and ${t.releasedAt} is not null)`,
+    ),
+  ],
+);
+
+/** One immutable per-site HMAC key, encrypted with existing credential wrapping. */
+export const mailReceiptKeys = pgTable("mail_receipt_keys", {
+  id: integer("id").primaryKey().default(1),
+  encryptedKey: text("encrypted_key").notNull(),
+  wrappingFingerprint: text("wrapping_fingerprint").notNull(),
+  sealedAt: timestamp("sealed_at", { withTimezone: true }),
+  createdAt: createdAtColumn(),
+}, t => [check("mail_receipt_keys_singleton", sql`${t.id} = 1`)]);
+
+/** A record can legitimately span address lifetimes; no second contact store. */
+export const mailRecordSubjects = pgTable("mail_record_subjects", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  kind: text("kind", { enum: ["delivery", "event", "suppression"] }).notNull(),
+  recordId: uuid("record_id").notNull(),
+  contactId: uuid("contact_id").references(() => contacts.id, { onDelete: "set null" }),
+  basis: text("basis", { enum: ["automatic", "owner_review"] }).notNull().default("automatic"),
+  evidenceDigest: text("evidence_digest"),
+  verifiedBy: uuid("verified_by").references(() => users.id, { onDelete: "set null" }),
+  createdAt: createdAtColumn(),
+}, t => [
+  index("mail_record_subjects_owned_idx").on(t.kind, t.recordId, t.contactId),
+  index("mail_record_subjects_contact_idx").on(t.contactId, t.kind, t.recordId),
+  check("mail_record_subjects_kind", sql`${t.kind} in ('delivery','event','suppression')`),
+]);
+
+/**
+ * Marketing grants Freeholder has recorded at a permission-checking campaign
+ * carrier (C3.31). Only these are ever withdrawn there: a contact who denied,
+ * never opted in, or was never mailed through such a carrier has nothing to
+ * mirror. Keyed to the consent record the grant came from and the address it
+ * was recorded under, so a withdrawal reaches the address the carrier holds
+ * even after the contact's email has changed. Exported and erased with the
+ * contact (`mail.provider_grants`); finished rows age out under the
+ * `mail_provider_grants` retention kind.
+ */
+export const mailProviderGrants = pgTable(
+  "mail_provider_grants",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    provider: text("provider", { enum: ["paradise"] }).notNull(),
+    email: text("original_email").notNull(),
+    emailDigest: text("email_digest"),
+    redactedAt: timestamp("redacted_at", { withTimezone: true }),
+    /**
+     * Null once the contact is gone: erasure detaches it on purpose, and
+     * deleting a contact sets it null through the consent record's cascade.
+     * A detached grant is withdrawn at the carrier and then its address
+     * is minimized (`withdrawDetachedGrants`). Minimal original operation
+     * receipts remain, including late replies, without restoring erased PII.
+     */
+    consentRecordId: uuid("consent_record_id").references(() => consentRecords.id, {
+      onDelete: "set null",
+    }),
+    /** Set when an erasure detached this grant: the receipt waits on it. */
+    erasureRequestId: uuid("erasure_request_id"),
+    erasureJobId: uuid("erasure_job_id"),
+    /** Never backfilled for legacy grants: today's account cannot prove yesterday's resource. */
+    revision: integer("revision").notNull().default(0),
+    recoveryPending: boolean("recovery_pending").notNull().default(false),
+    withdrawalReviews: jsonb("withdrawal_reviews").$type<Array<{ digest: string; operationsDigest: string }>>().notNull().default([]),
+    reviewDigest: text("review_digest"),
+    reviewedAt: timestamp("reviewed_at", { withTimezone: true }),
+    reviewedBy: uuid("reviewed_by").references(() => users.id, { onDelete: "set null" }),
+    resourceDigest: text("resource_digest"),
+    resourceBaseUrl: text("resource_base_url"),
+    carrierOperations: jsonb("carrier_operations").$type<CarrierOperation[]>().notNull().default([]),
+    withdrawnAt: timestamp("withdrawn_at", { withTimezone: true }),
+    /** Refusal or uncertainty is pending recovery, never successful withdrawal. */
+    withdrawalError: text("withdrawal_error"),
+    createdAt: createdAtColumn(),
+    updatedAt: updatedAtColumn(),
+  },
+  (t) => [
+    uniqueIndex("mail_provider_grants_unique_idx").on(t.provider, t.email, t.consentRecordId, t.resourceDigest),
+    index("mail_provider_grants_consent_idx").on(t.consentRecordId),
+    index("mail_provider_grants_detached_idx").on(t.id).where(sql`${t.consentRecordId} is null`),
+    check("mail_provider_grants_provider_allowed", sql`${t.provider} in ('paradise')`),
+  ],
+);

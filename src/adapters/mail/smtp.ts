@@ -1,0 +1,94 @@
+// Copyright (C) 2026 Tony Aly
+// SPDX-License-Identifier: Apache-2.0
+// SMTP (MASTER.md §12).
+//
+// The implementation every self-hoster can actually use: a mailbox they
+// already have, or a transactional provider's SMTP endpoint. §12 prefers
+// Gmail/Outlook OAuth for transactional mail — the owner's own address, so
+// replies land where they read. SMTP remains the portable alternative for a
+// mailbox or transactional provider the owner already operates.
+import { createTransport } from "nodemailer";
+import {
+  MailAdapterError,
+  type MailAdapter,
+  type OutboundEmail,
+} from "@/adapters/mail/types";
+
+export interface SmtpConfig {
+  host: string;
+  port: number;
+  user?: string;
+  password?: string;
+  /** Implicit TLS (port 465). STARTTLS on 587 is negotiated either way. */
+  secure?: boolean;
+  /** Optional private-server CA. Certificate verification is always enabled. */
+  ca?: string;
+  from: string;
+}
+
+export function createSmtpMail(config: SmtpConfig): MailAdapter {
+  // nodemailer's own types resolve to `any` through this import path, and the
+  // service-layer lint rules refuse to let an `any` spread quietly through the
+  // codebase. The two calls that matter are narrowed here instead.
+  interface Sender {
+    sendMail(options: Record<string, unknown>): Promise<{ messageId?: unknown; accepted?: unknown; rejected?: unknown; response?: unknown }>;
+  }
+  let transport: Sender | undefined;
+
+  return {
+    id: "smtp",
+    // `both`, because an owner pointing this at a real transactional provider
+    // may legitimately broadcast through it. Pointing it at a personal mailbox
+    // and then broadcasting is a mistake this cannot see — which is why §12
+    // puts the warning in the email-marketing module, next to the send.
+    // Bulk delivery needs provider feedback and suppression state. Treating a
+    // generic SMTP mailbox as a broadcast carrier would bypass both.
+    kind: "transactional",
+    delivers: true,
+    async send(message: OutboundEmail) {
+      // Connected on first use rather than at import, like the database pool:
+      // importing a module must never open a socket.
+      const secure = config.secure ?? config.port === 465;
+      const sender: Sender = (transport ??= createTransport({
+        host: config.host,
+        port: config.port,
+        secure,
+        requireTLS: !secure,
+        tls: { rejectUnauthorized: true, ...(config.ca ? { ca: config.ca } : {}) },
+        connectionTimeout: 10_000,
+        greetingTimeout: 10_000,
+        socketTimeout: 30_000,
+        auth: config.user ? { user: config.user, pass: config.password } : undefined,
+      }) as Sender);
+
+      try {
+        const info = await sender.sendMail({
+          from: message.from ?? config.from,
+          to: message.to,
+          subject: message.subject,
+          text: message.text,
+          html: message.html,
+          replyTo: message.replyTo,
+          headers: message.deliveryId || message.dispatchId
+            ? { ...(message.deliveryId ? { "X-Freeholder-Delivery": message.deliveryId } : {}), ...(message.dispatchId ? { "X-Freeholder-Dispatch": message.dispatchId } : {}) }
+            : undefined,
+        });
+        const recipient = message.to.trim().toLowerCase();
+        if (typeof info.messageId !== "string" || !info.messageId || info.messageId.length > 2_000 || !Array.isArray(info.accepted) || info.accepted.length !== 1 || typeof info.accepted[0] !== "string" || info.accepted[0].trim().toLowerCase() !== recipient || !Array.isArray(info.rejected) || info.rejected.length !== 0 || typeof info.response !== "string" || !/^250(?:[ -]|$)/.test(info.response) || info.response.length > 2_000) {
+          throw new MailAdapterError(
+            "SMTP did not prove final submission for the exact recipient.",
+          );
+        }
+        return { providerRef: info.messageId, acceptance: { protocol: "smtp" as const, recipient, response: info.response } };
+      } catch (error) {
+        if (error instanceof MailAdapterError) throw error;
+        // Nodemailer errors can include server banners, hostnames and command
+        // fragments. Keep those out of API responses and the delivery ledger.
+        throw new MailAdapterError(
+          "SMTP could not submit the message. Check the configured transport.",
+          true,
+        );
+      }
+    },
+  };
+}

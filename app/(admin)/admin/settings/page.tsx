@@ -1,0 +1,528 @@
+// Copyright (C) 2026 Tony Aly
+// SPDX-License-Identifier: Apache-2.0
+// Editing the business after setup — the other half of §13. The wizard writes
+// these once; this is where they live for the rest of the site's life.
+import { redirect } from "next/navigation";
+import { getLocale, getT } from "../../../i18n";
+import { businessFormLabels, businessOptions } from "../../../setup/businessLabels";
+import { requireStaffActor } from "../guard";
+import { SettingsForm } from "./SettingsForm";
+import { PasswordForm } from "./PasswordForm";
+import { ApiKeysCard } from "./ApiKeysCard";
+import { listApiKeys, listScopes } from "@/core/apikeys/service";
+import { inspectDelivery, listDeliveries, listWebhooks } from "@/core/webhooks/service";
+import { WebhooksCard } from "./WebhooksCard";
+import { currentBusiness } from "@/core/settings/read";
+import { listModules } from "@/core/settings/service";
+import { hasModuleAccess, type Actor } from "@/core/service";
+import { mailStatus } from "@/core/mail/service";
+import { MAIL_RECIPIENT_RETIRED, MAIL_ROUTE_CHANGED } from "@/core/mail/dispatch-state";
+import { previewMailActive } from "@/core/mail/preview";
+import { MailSettingsCard } from "./MailSettingsCard";
+import { ready } from "@/core/runtime";
+import { Button, Card, CardBody, CardHeader, Pill } from "@/ui/primitives";
+import { setModuleEnabledAction } from "../../settings-module-actions";
+import { env } from "@/core/env";
+import { domainOrNull } from "../../read-helpers";
+
+export const dynamic = "force-dynamic";
+
+/** Modules with a readable name; a plugin's module shows its own key. */
+const MODULE_NAMES = new Set([
+  "core", "cms", "forms", "analytics", "invoicing", "catalog", "seed", "builder", "events", "newsletters", "proof", "contracts", "rentals", "quotes", "projects", "galleries", "reviews", "crm", "ads", "share", "linkinbio", "popups", "documents", "automations", "reporting", "subscriptions", "assistant", "social", "loyalty", "referrals", "gift-registry", "print-on-demand", "assessments", "calculators", "community", "voice-video", "marketplace", "members",
+]);
+
+
+export default async function AdminSettingsPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ mail?: string; delivery?: string; webhook?: string; saved?: string; error?: string }>;
+}) {
+  const actor = await requireStaffActor("settings");
+  const business = await currentBusiness();
+  // Reachable only if setup was skipped somehow; the wizard is the way in.
+  if (!business) redirect("/setup");
+
+  const [t, locale, query, report, storedModules] = await Promise.all([
+    getT(),
+    getLocale(),
+    searchParams,
+    ready(),
+    domainOrNull(listModules.call({}, actor)),
+  ]);
+  const inspected = query.delivery
+    ? await domainOrNull(inspectDelivery.call({ id: query.delivery }, actor))
+    : null;
+  const byName = new Map((storedModules ?? []).map((row) => [row.module, row]));
+  const moduleRows = report.modules.map((name) => ({
+    module: name,
+    enabled: name === "core" ? true : (byName.get(name)?.enabled ?? true),
+    alwaysOn: name === "core",
+  }));
+  const canManageSettings = hasModuleAccess(actor, "settings", "manage");
+  const playground = env().FREEHOLDER_PLAYGROUND === "1";
+
+  // Sensitive integration cards are fetched only when this stored role may
+  // manage their modules, rather than rendered from calls that would refuse.
+  const access = await loadAccess(actor, locale, {
+    apiKeys: hasModuleAccess(actor, "apikeys", "manage"),
+    webhooks: hasModuleAccess(actor, "webhooks", "manage"),
+  });
+  const mailAccess = hasModuleAccess(actor, "mail", "view")
+    ? await loadMailAccess(actor, locale, t)
+    : null;
+
+  return (
+    <div className="grid gap-6">
+      {access.keys ? <a className="text-sm font-medium text-accent underline" href="/admin/connect">{t("connect.title")}</a> : null}
+      <div>
+        <h1 className="text-xl font-bold tracking-tight">
+          {t("admin.settings.title")}
+        </h1>
+        <p className="mt-1 text-sm text-ink-muted">
+          {t("admin.settings.intro")}
+        </p>
+      </div>
+      {query.saved === "module" ? (
+        <p className="rounded-md border border-success bg-success-soft px-3 py-2 text-sm text-success">
+          {t("settings.modules.saved")}
+        </p>
+      ) : null}
+      {query.webhook === "replayed" ? (
+        <p className="rounded-md border border-success bg-success-soft px-3 py-2 text-sm text-success">
+          {t("webhooks.replayed")}
+        </p>
+      ) : null}
+      {query.error ? (
+        <p className="rounded-md border border-danger bg-danger-soft px-3 py-2 text-sm text-danger">
+          {query.error.includes(" ") ? query.error : t("webhooks.replayFailed")}
+        </p>
+      ) : null}
+
+      <Card>
+        <CardHeader title={t("settings.modules.title")} />
+        <CardBody>
+          <p className="max-w-prose text-sm text-ink-muted">{t("settings.modules.intro")}</p>
+          {!canManageSettings ? (
+            <p className="text-sm text-ink-muted">{t("settings.modules.readOnly")}</p>
+          ) : null}
+          {storedModules === null ? (
+            <p className="text-sm text-danger">{t("settings.modules.unavailable")}</p>
+          ) : (
+            <ul className="mt-3 grid list-none gap-2 p-0">
+              {moduleRows.map((row) => (
+                <li key={row.module} className="flex flex-wrap items-center gap-3 rounded-md border border-rule p-3 text-sm">
+                  <span className="font-medium">
+                    {MODULE_NAMES.has(row.module) ? t(`settings.modules.name.${row.module}`) : row.module}
+                  </span>
+                  <Pill tone={row.enabled ? "success" : "neutral"}>
+                    {row.enabled ? t("settings.modules.on") : t("settings.modules.off")}
+                  </Pill>
+                  {/*
+                    "On" beside a module this person cannot open reads as a
+                    broken link waiting to happen; say why it is not in the nav.
+                  */}
+                  {row.enabled && !row.alwaysOn && !hasModuleAccess(actor, row.module, "view") ? (
+                    <span className="text-sm text-ink-muted">
+                      {t(playground ? "settings.modules.playgroundHidden" : "settings.modules.noAccess")}
+                    </span>
+                  ) : null}
+                  {row.alwaysOn ? (
+                    <span className="text-sm text-ink-muted">{t("settings.modules.alwaysOn")}</span>
+                  ) : canManageSettings ? (
+                    <form action={setModuleEnabledAction} className="ms-auto">
+                      <input type="hidden" name="module" value={row.module} />
+                      <input type="hidden" name="enabled" value={row.enabled ? "false" : "true"} />
+                      <Button type="submit" variant="quiet">
+                        {row.enabled ? t("settings.modules.off") : t("settings.modules.on")}
+                      </Button>
+                    </form>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          )}
+          <p className="mt-3 max-w-prose text-sm text-ink-muted">{t("settings.modules.coreHint")}</p>
+        </CardBody>
+      </Card>
+
+      {inspected ? (
+        <Card>
+          <CardHeader title={t("webhooks.inspect")} />
+          <CardBody>
+            <p className="text-sm">
+              {inspected.eventName} · {inspected.status} · {inspected.attempts} {t("webhooks.attempts")}
+            </p>
+            {inspected.error ? (
+              <p className="mt-2 text-sm text-danger">{inspected.error}</p>
+            ) : null}
+            <pre className="mt-3 overflow-x-auto rounded-md border border-rule bg-surface-muted p-3 text-xs">
+              {JSON.stringify(inspected.payload, null, 2)}
+            </pre>
+            {inspected.responseBody ? (
+              <pre className="mt-3 overflow-x-auto rounded-md border border-rule bg-surface-muted p-3 text-xs">
+                {inspected.responseBody}
+              </pre>
+            ) : null}
+          </CardBody>
+        </Card>
+      ) : query.delivery ? (
+        <p className="text-sm text-danger">{t("webhooks.inspectMissing")}</p>
+      ) : null}
+
+      <SettingsForm
+        readOnly={!hasModuleAccess(actor, "settings", "manage")}
+        labels={{
+          ...businessFormLabels(t),
+          cardTitle: t("business.cardTitle"),
+          submit: t("common.saveChanges"),
+          pending: t("common.saving"),
+          saved: t("admin.settings.saved"),
+        }}
+        options={businessOptions(locale, t, {
+          currency: business.baseCurrency,
+          timezone: business.timezone,
+        })}
+        values={{
+          name: business.name,
+          tagline: business.tagline ?? "",
+          schemaType: business.schemaType,
+          country: business.country,
+          baseCurrency: business.baseCurrency,
+          timezone: business.timezone,
+          enabledLocales: business.enabledLocales,
+          units: business.units,
+          firstDayOfWeek: business.firstDayOfWeek,
+        }}
+      />
+
+      {mailAccess && previewMailActive() ? (
+        <a className="text-sm font-medium text-accent underline" href="/admin/mail">{t("mail.preview.link")}</a>
+      ) : null}
+      {mailAccess && hasModuleAccess(actor, "mail", "manage") ? <a className="text-sm font-medium text-accent underline" href="/admin/retention/mail/recovery">{t("mail.recovery.link")}</a> : null}
+      {mailAccess ? (
+        <MailSettingsCard
+          {...mailAccess}
+          canManage={hasModuleAccess(actor, "mail", "manage")}
+          notice={mailNotice(query.mail, t)}
+          labels={{
+            title: t("mail.title"),
+            intro: t("mail.intro"),
+            route: t("mail.route"),
+            transactional: t("mail.transactional"),
+            transactionalIntro: t("mail.transactionalIntro"),
+            bulk: t("mail.bulk"),
+            bulkIntro: t("mail.bulkIntro"),
+            provider: t("mail.provider"),
+            delivers: t("mail.delivers"),
+            notDelivering: t("mail.notDelivering"),
+            configured: t("mail.configured"),
+            incomplete: t("mail.incomplete"),
+            notConfigured: t("mail.notConfigured"),
+            missing: t("mail.missing"),
+            connectGoogle: t("mail.connectGoogle"),
+            connectMicrosoft: t("mail.connectMicrosoft"),
+            register: t("mail.register"),
+            senderEmail: t("mail.senderEmail"),
+            displayName: t("mail.displayName"),
+            providerIdentity: t("mail.providerIdentity"),
+            providerIdentityHint: t("mail.providerIdentityHint"),
+            webhook: t("mail.webhook"),
+            feedbackReady: t("mail.feedbackReady"),
+            feedbackMissing: t("mail.feedbackMissing"),
+            senders: t("mail.senders"),
+            noSenders: t("mail.noSenders"),
+            default: t("mail.default"),
+            chooseDefault: t("mail.chooseDefault"),
+            verify: t("mail.verify"),
+            recheck: t("mail.recheck"),
+            pause: t("mail.pause"),
+            reactivate: t("mail.reactivate"),
+            test: t("mail.test"),
+            verified: t("mail.verified"),
+            verifyTitle: t("mail.verify.title"),
+            verifyProves: t("mail.verify.proves"),
+            verifyResend: t("mail.verify.resend"),
+            verifyPostmark: t("mail.verify.postmark"),
+            verifySes: t("mail.verify.ses"),
+            verifyFailed: t("mail.verify.failed"),
+            verifyDkim: t("mail.verify.dkim"),
+            verifyReturnPath: t("mail.verify.returnPath"),
+            verifyProviderStatus: t("mail.verify.providerStatus"),
+            verifyDomain: t("mail.verify.domain"),
+            verifyIdentity: t("mail.verify.identity"),
+            verifyYes: t("mail.verify.yes"),
+            verifyNo: t("mail.verify.no"),
+            pending: t("mail.pending"),
+            failed: t("mail.failed"),
+            active: t("mail.active"),
+            paused: t("mail.paused"),
+            needsAttention: t("mail.needsAttention"),
+            needsReconnect: t("mail.needsReconnect"),
+            revoked: t("mail.revoked"),
+            permissionOff: t("mail.permissionOff"),
+            lastChecked: t("mail.lastChecked"),
+            recentDeliveries: t("mail.recentDeliveries"),
+            noDeliveries: t("mail.noDeliveries"),
+            recipient: t("mail.recipient"),
+            subject: t("mail.subject"),
+            status: t("mail.status"),
+            attempts: t("mail.attempts"),
+            when: t("mail.when"),
+            suppressions: t("mail.suppressions"),
+            suppressionIntro: t("mail.suppressionIntro"),
+            noSuppressions: t("mail.noSuppressions"),
+            reason: t("mail.reason"),
+            release: t("mail.release"),
+            releaseHint: t("mail.releaseHint"),
+            retainedAddress: t("mail.retainedAddress"),
+            confirmation: t("mail.confirmation"),
+            readOnly: t("mail.readOnly"),
+            actionDone: t("mail.actionDone"),
+            pendingAction: t("mail.pendingAction"),
+            deliveryStatuses: {
+              queued: t("mail.delivery.queued"),
+              submitted: t("mail.delivery.submitted"),
+              unknown: t("mail.delivery.unknown"),
+              delivered: t("mail.delivery.delivered"),
+              bounced: t("mail.delivery.bounced"),
+              complained: t("mail.delivery.complained"),
+              failed: t("mail.delivery.failed"),
+              suppressed: t("mail.delivery.suppressed"),
+              held: t("mail.delivery.held"),
+            },
+            suppressionReasons: {
+              hard_bounce: t("mail.suppression.hardBounce"),
+              complaint: t("mail.suppression.complaint"),
+              provider: t("mail.suppression.provider"),
+              manual: t("mail.suppression.manual"),
+            },
+          }}
+        />
+      ) : null}
+
+      {access.keys ? (
+        <ApiKeysCard
+          areas={access.keys.areas}
+          keys={access.keys.rows}
+          labels={{
+            cardTitle: t("apikeys.title"),
+            intro: t("apikeys.intro"),
+            name: t("apikeys.name"),
+            nameHint: t("apikeys.nameHint"),
+            expiry: t("apikeys.expiry"),
+            expiryHint: t("apikeys.expiryHint"),
+            never: t("apikeys.never"),
+            access: t("apikeys.access"),
+            none: t("apikeys.none"),
+            read: t("apikeys.read"),
+            full: t("apikeys.full"),
+            create: t("apikeys.create"),
+            pending: t("common.saving"),
+            created: t("apikeys.created"),
+            createdHint: t("apikeys.createdHint"),
+            existing: t("apikeys.existing"),
+            empty: t("apikeys.empty"),
+            neverUsed: t("apikeys.neverUsed"),
+            lastUsed: t("apikeys.lastUsed"),
+            expiresOn: t("apikeys.expiresOn"),
+            revoke: t("apikeys.revoke"),
+            revokeConfirm: t("apikeys.revokeConfirm"),
+            publicOnly: t("apikeys.publicOnly"),
+          }}
+        />
+      ) : null}
+
+      {access.webhooks ? (
+        <WebhooksCard
+          hooks={access.webhooks.hooks}
+          deliveries={access.webhooks.deliveries}
+          labels={{
+            cardTitle: t("webhooks.title"),
+            intro: t("webhooks.intro"),
+            name: t("webhooks.name"),
+            nameHint: t("webhooks.nameHint"),
+            url: t("webhooks.url"),
+            urlHint: t("webhooks.urlHint"),
+            events: t("webhooks.events"),
+            eventsHint: t("webhooks.eventsHint"),
+            create: t("webhooks.create"),
+            pending: t("common.saving"),
+            existing: t("webhooks.existing"),
+            empty: t("webhooks.empty"),
+            never: t("webhooks.never"),
+            lastDelivery: t("webhooks.lastDelivery"),
+            paused: t("webhooks.paused"),
+            active: t("webhooks.active"),
+            test: t("webhooks.test"),
+            pause: t("webhooks.pause"),
+            resume: t("webhooks.resume"),
+            reveal: t("webhooks.reveal"),
+            remove: t("webhooks.remove"),
+            removeConfirm: t("webhooks.removeConfirm"),
+            secretShown: t("webhooks.secretShown"),
+            secretHint: t("webhooks.secretHint"),
+            recent: t("webhooks.recent"),
+            noDeliveries: t("webhooks.noDeliveries"),
+            inspect: t("webhooks.inspect"),
+            replay: t("webhooks.replay"),
+          }}
+        />
+      ) : null}
+
+      <PasswordForm
+        labels={{
+          cardTitle: t("settings.security"),
+          intro: t("settings.securityIntro"),
+          current: t("settings.currentPassword"),
+          next: t("settings.newPassword"),
+          nextHint: t("settings.newPasswordHelp"),
+          submit: t("settings.changePassword"),
+        }}
+      />
+    </div>
+  );
+}
+
+function mailNotice(
+  value: string | undefined,
+  t: Awaited<ReturnType<typeof getT>>,
+): { tone: "success" | "warning" | "danger"; text: string } | undefined {
+  switch (value) {
+    case "connected":
+      return { tone: "success", text: t("mail.oauth.connected") };
+    case "oauth_cancelled":
+      return { tone: "warning", text: t("mail.oauth.cancelled") };
+    case "oauth_conflict":
+      return { tone: "danger", text: t("mail.oauth.conflict") };
+    case "oauth_expired":
+      return { tone: "warning", text: t("mail.oauth.expired") };
+    case "oauth_incomplete":
+    case "oauth_invalid_provider":
+      return { tone: "danger", text: t("mail.oauth.incomplete") };
+    case "oauth_failed":
+      return { tone: "danger", text: t("mail.oauth.failed") };
+    default:
+      return undefined;
+  }
+}
+
+async function loadMailAccess(actor: Actor, locale: string, t: Awaited<ReturnType<typeof getT>>) {
+  const status = await mailStatus.call({ limit: 25 }, actor);
+  const exact = new Intl.DateTimeFormat(locale, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  });
+  return {
+    configuration: status.configuration,
+    senders: status.senders.map((sender) => ({
+      ...sender,
+      lastVerified: sender.lastVerifiedAt
+        ? exact.format(sender.lastVerifiedAt)
+        : null,
+      lastVerifiedAt: undefined,
+      createdAt: undefined,
+      verificationDetail:
+        sender.verificationDetail && typeof sender.verificationDetail === "object"
+          ? (sender.verificationDetail as Record<string, unknown>)
+          : {},
+    })),
+    deliveries: status.deliveries.map((delivery) => ({
+      id: delivery.id,
+      provider: delivery.provider,
+      recipient: delivery.recipient,
+      subject: delivery.subject,
+      status: delivery.status,
+      attempts: delivery.attempts,
+      detail: delivery.status === "unknown" ? t("mail.recovery.pending") : delivery.lastError === MAIL_ROUTE_CHANGED ? t("mail.recovery.routeChanged") : delivery.lastError === MAIL_RECIPIENT_RETIRED ? t("mail.recovery.recipientRetired") : delivery.lastError,
+      when: exact.format(delivery.createdAt),
+    })),
+    suppressions: status.suppressions.map((suppression) => ({
+      email: suppression.email,
+      redacted: Boolean(suppression.redactedAt),
+      reason: suppression.reason,
+      provider: suppression.provider,
+      detail: suppression.detail,
+      when: exact.format(suppression.createdAt),
+    })),
+  };
+}
+
+/**
+ * The key list and the scope areas the picker offers.
+ *
+ * `reads` is derived from each service's declared `kind`, so "read only" means
+ * exactly this instance's query services — including any a module added
+ * yesterday (§28). Nothing here is a second list to maintain.
+ */
+async function loadAccess(
+  actor: Actor,
+  locale: string,
+  include: { apiKeys: boolean; webhooks: boolean },
+) {
+  const [areas, rows] = include.apiKeys
+    ? await Promise.all([listScopes.call({}, actor), listApiKeys.call({}, actor)])
+    : [null, null];
+  const [hooks, deliveries] = include.webhooks
+    ? await Promise.all([
+        listWebhooks.call({}, actor),
+        listDeliveries.call({ limit: 10 }, actor),
+      ])
+    : [null, null];
+  const when = new Intl.DateTimeFormat(locale, { dateStyle: "medium" });
+  const exact = new Intl.DateTimeFormat(locale, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  });
+  return {
+    keys:
+      areas && rows
+        ? {
+            areas: areas.map((area) => ({
+              area: area.area,
+              family: area.family,
+              reads: area.services
+                .filter((service) => service.kind === "query")
+                .map((service) => service.name),
+              total: area.services.length,
+            })),
+            rows: rows.map((row) => ({
+              id: row.id,
+              name: row.name,
+              prefix: row.prefix,
+              scopes: row.scopes,
+              lastUsed: row.lastUsedAt ? when.format(row.lastUsedAt) : null,
+              expires: row.expiresAt ? when.format(row.expiresAt) : null,
+            })),
+          }
+        : null,
+    webhooks:
+      hooks && deliveries
+        ? {
+            hooks: hooks.map((hook) => ({
+              id: hook.id,
+              name: hook.name,
+              url: hook.url,
+              events: hook.events,
+              status: hook.status,
+              pausedReason: hook.pausedReason,
+              lastDelivery: hook.lastDeliveryAt
+                ? exact.format(hook.lastDeliveryAt)
+                : null,
+            })),
+            deliveries: deliveries.map((delivery) => ({
+              id: delivery.id,
+              event: delivery.eventName,
+              status: delivery.status,
+              attempts: delivery.attempts,
+              detail:
+                delivery.error ??
+                (delivery.responseStatus
+                  ? String(delivery.responseStatus)
+                  : ""),
+              when: exact.format(delivery.createdAt),
+            })),
+          }
+        : null,
+  };
+}

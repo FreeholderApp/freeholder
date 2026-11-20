@@ -1,0 +1,1371 @@
+// Copyright (C) 2026 Tony Aly
+// SPDX-License-Identifier: Apache-2.0
+// Sending and receiving text messages (MASTER.md §4.14, §12, C7.10).
+//
+// The adapter transports; core decides. That split is not decoration — §4.14
+// puts consent, quiet hours and "who may be messaged" in the service layer
+// precisely so there is no code path that can skip them, and a provider SDK
+// invited into the domain is exactly how such a path appears.
+//
+// Four things this file is careful about.
+//
+// **Which number to send from is a decision with consequences.** §4.14 keeps
+// transactional and marketing apart because consent does, so the number is
+// chosen by purpose and a number that failed its last health check is refused
+// rather than used — sending from a number carriers are filtering is how a
+// business discovers the problem from a customer.
+//
+// **Cost is recorded per message.** §4.14: "SMS is the one channel where an
+// owner can spend real money by accident." The provider returns segments and
+// price; both land on the message, in integer minor units (§15.4).
+//
+// **Delivery is observed.** A send records `queued`; the carrier's callback
+// records what actually happened, including its own error code verbatim.
+//
+// **An inbound message goes through the same door as every other channel.**
+// `conversations.record` resolves the contact and threads it, so a text from an
+// unknown number becomes a real person with a real history (C7.08) rather than
+// something SMS-shaped that only the SMS screen understands.
+import { z } from "zod";
+import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
+import { listed, row, timestamp, uuid } from "@/core/contract";
+import { smsAdapters } from "@/adapters/sms";
+import type { SmsAdapter } from "@/adapters/sms";
+import { AdapterError } from "@/adapters/types";
+import { storage } from "@/adapters/storage";
+import { contacts } from "@/core/contacts/schema";
+import { db } from "@/core/db";
+import { playgroundBlocksExternalDelivery } from "@/core/demo/playground-policy";
+import { env } from "@/core/env";
+import { jobIdempotencyKeys } from "@/core/jobs/schema";
+import { assets } from "@/core/media/schema";
+import {
+  defineOrchestratedService,
+  defineService,
+  getService,
+  ServiceError,
+  type Actor,
+  type ServiceContext,
+  type Tx,
+} from "@/core/service";
+import { NUMBER_KINDS, NUMBER_PURPOSES, messagingNumbers } from "./numbers-schema";
+import {
+  maySend,
+  overallState,
+  REGISTRATION_KINDS,
+  REGISTRATION_STATES,
+  requirementsFor,
+  type RegistrationRecord,
+} from "./registration";
+import consentServices, {
+  applyInboundSmsCompliance,
+  assertSmsPurposeAllowed,
+} from "./consent";
+import policyServices, {
+  evaluateSmsPolicy,
+  SMS_POLICY_EXCEPTION_KINDS,
+} from "./policy";
+import keywordServices, { applyInboundKeywordRule } from "./keywords";
+import { messageDeliveries, messages } from "./schema";
+import { resolveMessageContact } from "./service";
+
+const id = z.string().uuid();
+const HARD_INVALID_NUMBER_CODES = new Set(["21211", "21614"]);
+/** The post-commit job that submits a staged text to its carrier. */
+export const SMS_DELIVERY_JOB = "core.deliverSms";
+
+function normalizedPhone(value: string): string {
+  const digits = value.replace(/\D/g, "");
+  return digits.length === 11 && digits.startsWith("1") ? digits.slice(1) : digits;
+}
+
+async function smsContact(ctx: ServiceContext, contactId: string, to: string) {
+  const [contact] = await ctx.tx
+    .select()
+    .from(contacts)
+    .where(eq(contacts.id, contactId))
+    .limit(1);
+  if (!contact) throw new ServiceError("not_found", "That contact is not here.");
+  if (!contact.phone || normalizedPhone(contact.phone) !== normalizedPhone(to)) {
+    throw new ServiceError(
+      "validation",
+      "The destination does not match this contact's current phone number.",
+    );
+  }
+  if (contact.phoneStatus === "invalid") {
+    throw new ServiceError(
+      "validation",
+      `That phone number is marked invalid${contact.phoneInvalidProviderCode ? ` (${contact.phoneInvalidProviderCode})` : ""}. Correct it before sending again.`,
+    );
+  }
+  return contact;
+}
+
+async function markPhoneValid(ctx: ServiceContext, contactId: string, phone: string): Promise<void> {
+  const [contact] = await ctx.tx
+    .select({ phone: contacts.phone, phoneStatus: contacts.phoneStatus })
+    .from(contacts)
+    .where(eq(contacts.id, contactId))
+    .limit(1);
+  if (
+    !contact?.phone ||
+    normalizedPhone(contact.phone) !== normalizedPhone(phone) ||
+    contact.phoneStatus === "valid"
+  ) return;
+  await ctx.tx
+    .update(contacts)
+    .set({
+      phoneStatus: "valid",
+      phoneInvalidAt: null,
+      phoneInvalidReason: null,
+      phoneInvalidProviderCode: null,
+      updatedAt: new Date(),
+    })
+    .where(eq(contacts.id, contactId));
+}
+
+async function markPhoneInvalid(
+  ctx: ServiceContext,
+  input: { contactId: string; phone: string; code: string; reason?: string },
+): Promise<void> {
+  const [contact] = await ctx.tx
+    .select({ phone: contacts.phone })
+    .from(contacts)
+    .where(eq(contacts.id, input.contactId))
+    .limit(1);
+  // The contact may have corrected the number between send and receipt.
+  if (!contact?.phone || normalizedPhone(contact.phone) !== normalizedPhone(input.phone)) return;
+  await ctx.tx
+    .update(contacts)
+    .set({
+      phoneStatus: "invalid",
+      phoneInvalidAt: new Date(),
+      phoneInvalidReason: input.reason ?? "The carrier rejected this destination as invalid.",
+      phoneInvalidProviderCode: input.code,
+      updatedAt: new Date(),
+    })
+    .where(eq(contacts.id, input.contactId));
+}
+
+async function outboundMediaAssets(tx: Tx, mediaAssetIds: string[]) {
+  if (mediaAssetIds.length === 0) return [];
+  const rows = await tx
+    .select()
+    .from(assets)
+    .where(inArray(assets.id, mediaAssetIds));
+  const byId = new Map(rows.map((asset) => [asset.id, asset]));
+  const ordered = mediaAssetIds.map((assetId) => byId.get(assetId));
+  if (ordered.some((asset) => !asset)) {
+    throw new ServiceError("not_found", "One of those media assets is not here.");
+  }
+  for (const asset of ordered) {
+    if (asset!.status !== "ready") {
+      throw new ServiceError("validation", "Only ready, safety-checked media can be sent by MMS.");
+    }
+    if (asset!.kind === "doc") {
+      throw new ServiceError("validation", "MMS accepts images, audio, or video—not documents.");
+    }
+  }
+  return ordered.map((asset) => asset!);
+}
+
+function requirePerson(actor: Actor): void {
+  // System passes: a booking reminder and a carrier webhook both reach here
+  // without a person at the keyboard.
+  if (actor.kind !== "user" && actor.kind !== "system") {
+    throw new ServiceError("permission", "Sign in to manage text messaging.");
+  }
+}
+
+const numberRow = row({
+  id: uuid,
+  provider: z.string(),
+  providerRef: z.string(),
+  e164: z.string(),
+  label: z.string().nullable(),
+  country: z.string().nullable(),
+  kind: z.enum(NUMBER_KINDS),
+  capabilities: z.unknown(),
+  purpose: z.enum(NUMBER_PURPOSES),
+  isDefault: z.boolean(),
+  active: z.boolean(),
+  healthy: z.boolean(),
+  healthUnknown: z.boolean(),
+  healthProblem: z.string().nullable(),
+  providerStatus: z.string().nullable(),
+  healthCheckedAt: timestamp.nullable(),
+  registrations: z.unknown(),
+});
+
+/** The adapter an instance is actually configured for, or the refusing one. */
+export function smsAdapter(provider?: string): SmsAdapter {
+  if (provider) return smsAdapters.get(provider);
+  // The first that is genuinely usable. `none` is last and always present, so
+  // an unconfigured instance refuses clearly rather than throwing.
+  const configured = smsAdapters.available()[0];
+  return configured ?? smsAdapters.get("none");
+}
+
+export const listMessagingNumbers = defineService({
+  name: "messaging.numbers",
+  summary: "The numbers this business sends and receives on.",
+  kind: "query",
+  permission: "scoped",
+  input: z.object({}),
+  output: listed(numberRow),
+  handler: (_input, ctx) =>
+    ctx.tx
+      .select()
+      .from(messagingNumbers)
+      .orderBy(desc(messagingNumbers.isDefault), asc(messagingNumbers.e164)),
+});
+
+const importedNumber = z.object({
+  providerRef: z.string().min(1).max(300),
+  e164: z.string().min(1).max(40),
+  country: z.string().max(10).nullable(),
+  kind: z.enum(NUMBER_KINDS),
+  capabilities: z.object({
+    sms: z.boolean().optional(),
+    mms: z.boolean().optional(),
+    inbound: z.boolean().optional(),
+  }).passthrough(),
+});
+
+/** Records a provider's number listing that was read with no transaction open. */
+const importMessagingNumbersApply = defineService({
+  name: "messaging.importNumbersApply",
+  summary: "Record the numbers a provider listing returned.",
+  kind: "mutation",
+  permission: "scoped",
+  writeClass: "write",
+  external: false,
+  agentCallable: false,
+  input: z.object({
+    provider: z.string().trim().min(1).max(50),
+    numbers: z.array(importedNumber).max(1_000),
+  }),
+  output: row({ found: z.number().int(), added: z.number().int() }),
+  handler: async (input, ctx) => {
+    requirePerson(ctx.actor);
+    let added = 0;
+    for (const number of input.numbers) {
+      const [existing] = await ctx.tx
+        .select({ id: messagingNumbers.id })
+        .from(messagingNumbers)
+        .where(
+          and(
+            eq(messagingNumbers.provider, input.provider),
+            eq(messagingNumbers.providerRef, number.providerRef),
+          ),
+        )
+        .limit(1);
+      if (existing) {
+        // Capabilities can change under a number; the label, purpose and
+        // default are the owner's and are left alone.
+        await ctx.tx
+          .update(messagingNumbers)
+          .set({
+            e164: number.e164,
+            country: number.country,
+            kind: number.kind,
+            capabilities: number.capabilities,
+            updatedAt: sql`now()`,
+          })
+          .where(eq(messagingNumbers.id, existing.id));
+        continue;
+      }
+      await ctx.tx.insert(messagingNumbers).values({
+        provider: input.provider,
+        providerRef: number.providerRef,
+        e164: number.e164,
+        country: number.country,
+        kind: number.kind,
+        capabilities: number.capabilities,
+      });
+      added += 1;
+    }
+    ctx.queueEvent("messaging.numbersImported", {
+      provider: input.provider,
+      found: input.numbers.length,
+    });
+    return { found: input.numbers.length, added };
+  },
+});
+
+/**
+ * Read the numbers the provider actually holds.
+ *
+ * Listing, never buying. Buying a number spends the owner's money on a vendor's
+ * terms, in a country with its own rules about who may hold one — that belongs
+ * in the provider's own console, and a platform that hides it behind one button
+ * is a platform that bought somebody the wrong thing.
+ *
+ * The provider is asked with no database transaction open (§11): a slow carrier
+ * API must not hold a connection and row locks while it answers.
+ */
+export const importMessagingNumbers = defineOrchestratedService({
+  name: "messaging.importNumbers",
+  summary: "Read the numbers the provider holds and record what each can do.",
+  kind: "mutation",
+  permission: "scoped",
+  writeClass: "write",
+  input: z.object({ provider: z.string().trim().max(50).optional() }),
+  output: row({ found: z.number().int(), added: z.number().int() }),
+  handler: async (input, actor) => {
+    requirePerson(actor);
+    const adapter = smsAdapter(input.provider);
+    if (!adapter.available || !adapter.listNumbers) {
+      throw new ServiceError("validation", adapter.status.message);
+    }
+    const numbers = await adapter.listNumbers();
+    return importMessagingNumbersApply.call(
+      { provider: adapter.id, numbers: numbers.map((number) => ({ ...number })) },
+      actor,
+    );
+  },
+});
+
+export const updateMessagingNumber = defineService({
+  name: "messaging.updateNumber",
+  summary: "Say what a number is for, and whether it is the default.",
+  kind: "mutation",
+  permission: "scoped",
+  writeClass: "write",
+  input: z.object({
+    id,
+    label: z.string().trim().max(120).nullish(),
+    purpose: z.enum(NUMBER_PURPOSES).optional(),
+    isDefault: z.boolean().optional(),
+    active: z.boolean().optional(),
+  }),
+  output: numberRow,
+  handler: async (input, ctx) => {
+    requirePerson(ctx.actor);
+    const [existing] = await ctx.tx
+      .select()
+      .from(messagingNumbers)
+      .where(eq(messagingNumbers.id, input.id))
+      .limit(1);
+    if (!existing) throw new ServiceError("not_found", "That number is not here.");
+
+    const purpose = input.purpose ?? existing.purpose;
+    if (input.isDefault) {
+      // One default per purpose; the index says so, this keeps it true rather
+      // than letting the second one collide.
+      await ctx.tx
+        .update(messagingNumbers)
+        .set({ isDefault: false, updatedAt: sql`now()` })
+        .where(
+          and(eq(messagingNumbers.purpose, purpose), eq(messagingNumbers.isDefault, true)),
+        );
+    }
+    const [updated] = await ctx.tx
+      .update(messagingNumbers)
+      .set({
+        ...(input.label !== undefined ? { label: input.label ?? null } : {}),
+        ...(input.purpose !== undefined ? { purpose } : {}),
+        ...(input.isDefault !== undefined ? { isDefault: input.isDefault } : {}),
+        ...(input.active !== undefined ? { active: input.active } : {}),
+        updatedAt: sql`now()`,
+      })
+      .where(eq(messagingNumbers.id, input.id))
+      .returning();
+    ctx.setSubject("messagingNumber", updated!.id);
+    return updated!;
+  },
+});
+
+const numberHealth = z.object({
+  id,
+  usable: z.boolean(),
+  unknown: z.boolean(),
+  problem: z.string().max(2_000).nullable(),
+  providerStatus: z.string().max(300).nullable(),
+});
+
+/** Records provider health answers gathered with no transaction open. */
+const checkNumberHealthApply = defineService({
+  name: "messaging.checkNumbersApply",
+  summary: "Record what the provider said about each number's health.",
+  kind: "mutation",
+  permission: "scoped",
+  writeClass: "write",
+  external: false,
+  agentCallable: false,
+  input: z.object({ results: z.array(numberHealth).max(1_000) }),
+  output: row({ updated: z.number().int() }),
+  handler: async (input, ctx) => {
+    requirePerson(ctx.actor);
+    let updated = 0;
+    for (const health of input.results) {
+      const changed = await ctx.tx
+        .update(messagingNumbers)
+        .set({
+          healthy: health.usable,
+          healthUnknown: health.unknown,
+          healthProblem: health.problem,
+          providerStatus: health.providerStatus,
+          healthCheckedAt: new Date(),
+          updatedAt: sql`now()`,
+        })
+        .where(eq(messagingNumbers.id, health.id))
+        .returning({ id: messagingNumbers.id });
+      updated += changed.length;
+    }
+    return { updated };
+  },
+});
+
+/**
+ * Ask the provider whether each number can actually be used.
+ *
+ * §4.14: "an unregistered number silently filtered by carriers is the most
+ * common way an SMS launch fails". A check that could not be made is recorded
+ * as *unknown* rather than as healthy, because a green tick nobody verified is
+ * that failure wearing a disguise. Each provider question runs with no
+ * database transaction open; the answers are applied together afterwards.
+ */
+export const checkNumberHealth = defineOrchestratedService({
+  name: "messaging.checkNumbers",
+  summary: "Ask the provider whether each number can be used right now.",
+  kind: "mutation",
+  permission: "scoped",
+  writeClass: "write",
+  input: z.object({}),
+  output: row({ checked: z.number().int(), problems: z.number().int() }),
+  handler: async (_input, actor) => {
+    requirePerson(actor);
+    const rows = (await listMessagingNumbers.call({}, actor)) as Array<{
+      id: string;
+      provider: string;
+      providerRef: string;
+    }>;
+    const results: z.input<typeof numberHealth>[] = [];
+    for (const number of rows) {
+      const adapter = smsAdapter(number.provider);
+      if (!adapter.available || !adapter.checkNumber) continue;
+      const health = await adapter.checkNumber(number.providerRef);
+      results.push({
+        id: number.id,
+        usable: health.usable,
+        unknown: health.unknown,
+        problem: health.problem,
+        providerStatus: health.providerStatus,
+      });
+    }
+    if (results.length > 0) await checkNumberHealthApply.call({ results }, actor);
+    return {
+      checked: rows.length,
+      problems: results.filter((health) => !health.usable).length,
+    };
+  },
+});
+
+/**
+ * Which number this send goes out on.
+ *
+ * By purpose, then default, then anything usable. A number that failed its last
+ * health check is skipped: sending from a number carriers are filtering is how
+ * a business discovers the problem from a customer rather than from a screen.
+ */
+async function senderFor(
+  tx: Tx,
+  purpose: (typeof NUMBER_PURPOSES)[number],
+  needsMms: boolean,
+): Promise<{ e164: string; provider: string } | null> {
+  const rows = await tx
+    .select()
+    .from(messagingNumbers)
+    .where(and(eq(messagingNumbers.active, true), eq(messagingNumbers.healthy, true)))
+    .orderBy(desc(messagingNumbers.isDefault));
+  const usable = rows.filter((number) => {
+    const capabilities = number.capabilities;
+    if (needsMms && capabilities.mms === false) return false;
+    if (capabilities.sms === false) return false;
+    // §4.14, C7.11: an unregistered number does not bounce. The carrier accepts
+    // the message, bills for it, and drops it somewhere the sender cannot see —
+    // so the check has to happen here, before sending, rather than by reading a
+    // failure that never arrives.
+    return maySend({
+      country: number.country,
+      kind: number.kind,
+      registrations: number.registrations as RegistrationRecord[],
+    }).allowed;
+  });
+  const preferred =
+    usable.find((number) => number.purpose === purpose) ?? usable[0] ?? null;
+  return preferred ? { e164: preferred.e164, provider: preferred.provider } : null;
+}
+
+export const sendSms = defineService({
+  name: "messaging.sendSms",
+  summary: "Send a text message and record what it cost.",
+  kind: "mutation",
+  permission: "scoped",
+  writeClass: "message",
+  input: z.object({
+    contactId: id.optional(),
+    to: z.string().trim().min(4).max(40),
+    body: z.string().trim().min(1).max(4_000),
+    purpose: z.enum(NUMBER_PURPOSES).default("transactional"),
+    policyException: z
+      .object({
+        kind: z.enum(SMS_POLICY_EXCEPTION_KINDS),
+        referenceId: z.string().trim().min(1).max(300),
+      })
+      .optional(),
+    /** MMS may reference only assets that passed the core media pipeline. */
+    mediaAssetIds: z.array(id).max(10).default([]),
+    templateId: id.optional(),
+    conversationId: id.optional(),
+    /** Stable, so a retry does not send a second message. */
+    idempotencyKey: z.string().trim().min(1).max(200),
+  }),
+  output: row({
+    sent: z.boolean(),
+    providerRef: z.string().nullable(),
+    reason: z.string().nullable(),
+    messageId: uuid.nullable(),
+  }),
+  handler: async (input, ctx) => {
+    if (playgroundBlocksExternalDelivery(env())) {
+      // C1.38: the playground's container network has no route out, and this
+      // refusal is the in-app twin of that: reminder and compliance jobs run
+      // as system and reach here without a person at the keyboard.
+      throw new ServiceError(
+        "permission",
+        "Text message delivery is disabled in the public playground.",
+      );
+    }
+    requirePerson(ctx.actor);
+    const contactId =
+      input.contactId ??
+      (await resolveMessageContact(ctx, { phone: input.to, channel: "sms" }));
+    await smsContact(ctx, contactId, input.to);
+    await assertSmsPurposeAllowed(ctx, { ...input, contactId });
+    const policy = await ctx.call(evaluateSmsPolicy, {
+      contactId,
+      to: input.to,
+      purpose: input.purpose,
+      exception: input.policyException,
+    });
+    if (!policy.allowed) {
+      const reason =
+        policy.reason === "quiet_hours"
+          ? `It is ${policy.localTime} in ${policy.timezone}, inside recipient quiet hours.`
+          : policy.reason === "daily_cap"
+            ? "This recipient has reached the daily message cap."
+            : "This recipient has reached the weekly message cap.";
+      throw new ServiceError("validation", reason);
+    }
+    const adapter = smsAdapter();
+    if (!adapter.available) {
+      // Refused rather than queued: C7.09's rule, for the same reason. A
+      // message nobody can send is not a message waiting, it is a message that
+      // will never arrive.
+      throw new ServiceError("validation", adapter.status.message);
+    }
+    const media = await outboundMediaAssets(ctx.tx, input.mediaAssetIds);
+    const sender = await senderFor(ctx.tx, input.purpose, media.length > 0);
+    if (!sender) {
+      // Say *why*, not just "no". A blocked registration is a form somebody has
+      // to fill in, and an owner told only "no usable number" will check the
+      // credentials they already set up correctly.
+      throw new ServiceError("validation", await whyNothingCanSend(ctx.tx));
+    }
+
+    // A retry with the same key is the same message. The delivery job's id is
+    // the message id, so its idempotency claim leads straight back to it.
+    // Two concurrent sends with one key queue on this lock, so the second
+    // sees the first's claim instead of colliding with it.
+    await ctx.tx.execute(
+      sql`select pg_advisory_xact_lock(hashtextextended(${`sms-send:${input.idempotencyKey}`}, 0))`,
+    );
+    const [staged] = await ctx.tx
+      .select({ jobId: jobIdempotencyKeys.jobId })
+      .from(jobIdempotencyKeys)
+      .where(
+        and(
+          eq(jobIdempotencyKeys.jobName, SMS_DELIVERY_JOB),
+          eq(jobIdempotencyKeys.idempotencyKey, input.idempotencyKey),
+        ),
+      )
+      .limit(1);
+    if (staged) {
+      const [existing] = await ctx.tx
+        .select({ id: messages.id, providerRef: messages.providerRef })
+        .from(messages)
+        .where(eq(messages.id, staged.jobId))
+        .limit(1);
+      if (existing) {
+        return { sent: true, providerRef: existing.providerRef, reason: null, messageId: existing.id };
+      }
+    }
+
+    // Into the one conversation model, so a text sits in the same thread as the
+    // email and the form submission (C7.08). Recorded before the carrier is
+    // asked: provider I/O never runs inside this transaction (§11), so the
+    // message is staged here and `deliverQueuedSms` submits it after commit.
+    const recorded = (await recordOutbound(ctx, {
+      contactId,
+      to: input.to,
+      body: input.body,
+      conversationId: input.conversationId,
+      providerRef: null,
+      purpose: input.purpose,
+      policyException: input.policyException,
+      mediaAssetIds: input.mediaAssetIds,
+      templateId: input.templateId,
+      mms: media.length > 0,
+    })) as { message: { id: string } };
+
+    // Queued, not delivered: the carrier says what actually happened later.
+    await ctx.call(getService("conversations.recordDelivery"), {
+      messageId: recorded.message.id,
+      status: "queued",
+    });
+    await ctx.queueJob(
+      SMS_DELIVERY_JOB,
+      {
+        messageId: recorded.message.id,
+        provider: adapter.id,
+        from: sender.e164,
+        idempotencyKey: input.idempotencyKey,
+      },
+      { id: recorded.message.id, idempotencyKey: input.idempotencyKey },
+    );
+    return {
+      sent: true,
+      providerRef: null,
+      reason: null,
+      messageId: recorded.message.id,
+    };
+  },
+});
+
+function recordOutbound(
+  ctx: ServiceContext,
+  input: {
+    contactId?: string;
+    to: string;
+    body: string;
+    conversationId?: string;
+    providerRef: string | null;
+    segments?: number;
+    costMinor?: number;
+    costCurrency?: string;
+    purpose: (typeof NUMBER_PURPOSES)[number];
+    policyException?: {
+      kind: (typeof SMS_POLICY_EXCEPTION_KINDS)[number];
+      referenceId: string;
+    };
+    mediaAssetIds: string[];
+    templateId?: string;
+    mms: boolean;
+  },
+) {
+  return ctx.call(getService("conversations.record"), {
+    ...(input.contactId ? { contactId: input.contactId } : { phone: input.to }),
+    ...(input.conversationId ? { conversationId: input.conversationId } : {}),
+    direction: "outbound",
+    channel: input.mms ? "mms" : "sms",
+    purpose: input.purpose,
+    policyException: input.policyException?.kind,
+    policyExceptionRef: input.policyException?.referenceId,
+    body: input.body,
+    mediaAssetIds: input.mediaAssetIds,
+    templateId: input.templateId,
+    recipientAddress: input.to,
+    sentBy: ctx.actor.kind === "system" ? "system" : "user",
+    providerRef: input.providerRef ?? undefined,
+    segments: input.segments,
+    costMinor: input.costMinor,
+    costCurrency: input.costCurrency,
+  });
+}
+
+/** Retries for one staged text before it is recorded as failed. */
+export const SMS_DELIVERY_RETRIES = 8;
+
+const smsSendOutcome = z.discriminatedUnion("outcome", [
+  z.object({
+    outcome: z.literal("accepted"),
+    messageId: id,
+    providerRef: z.string().min(1).max(300),
+    segments: z.number().int().min(0).max(1_000).optional(),
+    costMinor: z.number().int().min(0).optional(),
+    costCurrency: z.string().trim().toUpperCase().length(3).optional(),
+  }),
+  z.object({
+    outcome: z.literal("failed"),
+    messageId: id,
+    errorCode: z.string().max(50).nullable(),
+    errorText: z.string().max(500),
+  }),
+]);
+
+/**
+ * Record what the carrier said when a staged text was submitted.
+ *
+ * Runs in its own short transaction after the provider call returned, so a
+ * slow or failing carrier never holds the business transaction that staged
+ * the message.
+ */
+const applySmsSendResult = defineService({
+  name: "messaging.applySmsSendResult",
+  summary: "Record the provider's answer for one staged text message.",
+  kind: "mutation",
+  permission: "system",
+  writeClass: "message",
+  agentCallable: false,
+  mcpExclude: true,
+  external: false,
+  input: smsSendOutcome,
+  output: row({ applied: z.boolean() }),
+  handler: async (input, ctx) => {
+    const [message] = await ctx.tx
+      .select()
+      .from(messages)
+      .where(eq(messages.id, input.messageId))
+      .for("update")
+      .limit(1);
+    if (!message || message.providerRef) return { applied: false };
+    ctx.setSubject("message", message.id);
+    if (input.outcome === "accepted") {
+      await ctx.tx
+        .update(messages)
+        .set({
+          providerRef: input.providerRef,
+          ...(input.segments !== undefined ? { segments: input.segments } : {}),
+          ...(input.costMinor !== undefined
+            ? { costMinor: input.costMinor, costCurrency: input.costCurrency }
+            : {}),
+          updatedAt: new Date(),
+        })
+        .where(eq(messages.id, message.id));
+      return { applied: true };
+    }
+    await ctx.call(getService("conversations.recordDelivery"), {
+      messageId: message.id,
+      status: "failed",
+      errorCode: input.errorCode,
+      errorText: input.errorText,
+    });
+    if (input.errorCode && HARD_INVALID_NUMBER_CODES.has(input.errorCode) && message.recipientAddress) {
+      await markPhoneInvalid(ctx, {
+        contactId: message.contactId,
+        phone: message.recipientAddress,
+        code: input.errorCode,
+        reason: input.errorText,
+      });
+    }
+    return { applied: true };
+  },
+});
+
+/**
+ * Submit one staged text to its carrier, after the transaction that staged it
+ * committed (§11). The provider idempotency token is the caller's key, so a
+ * retried job cannot send twice; a text that already has a provider reference
+ * or a recorded failure is left alone.
+ */
+type QueuedSms = { messageId: string; provider: string; from: string; idempotencyKey: string };
+
+/**
+ * Whether a staged text may still go, decided again at delivery time: a STOP,
+ * an invalid-number mark or a changed number that arrived while the message
+ * waited in the queue must stop it, exactly as it would have stopped a send.
+ */
+const checkSmsDelivery = defineService({
+  name: "messaging.checkSmsDelivery",
+  summary: "Re-check consent and number validity for a staged text before it is sent.",
+  kind: "query",
+  permission: "system",
+  agentCallable: false,
+  mcpExclude: true,
+  external: false,
+  input: z.object({ messageId: id }),
+  output: row({ allowed: z.boolean(), reason: z.string().nullable() }),
+  handler: async (input, ctx) => {
+    const [message] = await ctx.tx
+      .select()
+      .from(messages)
+      .where(eq(messages.id, input.messageId))
+      .limit(1);
+    if (!message?.recipientAddress) {
+      return { allowed: false, reason: "The message is no longer here to send." };
+    }
+    try {
+      await smsContact(ctx, message.contactId, message.recipientAddress);
+      if (message.purpose) {
+        await assertSmsPurposeAllowed(ctx, {
+          contactId: message.contactId,
+          to: message.recipientAddress,
+          purpose: message.purpose,
+        });
+      }
+    } catch (error) {
+      if (error instanceof ServiceError) return { allowed: false, reason: error.message };
+      throw error;
+    }
+    return { allowed: true, reason: null };
+  },
+});
+
+export async function deliverQueuedSms(
+  data: QueuedSms,
+  attempt = 1,
+): Promise<{ status: "submitted" | "failed" | "skipped" }> {
+  try {
+    return await attemptQueuedSms(data);
+  } catch (error) {
+    // Transient — a provider outage, a storage URL, a database read: the
+    // queue retries with the same provider idempotency token. The last
+    // attempt records a failure an owner can see instead of leaving the
+    // message queued forever.
+    if (attempt <= SMS_DELIVERY_RETRIES) throw error;
+    await applySmsSendResult.call(
+      {
+        outcome: "failed",
+        messageId: data.messageId,
+        errorCode: error instanceof AdapterError ? (error.providerCode ?? null) : null,
+        errorText: (error instanceof AdapterError || error instanceof ServiceError
+          ? error.message
+          : "The message could not be sent."
+        ).slice(0, 500),
+      },
+      { kind: "system" },
+    );
+    return { status: "failed" };
+  }
+}
+
+async function attemptQueuedSms(
+  data: QueuedSms,
+): Promise<{ status: "submitted" | "failed" | "skipped" }> {
+  const system: Actor = { kind: "system" };
+  const [message] = await db()
+    .select()
+    .from(messages)
+    .where(eq(messages.id, data.messageId))
+    .limit(1);
+  if (!message || message.providerRef || !message.recipientAddress) return { status: "skipped" };
+  const [failed] = await db()
+    .select({ id: messageDeliveries.id })
+    .from(messageDeliveries)
+    .where(and(eq(messageDeliveries.messageId, message.id), eq(messageDeliveries.status, "failed")))
+    .limit(1);
+  if (failed) return { status: "skipped" };
+
+  const fail = async (errorText: string, errorCode: string | null = null) => {
+    await applySmsSendResult.call(
+      { outcome: "failed", messageId: message.id, errorCode, errorText: errorText.slice(0, 500) },
+      system,
+    );
+    return { status: "failed" as const };
+  };
+  if (playgroundBlocksExternalDelivery(env())) {
+    return fail("Text message delivery is disabled in the public playground.");
+  }
+  const adapter = smsAdapter(data.provider);
+  if (!adapter.available) return fail(adapter.status.message);
+  const still = await checkSmsDelivery.call({ messageId: message.id }, system);
+  if (!still.allowed) return fail(still.reason ?? "This text may no longer be sent.");
+
+  let mediaUrls: string[] = [];
+  if (message.mediaAssetIds.length > 0) {
+    const rows = await db().select().from(assets).where(inArray(assets.id, message.mediaAssetIds));
+    const byId = new Map(rows.map((asset) => [asset.id, asset]));
+    const ordered = message.mediaAssetIds.map((assetId) => byId.get(assetId));
+    if (ordered.some((asset) => !asset || asset.status !== "ready")) {
+      return fail("A picture in this message is no longer available to send.");
+    }
+    mediaUrls = await Promise.all(
+      ordered.map((asset) =>
+        storage().url(asset!.storageKey, { contentType: asset!.mime, expiresIn: 3_600 }),
+      ),
+    );
+  }
+
+  let result;
+  try {
+    result = await adapter.send({
+      to: message.recipientAddress,
+      from: data.from,
+      title: "",
+      body: message.body,
+      mediaUrls,
+      deliveryId: data.idempotencyKey,
+    });
+  } catch (error) {
+    if (
+      error instanceof AdapterError &&
+      error.providerCode &&
+      HARD_INVALID_NUMBER_CODES.has(error.providerCode)
+    ) {
+      return fail(error.message, error.providerCode);
+    }
+    throw error;
+  }
+  if (!result.delivers || !result.providerRef) {
+    return fail(result.reason ?? "The provider would not take it.");
+  }
+  await applySmsSendResult.call(
+    {
+      outcome: "accepted",
+      messageId: message.id,
+      providerRef: result.providerRef,
+      segments: result.segments,
+      costMinor: result.costMinor,
+      costCurrency: result.costCurrency,
+    },
+    system,
+  );
+  return { status: "submitted" };
+}
+
+/**
+ * Everything a verified carrier callback means (C7.10).
+ *
+ * The HTTP boundary verifies the signature and hands over already-trusted
+ * events; this decides what each one *is*. An inbound message goes through
+ * `conversations.record` like every other channel, so it resolves to a contact
+ * and threads with their email — which is the whole point of C7.08 existing
+ * before this.
+ */
+const smsEventsInput = z.object({
+  events: z
+    .array(
+      z.object({
+        id: z.string().max(200),
+        kind: z.enum(["delivered", "failed", "received", "sent", "undelivered"]),
+        providerRef: z.string().max(300),
+        from: z.string().max(40).optional(),
+        to: z.string().max(40).optional(),
+        body: z.string().max(4_000).optional(),
+        media: z
+          .array(
+            z.object({
+              sourceUrl: z.string().url().max(2_000),
+              filename: z.string().min(1).max(255),
+              contentType: z.string().min(1).max(255),
+              bytes: z.instanceof(Uint8Array),
+            }),
+          )
+          .max(10)
+          .optional(),
+        errorCode: z.string().max(50).optional(),
+        errorText: z.string().max(500).optional(),
+        segments: z.number().int().min(0).max(1_000).optional(),
+        costMinor: z.number().int().min(0).optional(),
+        costCurrency: z.string().trim().toUpperCase().length(3).optional(),
+        occurredAt: z.string().max(60),
+      }),
+    )
+    .max(100),
+});
+
+const applySmsEventsApply = defineService({
+  name: "messaging.applySmsEventsApply",
+  summary: "Record carrier events after inbound media has been stored.",
+  kind: "mutation",
+  permission: "system",
+  writeClass: "message",
+  agentCallable: false,
+  mcpExclude: true,
+  input: smsEventsInput.extend({
+    uploaded: z.record(
+      z.string(),
+      z.object({
+        assetIds: z.array(z.string().uuid()),
+        failed: z.number().int().nonnegative(),
+      }),
+    ),
+  }),
+  output: row({ received: z.number().int(), reported: z.number().int() }),
+  handler: async (input, ctx) => {
+    requirePerson(ctx.actor);
+    let received = 0;
+    let reported = 0;
+
+    for (const event of input.events) {
+      if (event.kind === "received") {
+        if (!event.from) continue;
+        const compliance = await applyInboundSmsCompliance(ctx, {
+          providerRef: event.providerRef,
+          from: event.from,
+          body: event.body,
+          occurredAt: event.occurredAt,
+        });
+        if (compliance.handled) {
+          if (compliance.contactId) await markPhoneValid(ctx, compliance.contactId, event.from);
+          received += 1;
+          continue;
+        }
+
+        // Idempotency precedes media import: a carrier retry must not create a
+        // second Asset even though the message row itself is also unique.
+        const [seen] = await ctx.tx
+          .select({ contactId: messages.contactId })
+          .from(messages)
+          .where(eq(messages.providerRef, event.providerRef))
+          .limit(1);
+        if (seen) {
+          await markPhoneValid(ctx, seen.contactId, event.from);
+          received += 1;
+          continue;
+        }
+
+        const contactId = await resolveMessageContact(ctx, {
+          phone: event.from,
+          channel: (event.media?.length ?? 0) > 0 ? "mms" : "sms",
+        });
+        const imported = input.uploaded[event.providerRef] ?? {
+          assetIds: [] as string[],
+          failed: 0,
+        };
+        const mediaAssetIds = imported.assetIds;
+        const failedMedia = imported.failed;
+        const suppliedBody = event.body?.trim() ?? "";
+        const fallbackBody = failedMedia > 0
+          ? `(${failedMedia} attachment${failedMedia === 1 ? "" : "s"} could not be imported safely)`
+          : "(no text)";
+        const recorded = (await ctx.call(getService("conversations.record"), {
+          contactId,
+          direction: "inbound",
+          channel: (event.media?.length ?? 0) > 0 ? "mms" : "sms",
+          body: suppliedBody || fallbackBody,
+          mediaAssetIds,
+          sentBy: "contact",
+          // The carrier's id, so a redelivered webhook is a no-op (C7.08).
+          providerRef: event.providerRef,
+          occurredAt: new Date(event.occurredAt).toISOString(),
+        })) as {
+          conversation: { id: string };
+          message: { id: string; contactId: string };
+          duplicate: boolean;
+        };
+        await markPhoneValid(ctx, recorded.message.contactId, event.from);
+        if (!recorded.duplicate) {
+          await applyInboundKeywordRule(ctx, {
+            providerRef: event.providerRef,
+            body: suppliedBody,
+            from: event.from,
+            contactId: recorded.message.contactId,
+            conversationId: recorded.conversation.id,
+          });
+        }
+        received += 1;
+        continue;
+      }
+
+      // A status callback about something this instance sent. Found by the
+      // provider reference the send recorded; a callback about a message this
+      // instance has no record of is ignored rather than invented.
+      const [message] = await ctx.tx
+        .select({
+          id: messages.id,
+          contactId: messages.contactId,
+          recipientAddress: messages.recipientAddress,
+        })
+        .from(messages)
+        .where(eq(messages.providerRef, event.providerRef))
+        .limit(1);
+      if (!message) continue;
+
+      await ctx.call(getService("conversations.recordDelivery"), {
+        messageId: message.id,
+        status: event.kind,
+        errorCode: event.errorCode ?? null,
+        errorText: event.errorText ?? null,
+        occurredAt: new Date(event.occurredAt).toISOString(),
+      });
+      if (event.segments !== undefined || event.costMinor !== undefined) {
+        await ctx.tx
+          .update(messages)
+          .set({
+            ...(event.segments !== undefined ? { segments: event.segments } : {}),
+            ...(event.costMinor !== undefined
+              ? {
+                  costMinor: event.costMinor,
+                  costCurrency: event.costCurrency,
+                }
+              : {}),
+            updatedAt: new Date(),
+          })
+          .where(eq(messages.id, message.id));
+      }
+      if (
+        (event.kind === "failed" || event.kind === "undelivered") &&
+        event.errorCode &&
+        HARD_INVALID_NUMBER_CODES.has(event.errorCode) &&
+        message.recipientAddress
+      ) {
+        await markPhoneInvalid(ctx, {
+          contactId: message.contactId,
+          phone: message.recipientAddress,
+          code: event.errorCode,
+          reason: event.errorText,
+        });
+      }
+      reported += 1;
+    }
+
+    return { received, reported };
+  },
+});
+
+export const applySmsEvents = defineOrchestratedService({
+  name: "messaging.applySmsEvents",
+  summary: "Record what the carrier said, and thread anything it delivered.",
+  kind: "mutation",
+  permission: "system",
+  writeClass: "message",
+  agentCallable: false,
+  mcpExclude: true,
+  input: smsEventsInput,
+  output: row({ received: z.number().int(), reported: z.number().int() }),
+  handler: async (input, actor) => {
+    requirePerson(actor);
+    const uploaded: Record<string, { assetIds: string[]; failed: number }> = {};
+    for (const event of input.events) {
+      if (event.kind !== "received" || !event.media?.length) continue;
+      const assetIds: string[] = [];
+      let failed = 0;
+      for (const item of event.media) {
+        try {
+          const asset = await getService("media.upload").call(
+            {
+              filename: item.filename,
+              contentType: item.contentType,
+              bytes: item.bytes,
+              source: "import",
+              provenance: { sourceUrl: item.sourceUrl, note: "Inbound MMS attachment" },
+              metadata: {},
+            },
+            { kind: "system" },
+          );
+          assetIds.push((asset as { id: string }).id);
+        } catch (error) {
+          if (!(error instanceof ServiceError) || error.code !== "validation") throw error;
+          failed += 1;
+        }
+      }
+      uploaded[event.providerRef] = { assetIds, failed };
+    }
+    return applySmsEventsApply.call({ events: input.events, uploaded }, actor);
+  },
+});
+
+/**
+ * Why nothing can send, in words an owner can act on.
+ *
+ * The commonest reasons are different problems with different fixes — no
+ * numbers at all, none healthy, or one blocked on a registration form — and a
+ * single message covering all three sends people to check the thing that is
+ * already right.
+ */
+export async function whyNothingCanSend(tx: Tx): Promise<string> {
+  const rows = await tx.select().from(messagingNumbers);
+  if (rows.length === 0) {
+    return "No numbers are set up yet. Read your numbers in from your provider first.";
+  }
+  const active = rows.filter((number) => number.active);
+  if (active.length === 0) {
+    return "Every number is switched off. Turn one back on to send from it.";
+  }
+  const unhealthy = active.filter((number) => !number.healthy);
+  if (unhealthy.length === active.length) {
+    return (
+      unhealthy[0]?.healthProblem ??
+      "No number passed its last health check. Check them again, and fix what the provider reports."
+    );
+  }
+  const blocked = active
+    .filter((number) => number.healthy)
+    .map((number) =>
+      maySend({
+        country: number.country,
+        kind: number.kind,
+        registrations: number.registrations as RegistrationRecord[],
+      }),
+    )
+    .filter((verdict) => !verdict.allowed);
+  if (blocked.length > 0 && blocked[0]?.problem) return blocked[0].problem;
+  return "No usable number is set up to send from. Read your numbers in and check their health.";
+}
+
+/**
+ * What each number still has to be registered for (§4.14, C7.11).
+ *
+ * The requirement is derived here rather than read from the row, so an owner
+ * cannot clear it and a rule change reaches every existing number at once.
+ */
+export const numberRegistrations = defineService({
+  name: "messaging.registrations",
+  summary: "What each number must be registered for, and how far along it is.",
+  kind: "query",
+  permission: "scoped",
+  input: z.object({}),
+  output: listed(
+    row({
+      id: uuid,
+      e164: z.string(),
+      country: z.string().nullable(),
+      kind: z.enum(NUMBER_KINDS),
+      state: z.enum(REGISTRATION_STATES),
+      canSend: z.boolean(),
+      problem: z.string().nullable(),
+      required: listed(
+        row({
+          kind: z.enum(REGISTRATION_KINDS),
+          guidance: z.string(),
+          state: z.enum(REGISTRATION_STATES),
+          brand: z.string().nullable(),
+          campaign: z.string().nullable(),
+          providerRef: z.string().nullable(),
+          reason: z.string().nullable(),
+        }),
+      ),
+    }),
+  ),
+  handler: async (_input, ctx) => {
+    const rows = await ctx.tx
+      .select()
+      .from(messagingNumbers)
+      .orderBy(asc(messagingNumbers.e164));
+    return rows.map((number) => {
+      const stored = number.registrations as RegistrationRecord[];
+      const shape = { country: number.country, kind: number.kind, registrations: stored };
+      const verdict = maySend(shape);
+      return {
+        id: number.id,
+        e164: number.e164,
+        country: number.country,
+        kind: number.kind,
+        state: overallState(shape),
+        canSend: verdict.allowed,
+        problem: verdict.problem,
+        required: requirementsFor(shape).map((requirement) => {
+          const record = stored.find((one) => one.kind === requirement.kind);
+          return {
+            kind: requirement.kind,
+            guidance: requirement.guidance,
+            state: record?.state ?? "not_started",
+            brand: record?.brand ?? null,
+            campaign: record?.campaign ?? null,
+            providerRef: record?.providerRef ?? null,
+            reason: record?.reason ?? null,
+          };
+        }),
+      };
+    });
+  },
+});
+
+/**
+ * Record where a registration has got to.
+ *
+ * Owner-entered, because the platform cannot submit a 10DLC brand on somebody's
+ * behalf — that is an identity claim with legal weight, made in the provider's
+ * own console. What the platform *can* do is remember what was said and refuse
+ * to send until it says approved, which is the whole of §4.14's rule.
+ *
+ * Recording a registration that is not required is refused: it would put a form
+ * in front of an owner that nobody asked them to fill in.
+ */
+export const setRegistration = defineService({
+  name: "messaging.setRegistration",
+  summary: "Record how far a number's registration has got.",
+  kind: "mutation",
+  permission: "scoped",
+  writeClass: "write",
+  input: z.object({
+    id,
+    kind: z.enum(REGISTRATION_KINDS),
+    state: z.enum(REGISTRATION_STATES),
+    brand: z.string().trim().max(200).nullish(),
+    campaign: z.string().trim().max(200).nullish(),
+    providerRef: z.string().trim().max(200).nullish(),
+    reason: z.string().trim().max(1_000).nullish(),
+  }),
+  output: numberRow,
+  handler: async (input, ctx) => {
+    requirePerson(ctx.actor);
+    const [number] = await ctx.tx
+      .select()
+      .from(messagingNumbers)
+      .where(eq(messagingNumbers.id, input.id))
+      .limit(1);
+    if (!number) throw new ServiceError("not_found", "That number is not here.");
+
+    const required = requirementsFor({ country: number.country, kind: number.kind });
+    if (!required.some((requirement) => requirement.kind === input.kind)) {
+      throw new ServiceError(
+        "validation",
+        "That registration is not needed for this number, so there is nothing to record.",
+      );
+    }
+
+    const now = new Date().toISOString();
+    const stored = (number.registrations as RegistrationRecord[]).filter(
+      (one) => one.kind !== input.kind,
+    );
+    const previous = (number.registrations as RegistrationRecord[]).find(
+      (one) => one.kind === input.kind,
+    );
+    stored.push({
+      kind: input.kind,
+      state: input.state,
+      brand: input.brand ?? previous?.brand ?? null,
+      campaign: input.campaign ?? previous?.campaign ?? null,
+      providerRef: input.providerRef ?? previous?.providerRef ?? null,
+      // The moment it was first submitted survives later updates: "how long has
+      // this been in review" is the question an owner actually asks.
+      submittedAt:
+        input.state === "submitted" && !previous?.submittedAt
+          ? now
+          : (previous?.submittedAt ?? null),
+      decidedAt:
+        input.state === "approved" || input.state === "rejected"
+          ? now
+          : (previous?.decidedAt ?? null),
+      // A rejection with no reason is unactionable, so a reason given once is
+      // kept until the state changes away from rejected.
+      reason: input.state === "rejected" ? (input.reason ?? previous?.reason ?? null) : null,
+    });
+
+    const [updated] = await ctx.tx
+      .update(messagingNumbers)
+      .set({ registrations: stored, updatedAt: sql`now()` })
+      .where(eq(messagingNumbers.id, input.id))
+      .returning();
+    ctx.setSubject("messagingNumber", updated!.id);
+    ctx.queueEvent("messaging.registrationChanged", {
+      id: updated!.id,
+      kind: input.kind,
+      state: input.state,
+    });
+    return updated!;
+  },
+});
+
+export default [
+  ...consentServices,
+  ...policyServices,
+  ...keywordServices,
+  listMessagingNumbers,
+  importMessagingNumbers,
+  updateMessagingNumber,
+  checkNumberHealth,
+  numberRegistrations,
+  setRegistration,
+  sendSms,
+  applySmsSendResult,
+  checkSmsDelivery,
+  importMessagingNumbersApply,
+  checkNumberHealthApply,
+  applySmsEvents,
+  applySmsEventsApply,
+];

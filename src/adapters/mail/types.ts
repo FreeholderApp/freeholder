@@ -1,0 +1,142 @@
+// Copyright (C) 2026 Tony Aly
+// SPDX-License-Identifier: Apache-2.0
+// The mail adapter contract (MASTER.md §12).
+//
+// §12 splits mail in two and the split is load-bearing. **Transactional** mail
+// — a receipt, a booking confirmation, a password reset — goes through the
+// owner's own address, because deliverability follows reputation and replies
+// should land in the inbox they already read. **Bulk** mail — a campaign to
+// four hundred people — must not: a personal mailbox that starts sending
+// broadcasts loses its reputation and takes every receipt down with it.
+//
+// So `kind` is on the adapter, and the modules that send check it. An owner
+// cannot accidentally broadcast through their own Gmail, because the
+// email-marketing module refuses an adapter that is not `bulk` or `both`.
+
+/** Internal worker hook: one persisted intent/outcome for each carrier HTTP call. */
+export interface MailCarrierJournal {
+  request<T>(operation: { kind: "send" | "consent"; key: string; body: unknown; evidenceRef?: string; grant?: { email: string; evidenceRef: string } }, resource: { baseUrl: string; apiKey: string | undefined }, execute: () => Promise<T>): Promise<T>;
+}
+
+export interface OutboundEmail {
+  to: string;
+  subject: string;
+  /** Always present. HTML is an enhancement, never the only copy. */
+  text: string;
+  html?: string;
+  replyTo?: string;
+  /** Overrides the configured sender. Rare, and audited when it happens. */
+  from?: string;
+  /** Stable internal correlation/idempotency value, never shown as content. */
+  deliveryId?: string;
+  /** Assigned by the worker's durable physical-call claim, never by a caller. */
+  dispatchId?: string;
+  /** Worker-only journal; never accepted in staged message input. */
+  carrierJournal?: MailCarrierJournal;
+  /** Narrow allowlist, validated before the encrypted outbox is written. */
+  headers?: {
+    "List-Unsubscribe"?: string;
+    "List-Unsubscribe-Post"?: "List-Unsubscribe=One-Click";
+  };
+  /**
+   * Why this message may be sent (C3.31). Set by the delivery worker, never
+   * by a module, and only for an adapter that `requiresPermission`:
+   * transactional mail names its reason and the event behind it; campaign
+   * mail carries the recipient's recorded opt-in, or `null` when there is
+   * none a provider could accept.
+   */
+  permission?: MailPermission;
+}
+
+/** The transactional reasons a permission-checking provider understands. */
+export const TRANSACTIONAL_REASONS = [
+  "authentication",
+  "receipt",
+  "account_notice",
+  "requested_reply",
+  "service_notification",
+] as const;
+export type TransactionalReason = (typeof TRANSACTIONAL_REASONS)[number];
+
+/** A marketing opt-in as retained evidence, never a bare assertion. */
+export interface MarketingConsentEvidence {
+  collectedAt: string;
+  method: "unchecked_checkbox" | "double_opt_in" | "signed_form";
+  statement: string;
+  source: string;
+  /** Points at the Freeholder consent record that holds the proof. */
+  evidenceRef: string;
+  recipientIp?: string;
+}
+
+export type MailPermission =
+  | { purpose: "transactional"; reason: TransactionalReason; eventRef: string }
+  | { purpose: "marketing"; evidence: MarketingConsentEvidence | null };
+
+export type MailProvider =
+  | "smtp"
+  | "console"
+  | "gmail"
+  | "outlook"
+  | "resend"
+  | "postmark"
+  | "ses"
+  | "paradise"
+  | "none";
+
+export interface SenderVerification {
+  status: "pending" | "verified" | "failed";
+  detail: Record<string, unknown>;
+  message?: string;
+}
+
+export interface MailAdapter {
+  readonly id: MailProvider;
+  readonly kind: "transactional" | "bulk" | "both";
+  /**
+   * Whether this adapter can actually deliver to a stranger.
+   *
+   * `console` cannot, and the difference matters: a password reset that
+   * "succeeds" into a log file is worse than one that refuses, because the
+   * person waiting for the email has no way to tell.
+   */
+  readonly delivers: boolean;
+  send(message: OutboundEmail): Promise<{
+    providerRef: string;
+    /** Positive final SMTP reply for this exact recipient; private receipt input. */
+    acceptance?: { protocol: "smtp"; recipient: string; response: string };
+    /**
+     * A permission-checking carrier reports the grant it recorded while
+     * sending (C3.31), so the worker can remember it and a later withdrawal
+     * is mirrored to exactly that address.
+     */
+    grantRecorded?: { email: string; evidenceRef: string };
+  }>;
+  /**
+   * The provider checks a declared permission basis on every message
+   * (C3.31), so the delivery worker attaches `OutboundEmail.permission`.
+   */
+  readonly requiresPermission?: boolean;
+  /**
+   * The provider keeps its own marketing-consent ledger; tell it about a
+   * withdrawal. Called from an outbox listener, never inside a transaction.
+   */
+  recordWithdrawal?(email: string): Promise<void>;
+  /** Provider-backed proof that this From identity is permitted to send. */
+  verifySender?(sender: {
+    email: string;
+    providerIdentity?: string;
+  }): Promise<SenderVerification>;
+}
+
+export class MailAdapterError extends Error {
+  constructor(
+    message: string,
+    readonly retryable = false,
+    readonly httpStatus?: number,
+    readonly providerCode?: string,
+  ) {
+    super(message);
+    this.name = "MailAdapterError";
+  }
+}

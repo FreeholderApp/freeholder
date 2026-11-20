@@ -1,0 +1,63 @@
+# First stable release acceptance (C11.16/C11.17)
+
+This is the release evidence procedure for MASTER.md §43, not a second backlog.
+Stable remains unpublished and the independent review remains unchecked.
+
+The build and publishers read `src/core/update/release-declaration.json`.
+Set its exact version, channel, minimum upgrade version, schema risk, CVSS/severity,
+manual steps and plugin API in the same reviewed change as all package versions.
+The same change sets every first-party plugin's `freeholder` range
+(`plugins/*/plugin.json` and `manifest.ts`, and `src/modules/proof/manifest.ts`)
+to the new major and minor, for example `^0.3.0` for 0.3.x. Package release and
+publication refuse a version whose first-party ranges were not bumped
+(`readAlignedVersion` in `scripts/release-packages.mjs`).
+Breaking releases must declare tested recovery instructions. A candidate such as
+`1.0.0-rc.1` uses channel `edge`, npm tag `next`, a prerelease GitHub release,
+and its full image version tag. It never takes stable/latest. The final version
+requires every live MASTER checkbox completed and the owner's completion signature.
+
+Before tagging, complete the protected main CI run for the exact commit.
+Publication verifies that identity and promotes its already tested image digest.
+The signed feed carries the same declaration; it never supplies compatible schema
+risk or empty recovery steps on the build's behalf.
+
+Run package verification from a clean checkout (`pnpm packages:verify`). It builds,
+packs, installs and executes the packages outside the workspace. Registry publication
+still requires ownership and write access to create-freeholder, freeholder-app and
+@freeholder/{sdk,plugin-kit,templates,cli}. Configure the package workflow's NPM_TOKEN
+privately for initial bootstrap or establish npm trusted publishing. The workflow
+uses npm 12.2.0; `NPM_PUBLISH_MODE=stage` stages provenance-bearing packages for
+owner promotion (useful before packages exist), and its default `publish` mode
+publishes directly. With trusted publishers configured for
+`CampDenman/freeholder` and `publish-packages.yml`, no npm token is required.
+The initial account must satisfy npm publishing/2FA requirements; login alone
+does not prove publish permission. Neither account access nor successful
+public installation is proven by a local packed-artifact test.
+
+npm gives every package a `latest` tag, and the first staged upload of each
+package took it: `latest` is `0.0.0-stage`, a placeholder with no code. A
+prerelease never takes `latest`, and npm cannot remove that tag, so until the
+first stable release the owner deprecates each placeholder, so that an install
+without `@next` warns and names the right tag:
+`npm deprecate <package>@0.0.0-stage "Placeholder. Install <package>@next."`
+(and `create-freeholder@0.0.0-bootstrap.0` likewise). Documentation always
+names `@next`. After a prerelease publishes, confirm the result with
+`npm view <package> dist-tags`, and run
+`npx @freeholder/cli@next launch --provider digitalocean --domain example.com --dry-run`
+to confirm the public CLI answers with a plan.
+
+Run the full C11.17 suite against the candidate and archive exact commit, image digest,
+commands, pass/skip counts and configuration limitations. Exercise fresh bootstrap,
+owner second-factor setup, page editing/publishing and customer journeys. Rehearse
+upgrade and rollback with a recoverable database backup and actual object bytes;
+retain checksums and verify restored content through the app before cutting over.
+Existing media-row-only restore evidence does not prove object-byte recovery.
+
+Provider acceptance follows deploy/commerce-payments.md, using actual enabled provider
+configuration on an isolated instance. A manual receipt or mocked HTTP response
+is not provider settlement. This environment's public production instance has no
+configured provider credential environment variables; do not charge from it by guesswork.
+
+The independent reviewer uses security/independent-review-packet.md. Automated
+CodeQL and dependency checks are inputs to that review, not its signature.
+Only the product owner signs the final C11.17 record after evidence is complete.

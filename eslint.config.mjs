@@ -1,0 +1,291 @@
+// Copyright (C) 2026 Tony Aly
+// SPDX-License-Identifier: Apache-2.0
+// Lint IS the architecture police (MASTER.md §2 principle 11, §15, §16):
+// every boundary rule agreed in the master doc that can be machine-checked
+// lives here, not in tribal knowledge.
+import tseslint from "typescript-eslint";
+
+// The gates are named arrays rather than written inline because ESLint's flat
+// config *replaces* a rule's options when a later block sets the same rule for
+// overlapping files — it does not merge them. Writing the i18n gate inline for
+// `src/ui/**` silently switched the money gate off there, which is the kind of
+// hole a gate is supposed to close rather than open. Composing the arrays
+// makes the overlap explicit and impossible to get wrong by accident.
+
+// Money gate (MASTER.md §15.4). Money is integer minor units; the only way it
+// becomes a float is division, rounding helpers, or float parsing. Adding and
+// subtracting minor units is correct and stays legal — this bans the
+// operations that lose a cent, not arithmetic.
+const MONEY_GATE = [
+  {
+    // `Minor` is this codebase's own universal suffix (amountMinor,
+    // totalMinor, shippingMinor…) — a division rule that misses it is inert
+    // against the very code it exists to guard.
+    selector:
+      'BinaryExpression[operator="/"] > Identifier[name=/([Cc]ents|[Mm]inorUnits|[Mm]inor|[Aa]mount)$/]',
+    message:
+      "Money is integer minor units (MASTER.md §15.4): dividing it produces a float. formatMoney() renders it without ever dividing.",
+  },
+  {
+    selector: 'CallExpression[callee.property.name="toFixed"]',
+    message:
+      "toFixed() rounds in floating point (MASTER.md §15.4). Format money with formatMoney().",
+  },
+  {
+    selector: 'CallExpression[callee.name="parseFloat"]',
+    message:
+      "parseFloat() introduces float error (MASTER.md §15.4). Money is parsed and stored as integer minor units.",
+  },
+  {
+    selector:
+      'CallExpression[callee.object.name="Number"][callee.property.name="parseFloat"]',
+    message:
+      "Number.parseFloat() introduces float error (MASTER.md §15.4). Money is parsed and stored as integer minor units.",
+  },
+];
+
+// The i18n gate (MASTER.md §15.3): user-facing text must pass through the
+// string layer. §2 principle 9 calls retrofitting i18n "the single most
+// expensive refactor a platform can face" — this is what keeps the retrofit
+// from being needed a second time.
+//
+// It catches the two shapes copy takes in JSX: a bare literal between tags,
+// and a literal handed to an attribute that is rendered or announced.
+//
+// Client components cannot call `t` — the catalogs are server-side and the
+// locale is resolved per request — so they take their strings as props. That
+// is what makes a rule this blunt workable.
+// Colour gate (CLAUDE.md non-negotiable: every colour comes from a semantic
+// token in src/core/design/tokens.ts). The tokens test proves the *palette*
+// clears WCAG AA in both schemes; this is what makes components actually use
+// it. It catches the two shapes a bypass takes: Tailwind's raw palette
+// (`text-white` on an inverting ground was a live AA failure) and arbitrary
+// values smuggling a literal (`bg-[#fff]`, `shadow-[…rgb(0_0_0/0.16)]`).
+const COLOR_GATE = [
+  {
+    selector:
+      "Literal[value=/(^|[\\s'\"])(bg|text|border|ring|outline|fill|stroke|from|via|to|divide|decoration|caret|accent)-(white|black|slate|gray|zinc|neutral|stone|red|orange|amber|yellow|lime|green|emerald|teal|cyan|sky|blue|indigo|violet|purple|fuchsia|pink|rose)([-0-9\\/]|$|[\\s'\"])/]",
+    message:
+      "Tailwind's raw palette bypasses the design tokens (CLAUDE.md). Use a semantic utility (bg-surface, text-ink, bg-danger, text-on-danger…) or add a token to src/core/design/tokens.ts.",
+  },
+  {
+    selector:
+      "Literal[value=/-\\[[^\\]]*(#[0-9a-fA-F]{3}|rgba?\\(|hsla?\\(|oklch\\()/]",
+    message:
+      "Arbitrary colour values bypass the design tokens (CLAUDE.md). Define the value once in src/core/design/tokens.ts and use its utility.",
+  },
+  {
+    selector:
+      'JSXAttribute[name.name="style"] Literal[value=/(#[0-9a-fA-F]{3,8}\\b|rgba?\\(|hsla?\\(|oklch\\()/]',
+    message:
+      "Inline style colour literals bypass the design tokens (CLAUDE.md). Use a semantic token from src/core/design/tokens.ts.",
+  },
+  {
+    // SVG paints a colour through attributes, not classes or style, so an
+    // inline icon with `fill="#16181d"` slipped past both rules above and
+    // renders dark-on-dark in the dark scheme. `currentColor` with a token
+    // utility on the element keeps it on the palette.
+    selector:
+      'JSXAttribute[name.name=/^(fill|stroke|stopColor|floodColor|lightingColor|color)$/] Literal[value=/(#[0-9a-fA-F]{3,8}\\b|rgba?\\(|hsla?\\(|oklch\\()/]',
+    message:
+      "SVG fill/stroke colour literals bypass the design tokens (CLAUDE.md). Use currentColor with a semantic text-* utility, or a token from src/core/design/tokens.ts.",
+  },
+  {
+    // The same attributes written into SVG markup assembled as a string.
+    selector:
+      'Literal[value=/(fill|stroke|stop-color|flood-color)\\s*[=:]\\s*[\'"]?\\s*(#[0-9a-fA-F]{3,8}\\b|rgba?\\(|hsla?\\(|oklch\\()/]',
+    message:
+      "SVG fill/stroke colour literals bypass the design tokens (CLAUDE.md). Use currentColor or a token from src/core/design/tokens.ts.",
+  },
+  {
+    selector:
+      'TemplateElement[value.raw=/(fill|stroke|stop-color|flood-color)\\s*[=:]\\s*[\'"]?\\s*(#[0-9a-fA-F]{3,8}\\b|rgba?\\(|hsla?\\(|oklch\\()/]',
+    message:
+      "SVG fill/stroke colour literals bypass the design tokens (CLAUDE.md). Use currentColor or a token from src/core/design/tokens.ts.",
+  },
+];
+
+const CONTACT_CREATE_IMPORT = {
+  name: "@/core/contacts/service",
+  importNames: ["createContact"],
+  message:
+    "Automated paths call contacts.resolve, never contacts.create (CLAUDE.md). Human entry lives in app/(admin) only.",
+};
+
+const CONTACT_CREATE_CALL = {
+  selector:
+    "CallExpression[callee.property.name='callAsSystem'][arguments.0.name='createContact']",
+  message:
+    "ctx.callAsSystem(createContact) is forbidden outside app/(admin). Use contacts.resolve.",
+};
+
+// The registry lookup is the other way to reach contacts.create without
+// importing it by name.
+const CONTACT_CREATE_LOOKUP = {
+  selector: "CallExpression[callee.name='getService'][arguments.0.value='contacts.create']",
+  message:
+    "contacts.create is deliberate human entry (CLAUDE.md). Automated and public paths call contacts.resolve.",
+};
+
+// Route handlers never reach the database directly (MASTER.md §15.5).
+const APP_DATABASE_IMPORTS = {
+  group: [
+    "@/core/db",
+    "@/core/db/*",
+    "@/core/*/schema",
+    "@/modules/*/schema",
+    "drizzle-orm",
+    "drizzle-orm/*",
+    "postgres",
+  ],
+  message:
+    "Route handlers never reach the database directly (MASTER.md §15.5) — call the service layer.",
+};
+
+const I18N_GATE = [
+  {
+    // Two or more letters in a row: skips punctuation, arrows, dashes and the
+    // whitespace JSX is full of, catches every real sentence.
+    selector: "JSXText[value=/[A-Za-z]{2,}/]",
+    message:
+      'User-facing text must come from the string layer (MASTER.md §15.3). Use {t("some.key")} in a server component, or take the string as a prop in a client component.',
+  },
+  {
+    selector:
+      'JSXAttribute[name.name=/^(label|placeholder|title|alt|hint|summary|legend|aria-label|aria-description|aria-placeholder|aria-roledescription|aria-valuetext)$/] > Literal[value=/[A-Za-z]{2,}/]',
+    message:
+      "This attribute is read by a person or a screen reader, so it must come from the string layer (MASTER.md §15.3) rather than a literal.",
+  },
+];
+
+export default tseslint.config(
+  {
+    // `apps/**` is the Expo customer app (C10.23). It sits outside the root
+    // pnpm workspace with its own tsconfig, dependencies and CI job, so
+    // type-aware linting here would resolve its imports against the wrong
+    // project and report every one of them as missing.
+    // Byte-pinned generated transport/OpenMLS builds and MIT/BSD codecs; source policy
+    // belongs to their owning project. Consumer manifest digests are tested.
+    ignores: [".next/**", ".work/**", "node_modules/**", "packages/**", "db/**", "apps/**", "public/managed-assistant/0.1.10/**", "public/_freeholder/openmls/0.1.0/freeholder_openmls.js", "public/_freeholder/openmls/0.1.0/freeholder_openmls.d.ts"],
+  },
+  // Type-aware from here down. Several gates in §15 are statements about
+  // values, not syntax, and cannot be written without the type checker.
+  ...tseslint.configs.recommendedTypeChecked,
+  {
+    languageOptions: {
+      parserOptions: {
+        projectService: true,
+        tsconfigRootDir: import.meta.dirname,
+      },
+    },
+  },
+  {
+    // Config and script files live outside the TypeScript program.
+    files: ["**/*.mjs", "**/*.js"],
+    extends: [tseslint.configs.disableTypeChecked],
+  },
+  {
+    // Plugins carry money and render UI like everything else; leaving them
+    // outside the gates made them the one place a cent could quietly become
+    // a float. (packages/** stays out of the program entirely — it has its
+    // own builds — and is the documented residual hole.)
+    files: ["plugins/**/*.ts", "plugins/**/*.tsx"],
+    rules: {
+      "no-restricted-syntax": ["error", ...MONEY_GATE, ...COLOR_GATE, CONTACT_CREATE_CALL],
+      "no-restricted-imports": [
+        "error",
+        { paths: [CONTACT_CREATE_IMPORT] },
+      ],
+    },
+  },
+  {
+    files: ["src/**/*.ts", "src/**/*.tsx"],
+    rules: {
+      // Framework-free below app/: src/ is the application, app/ is the
+      // routing skin. A future framework migration must be a chore, not a
+      // rewrite.
+      "no-restricted-imports": [
+        "error",
+        {
+          paths: [CONTACT_CREATE_IMPORT],
+          patterns: [
+            {
+              group: ["next", "next/*"],
+              message:
+                "src/ is framework-agnostic (MASTER.md §10): Next.js imports belong in app/ only.",
+            },
+          ],
+        },
+      ],
+      "no-restricted-syntax": ["error", ...MONEY_GATE, ...COLOR_GATE, CONTACT_CREATE_CALL],
+    },
+  },
+  {
+    files: ["app/**/*.ts", "app/**/*.tsx"],
+    rules: {
+      // The server actions in app/**/*.ts are exactly the files that parse
+      // money out of FormData — the money gate must reach them, not just the
+      // rendered .tsx surfaces.
+      "no-restricted-syntax": [
+        "error",
+        ...MONEY_GATE,
+        ...COLOR_GATE,
+        CONTACT_CREATE_CALL,
+        CONTACT_CREATE_LOOKUP,
+      ],
+      // Service-layer gate (MASTER.md §15.5): routes call services, never the
+      // database. Blocking only the schema modules left the front door open —
+      // a handler could take the Drizzle client itself and issue raw SQL,
+      // skipping permissions, validation, the audit trail and the timeline.
+      // Public surfaces (forms, checkout, portal, API routes) are automated
+      // paths, so they may not import contacts.create either.
+      "no-restricted-imports": [
+        "error",
+        { paths: [CONTACT_CREATE_IMPORT], patterns: [APP_DATABASE_IMPORTS] },
+      ],
+    },
+  },
+  {
+    // The owner's "add a contact" form is the one deliberate human entry
+    // point (CLAUDE.md). Only the contact rules are lifted here.
+    files: ["app/(admin)/actions.ts"],
+    rules: {
+      "no-restricted-imports": ["error", { patterns: [APP_DATABASE_IMPORTS] }],
+      "no-restricted-syntax": ["error", ...MONEY_GATE, ...COLOR_GATE],
+    },
+  },
+  {
+    // The rendered surfaces carry every gate. These globs overlap the src/
+    // and app/ blocks above, so the money and colour gates are restated here
+    // rather than lost — flat config replaces, it does not merge.
+    // `src/modules/**/*.tsx` is the block-rendering surface (cms render,
+    // forms, events, newsletters, proof): it ships user-facing markup like
+    // app/ does, so it carries the i18n gate like app/ does.
+    files: ["app/**/*.tsx", "src/ui/**/*.tsx", "src/modules/**/*.tsx"],
+    rules: {
+      "no-restricted-syntax": [
+        "error",
+        ...MONEY_GATE,
+        ...COLOR_GATE,
+        ...I18N_GATE,
+        CONTACT_CREATE_CALL,
+        CONTACT_CREATE_LOOKUP,
+      ],
+    },
+  },
+  {
+    files: ["**/*.ts", "**/*.tsx"],
+    rules: {
+      // Core's contracts require async functions by signature — a service
+      // handler and a manifest's lazy loaders must return promises whether or
+      // not their body happens to await. The rule would push those toward
+      // hand-rolled Promise.resolve wrappers, which is worse code for no gain.
+      "@typescript-eslint/require-await": "off",
+      "@typescript-eslint/consistent-type-imports": "error",
+      "@typescript-eslint/no-unused-vars": [
+        "error",
+        { argsIgnorePattern: "^_", varsIgnorePattern: "^_" },
+      ],
+    },
+  },
+);

@@ -1,0 +1,436 @@
+// Copyright (C) 2026 Tony Aly
+// SPDX-License-Identifier: Apache-2.0
+// Request preprocessing, at the edge (Next's `proxy` convention — the current
+// name for what used to be `middleware`).
+//
+// It forwards request context for server components, applies locale rewrites,
+// and supplies only the analytics identity state policy permits at the edge.
+// The short bootstrap bridges a first render until the database-backed policy
+// endpoint promotes it (or clears it); durable identifiers are forwarded as
+// headers because a server component cannot read a cookie being set.
+//
+// Deliberately tiny. This runs in the Edge runtime, which cannot load the
+// platform — core reaches node:crypto through auth — so nothing here imports
+// anything but leaf constants.
+//
+// This is also where §4.9's URL strategy lands when the public surface goes
+// multilingual: non-default locales are path-prefixed, and stripping that
+// prefix before the route sees it is exactly this layer's job.
+import { NextResponse, type NextRequest } from "next/server";
+import instanceConfig from "./freeholder.config";
+import { legacyRedirect } from "@/core/seo/legacy-proxy";
+import {
+  LOCALE_HEADER,
+  PATH_HEADER,
+  REQUEST_TARGET_HEADER,
+} from "@/core/http/headers";
+import { env } from "@/core/env";
+import { measurementCspOrigins } from "@/adapters/measurement/config";
+import {
+  CSP_NONCE_HEADER,
+  THIRD_PARTY_CREATIVE_CONSENT_COOKIE,
+  contentSecurityPolicy,
+  cspAppliesToPath,
+  parseCspOrigins,
+  reportingEndpointsHeader,
+  thirdPartyCreativeConsentGranted,
+} from "@/core/http/csp";
+import {
+  ANALYTICS_BOOTSTRAP_COOKIE,
+  ANALYTICS_BOOTSTRAP_HEADER,
+  ANALYTICS_BOOTSTRAP_MAX_AGE,
+  ANALYTICS_CONSENT_COOKIE,
+  ANON_COOKIE,
+  ANON_HEADER,
+  newVisitorId,
+  SESSION_COOKIE_NAME,
+  SESSION_HEADER,
+  SESSION_MAX_AGE,
+  analyticsIdentifiersAllowed,
+  parseAnalyticsConsentState,
+} from "@/modules/analytics/visitor";
+import {
+  PLAYGROUND_SHARED_CACHE_CONTROL,
+  playgroundSharedCacheable,
+} from "@/core/demo/playground-cache";
+import {
+  PREVIEW_ACCESS_PATH,
+  PREVIEW_COOKIE,
+  PREVIEW_REQUIRED_HTML,
+  PREVIEW_ROBOTS_HEADER,
+  previewEnabled,
+  previewGated,
+  previewLandingPath,
+  verifyPreviewToken,
+} from "@/core/preview/private-preview";
+
+/** `/sitemap-fr-CA.xml` or `/sitemap-en-2.xml` when a locale map is split. */
+const LOCALE_SITEMAP =
+  /^\/sitemap-([A-Za-z]{2}(?:-[A-Za-z]{2,4})?)(?:-([1-9]\d*))?\.xml$/;
+
+/** IndexNow key file: `/{32-hex}.txt`. */
+const INDEXNOW_KEY_FILE = /^\/[a-f0-9]{32}\.txt$/i;
+
+/** `/feeds/products.xml` — Atom feeds over the public entity registry. */
+const ENTITY_FEED = /^\/feeds\/([a-z]+)\.xml$/;
+
+/**
+ * A leading path segment shaped like a language tag: `/fr`, `/fr-CA`.
+ *
+ * Shape only. The edge cannot ask the database which locales this instance
+ * publishes, so it strips anything that *looks* like a prefix and lets the
+ * page decide — a page whose slug genuinely is "de" on an instance with no
+ * German still resolves, because the route falls back to the original path
+ * when the locale turns out not to be enabled.
+ */
+const LOCALE_PREFIX = /^\/([a-z]{2}(?:-[A-Za-z]{2,4})?)(\/.*)?$/;
+
+/**
+ * Two-letter route roots that are not languages.
+ *
+ * `/og/services` is shaped exactly like a locale-prefixed path, so the prefix
+ * was stripped and the request became `/services` — every page's link-preview
+ * image 404ed, and every `/go/…` short link was swallowed the same way. Nobody
+ * sees that on the site itself; you see it when a page is shared to Facebook,
+ * iMessage or WhatsApp and comes back blank. Reported by a third party.
+ *
+ * `NEVER_LOCALIZED` cannot do this job: it is tested against the *rest* of the
+ * path, so it answers "is `/admin` localizable", never "is `og` a language".
+ * This is the same question asked about the first segment instead.
+ *
+ * A deny-list rather than an allow-list of languages, because the edge still
+ * cannot ask which locales exist, and `tests/core/proxy.test.ts` fails if a new
+ * two-letter route appears in `app/` without being listed here. `ap` is the
+ * ActivityPub surface (C12.18); stripping it sent every fediverse server a 404.
+ */
+const RESERVED_ROOT = /^(og|go|ap)$/;
+
+/**
+ * Surfaces where a visitor identifier would be pointless or unwelcome.
+ *
+ * The owner's own admin is not traffic to measure, and a crawler fetching
+ * robots.txt is not a visit. Anything here gets no cookie at all rather than a
+ * cookie whose events are filtered out later — the cheapest way to be sure a
+ * number is honest is to never record it.
+ */
+const UNCOUNTED = /^\/(admin|login|setup|preview|portal|api|media|og|feeds|ap|\.well-known)(\/|$)|\.(xml|txt|ico|png|jpg|svg|webp|avif)$/;
+
+/** Owner/internal routes may look like locale-prefixed public paths, but are not. */
+const NEVER_LOCALIZED = /^\/(admin|login|setup|preview|api|media|embed)(\/|$)/;
+
+/** The SFU's signalling origin and its HTTP twin, which the client also calls. */
+function sfuOrigins(url: string | undefined): string[] {
+  if (!url) return [];
+  try {
+    const parsed = new URL(url);
+    const http = new URL(url);
+    http.protocol = parsed.protocol === "wss:" ? "https:" : parsed.protocol === "ws:" ? "http:" : parsed.protocol;
+    const ws = new URL(url);
+    ws.protocol = parsed.protocol === "https:" ? "wss:" : parsed.protocol === "http:" ? "ws:" : parsed.protocol;
+    return [...new Set([ws.origin, http.origin])];
+  } catch {
+    return [];
+  }
+}
+
+export async function proxy(request: NextRequest): Promise<NextResponse> {
+  const context = requestContextProxy(request);
+  // The preview access decision must run before a public route is examined.
+  if (context.status >= 300 || context.headers.has("X-Robots-Tag")) return context;
+  const moved = await legacyRedirect(request);
+  if (!moved) return context;
+  const response = new NextResponse(null, { status: moved.status, headers: new Headers(moved.headers) });
+  for (const name of ["Content-Security-Policy", "Reporting-Endpoints"]) {
+    const value = context.headers.get(name);
+    if (value) response.headers.set(name, value);
+  }
+  return response;
+}
+
+/** Request-context projection, independently testable without a running server. */
+export function requestContextProxy(request: NextRequest): NextResponse {
+  const headers = new Headers(request.headers);
+  const path = request.nextUrl.pathname;
+  const playground = env().FREEHOLDER_PLAYGROUND === "1";
+  // C3.35: a private preview answers only to a signed link, before any other
+  // routing, and says noindex on everything it serves.
+  const previewKey = env().FREEHOLDER_PREVIEW_KEY;
+  const preview = previewEnabled(previewKey);
+  if (preview) {
+    const refused = privatePreview(request, path, previewKey);
+    if (refused) return refused;
+  }
+  headers.set(PATH_HEADER, path);
+  headers.set(REQUEST_TARGET_HEADER, `${path}${request.nextUrl.search}`);
+  const policy = requestPolicy(request, path);
+  if (policy) {
+    // Next parses the request policy and applies this nonce to its framework
+    // scripts and styles. The browser enforces the identical response policy.
+    headers.set(CSP_NONCE_HEADER, policy.nonce);
+    headers.set("content-security-policy", policy.value);
+  }
+  const finalize = (response: NextResponse): NextResponse => {
+    if (preview) response.headers.set("X-Robots-Tag", PREVIEW_ROBOTS_HEADER);
+    if (policy) {
+      response.headers.set("Content-Security-Policy", policy.value);
+      response.headers.set("Reporting-Endpoints", reportingEndpointsHeader());
+    }
+    return response;
+  };
+
+  // Next matches a dynamic segment, never a dynamic part of one, so the file
+  // cannot be named `sitemap-[locale].xml`. The published URL is the one in
+  // robots.txt and the sitemap index; the route behind it is an ordinary
+  // dynamic segment, and this is the seam between them.
+  const sitemap = LOCALE_SITEMAP.exec(path);
+  if (sitemap) {
+    const url = request.nextUrl.clone();
+    url.pathname = `/sitemaps/${sitemap[1]}`;
+    if (sitemap[2]) url.searchParams.set("chunk", sitemap[2]);
+    return finalize(NextResponse.rewrite(url, { request: { headers } }));
+  }
+
+  if (INDEXNOW_KEY_FILE.test(path)) {
+    const url = request.nextUrl.clone();
+    url.pathname = "/indexnow-key";
+    return finalize(NextResponse.rewrite(url, { request: { headers } }));
+  }
+
+  const feed = ENTITY_FEED.exec(path);
+  if (feed) {
+    const url = request.nextUrl.clone();
+    url.pathname = `/feeds/${feed[1]}`;
+    return finalize(NextResponse.rewrite(url, { request: { headers } }));
+  }
+
+  // §4.9's URL strategy, applied before anything else routes: public pages and
+  // the customer portal accept a prefix. Owner/internal routes never do, even
+  // when somebody types `/fr/admin` by hand.
+  const prefixed = LOCALE_PREFIX.exec(path);
+  if (
+    prefixed &&
+    !RESERVED_ROOT.test(prefixed[1] ?? "") &&
+    !NEVER_LOCALIZED.test(prefixed[2] ?? "/")
+  ) {
+    const [, locale = "", rest = "/"] = prefixed;
+    headers.set(LOCALE_HEADER, locale);
+    headers.set(PATH_HEADER, rest);
+    const url = request.nextUrl.clone();
+    url.pathname = rest;
+    if (playground) {
+      return finalize(playgroundPage(request, rest, NextResponse.rewrite(url, { request: { headers } })));
+    }
+    // A localized portal request is still account traffic, not analytics.
+    return finalize(UNCOUNTED.test(rest)
+      ? NextResponse.rewrite(url, { request: { headers } })
+      : withAnalyticsIdentity(
+          request,
+          headers,
+          (forwarded) => NextResponse.rewrite(url, { request: { headers: forwarded } }),
+        ));
+  }
+
+  if (UNCOUNTED.test(path)) {
+    return finalize(NextResponse.next({ request: { headers } }));
+  }
+
+  if (playground) {
+    return finalize(playgroundPage(request, path, NextResponse.next({ request: { headers } })));
+  }
+
+  return finalize(withAnalyticsIdentity(
+    request,
+    headers,
+    (forwarded) => NextResponse.next({ request: { headers: forwarded } }),
+  ));
+}
+
+/**
+ * The private-preview gate (C3.35). Exchanges a signed link for a cookie at
+ * /preview-access, and refuses any gated path without a current cookie.
+ * Returns null when the request may continue.
+ */
+function privatePreview(request: NextRequest, path: string, key: string): NextResponse | null {
+  const now = Math.floor(Date.now() / 1000);
+  const refuse = () =>
+    new NextResponse(PREVIEW_REQUIRED_HTML, {
+      status: 401,
+      headers: {
+        "content-type": "text/html; charset=utf-8",
+        "cache-control": "no-store",
+        "x-robots-tag": PREVIEW_ROBOTS_HEADER,
+        "referrer-policy": "no-referrer",
+      },
+    });
+  if (path === PREVIEW_ACCESS_PATH) {
+    const token = request.nextUrl.searchParams.get("t");
+    const expires = verifyPreviewToken(key, token, now);
+    if (!expires || !token) return refuse();
+    // Absolute, on the configured public origin: Next refuses a relative
+    // Location here, and behind a reverse proxy the request URL names the
+    // internal scheme rather than the one the browser used.
+    const response = new NextResponse(null, {
+      status: 303,
+      headers: {
+        location: new URL(previewLandingPath(request.nextUrl.searchParams.get("next")), env().APP_URL).toString(),
+        "cache-control": "no-store",
+        "x-robots-tag": PREVIEW_ROBOTS_HEADER,
+        // The token is in this URL; never hand it to the next page's referrer.
+        "referrer-policy": "no-referrer",
+      },
+    });
+    response.cookies.set(PREVIEW_COOKIE, token, {
+      httpOnly: true,
+      sameSite: "lax",
+      path: "/",
+      secure:
+        request.nextUrl.protocol === "https:" ||
+        request.headers.get("x-forwarded-proto") === "https",
+      maxAge: expires - now,
+    });
+    return response;
+  }
+  const gated = previewGated(path, request.headers.has("authorization"), {
+    method: request.method,
+    hasStripeSignature: Boolean(request.headers.get("stripe-signature")),
+  });
+  if (!gated) return null;
+  return verifyPreviewToken(key, request.cookies.get(PREVIEW_COOKIE)?.value, now) ? null : refuse();
+}
+
+function originOf(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  try {
+    return new URL(value).origin;
+  } catch {
+    return undefined;
+  }
+}
+
+function requestPolicy(
+  request: NextRequest,
+  path: string,
+): { nonce: string; value: string } | null {
+  if (!cspAppliesToPath(path)) return null;
+  const runtime = env();
+  const storageOrigins = (runtime.FREEHOLDER_STORAGE ?? instanceConfig.adapters.storage) === "s3"
+    ? [
+        originOf(runtime.S3_ENDPOINT),
+        originOf(runtime.S3_PUBLIC_BASE_URL),
+      ].filter((value): value is string => Boolean(value))
+    : [];
+  const nonce = crypto.randomUUID().replaceAll("-", "");
+  return {
+    nonce,
+    value: contentSecurityPolicy({
+      nonce,
+      path,
+      production: runtime.NODE_ENV === "production",
+      mediaOrigins: storageOrigins,
+      uploadOrigins: storageOrigins,
+      creativeOrigins: parseCspOrigins(runtime.CSP_THIRD_PARTY_ORIGINS),
+      callOrigins: sfuOrigins(runtime.LIVEKIT_URL),
+      assistantOrigins: parseCspOrigins(runtime.PARADISEMODERN_ASSISTANT_ORIGINS).flatMap(origin => [origin, origin.replace(/^https:/, "wss:")]),
+      thirdPartyCreativeConsent: thirdPartyCreativeConsentGranted(
+        request.cookies.get(THIRD_PARTY_CREATIVE_CONSENT_COOKIE)?.value,
+      ),
+      // C3.32: the measurement provider's edge, only after this visitor's
+      // explicit "allow". The layout applies the owner's policy before it
+      // renders the scripts; this only lets them reach their own host.
+      measurementOrigins: measurementCspOrigins(
+        runtime,
+        parseAnalyticsConsentState(request.cookies.get(ANALYTICS_CONSENT_COOKIE)?.value),
+        { path },
+      ),
+    }),
+  };
+}
+
+/**
+ * C1.38: the public playground records no analytics (`pageview.ts`), so it
+ * mints no identity cookies either. With no Set-Cookie on an anonymous page,
+ * a CDN in front of the demo may keep the pages `playgroundSharedCacheable`
+ * allows for a few seconds — a launch-day spike then costs one render per
+ * page rather than one per visitor.
+ */
+function playgroundPage(
+  request: NextRequest,
+  path: string,
+  response: NextResponse,
+): NextResponse {
+  if (
+    playgroundSharedCacheable({
+      method: request.method,
+      path,
+      search: request.nextUrl.search,
+      headers: request.headers,
+    })
+  ) {
+    response.headers.set("Cache-Control", PLAYGROUND_SHARED_CACHE_CONTROL);
+  }
+  return response;
+}
+
+/**
+ * Attach the visitor and session cookies to whatever response is going back.
+ *
+ * Shared because a locale-prefixed URL is rewritten rather than passed
+ * through, and a visitor reading the French site is still a visitor.
+ */
+function withAnalyticsIdentity(
+  request: NextRequest,
+  headers: Headers,
+  respond: (headers: Headers) => NextResponse,
+): NextResponse {
+  const consent = parseAnalyticsConsentState(
+    request.cookies.get(ANALYTICS_CONSENT_COOKIE)?.value,
+  );
+  const durableAnon = request.cookies.get(ANON_COOKIE)?.value;
+  if (!analyticsIdentifiersAllowed(consent) || !durableAnon) {
+    if (consent === "denied" || consent === "disabled") return respond(headers);
+    const bootstrap =
+      request.cookies.get(ANALYTICS_BOOTSTRAP_COOKIE)?.value ?? newVisitorId();
+    headers.set(ANALYTICS_BOOTSTRAP_HEADER, bootstrap);
+    const response = respond(headers);
+    response.cookies.set(ANALYTICS_BOOTSTRAP_COOKIE, bootstrap, {
+      httpOnly: true,
+      sameSite: "lax",
+      secure: request.nextUrl.protocol === "https:",
+      path: "/",
+      maxAge: ANALYTICS_BOOTSTRAP_MAX_AGE,
+    });
+    return response;
+  }
+
+  const anon = durableAnon;
+  const session = request.cookies.get(SESSION_COOKIE_NAME)?.value ?? newVisitorId();
+  headers.set(ANON_HEADER, anon);
+  headers.set(SESSION_HEADER, session);
+  const response = respond(headers);
+
+  // The session is re-set on every request: its expiry is what makes a visit
+  // end after thirty minutes of quiet. The visitor cookie is deliberately
+  // refreshed only by the policy-aware consent endpoint, which knows the
+  // configured retention period that this edge layer cannot read.
+  //
+  // httpOnly because nothing in the browser needs to read these, and a value
+  // scripts cannot reach is a value an injected script cannot exfiltrate.
+  const secure = request.nextUrl.protocol === "https:";
+  response.cookies.set(SESSION_COOKIE_NAME, session, {
+    httpOnly: true,
+    sameSite: "lax",
+    secure,
+    path: "/",
+    maxAge: SESSION_MAX_AGE,
+  });
+
+  return response;
+}
+
+export const config = {
+  // Everything except Next's own assets and the files that are their own
+  // answer — adding a header nobody reads to every image is waste.
+  matcher: [
+    "/((?!_next/static|_next/image|favicon.ico|robots.txt|sitemap.xml).*)",
+  ],
+};

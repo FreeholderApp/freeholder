@@ -1,0 +1,357 @@
+// Copyright (C) 2026 Tony Aly
+// SPDX-License-Identifier: Apache-2.0
+// Seeded page/post/product/service/email templates (C2.13).
+//
+// §32: "Default templates ship per business preset as seed data, so day one
+// still looks designed." These are starting trees, never cages — create-from-
+// template copies them, reset-to-default restores them.
+import {
+  emailTemplateKey,
+  listPresets,
+  preset as packagePreset,
+  type PresetKey,
+} from "@freeholder/templates";
+import type { BlockNode } from "./blocks/types";
+import type { TemplateKind, TemplatePreset } from "./schema";
+
+export const TEMPLATE_KEYS = [
+  "page.blank",
+  "page.landing",
+  "page.link-in-bio",
+  "post.article",
+  "product.default",
+  "service.default",
+  "portfolio.index",
+  "portfolio.collection",
+  "project.case-study",
+  "email.transactional",
+  "sms.transactional",
+] as const;
+
+export type TemplateKey = (typeof TEMPLATE_KEYS)[number];
+
+export interface SeedTemplate {
+  key: string;
+  kind: TemplateKind;
+  name: string;
+  blocks: BlockNode[];
+  variables: string[];
+}
+
+function heading(id: string, text: string, level: 1 | 2 = 1): BlockNode {
+  return { id, type: "heading", props: { text, level, align: "start" } };
+}
+
+function body(id: string, text: string): BlockNode {
+  return { id, type: "text", props: { body: text, align: "start", measure: true } };
+}
+
+function button(id: string, label: string, href: string): BlockNode {
+  return { id, type: "button", props: { label, href, variant: "solid" } };
+}
+
+const COPY: Record<
+  TemplatePreset,
+  {
+    landingTitle: string;
+    landingBody: string;
+    landingCta: string;
+    postTitle: string;
+    postBody: string;
+    productTitle: string;
+    productBody: string;
+    serviceTitle: string;
+    serviceBody: string;
+    emailTitle: string;
+    emailBody: string;
+  }
+> = {
+  creator: {
+    landingTitle: "Work worth looking at",
+    landingBody:
+      "A short page for the work, the story, and how to hire you. Rearrange it; this is only a start.",
+    landingCta: "See the work",
+    postTitle: "A note from the studio",
+    postBody: "Write the piece. The heading and this paragraph are only placeholders.",
+    productTitle: "This piece",
+    productBody: "Describe the work, what is included, and how someone buys it.",
+    serviceTitle: "Book a session",
+    serviceBody: "Say what the sitting is, how long it lasts, and what happens next.",
+    emailTitle: "Hello {{contact.first_name}}",
+    emailBody: "This is a starting letter. Variable slots stay as written until send time.",
+  },
+  "service-business": {
+    landingTitle: "How we can help",
+    landingBody:
+      "Lead with the offer, the area you serve, and a way to get in touch. Times are arranged after that.",
+    landingCta: "Request a booking",
+    postTitle: "From the practice",
+    postBody: "A short update for clients. Replace this copy.",
+    productTitle: "This service",
+    productBody: "What they get, how long it takes, and what happens after they book.",
+    serviceTitle: "Book this service",
+    serviceBody: "Introduce the session. The booking block below is a request, not a live calendar.",
+    emailTitle: "Hello {{contact.first_name}}",
+    emailBody: "Confirm the next step. Variable slots stay as written until send time.",
+  },
+  shop: {
+    landingTitle: "What we sell",
+    landingBody: "A storefront page. Add products below, then change this copy to match the season.",
+    landingCta: "Shop now",
+    postTitle: "From the shop",
+    postBody: "A note about a drop, a restock, or how something is made.",
+    productTitle: "This product",
+    productBody: "What it is, who it is for, and what arrives with it.",
+    serviceTitle: "This service",
+    serviceBody: "If you also take bookings, start from here.",
+    emailTitle: "Hello {{contact.first_name}}",
+    emailBody: "A receipt or a dispatch note starts here. Variable slots stay as written until send time.",
+  },
+  community: {
+    landingTitle: "A place for people who make things",
+    landingBody: "Say who this community is for. Members post, follow, talk, call and trade with each other here.",
+    landingCta: "Join",
+    postTitle: "News from the organisers",
+    postBody: "Announcements, events and changes to the guidelines start here.",
+    productTitle: "Support the community",
+    productBody: "What a supporter's contribution pays for, and what they receive.",
+    serviceTitle: "A community session",
+    serviceBody: "A workshop or meet-up people can book.",
+    emailTitle: "Welcome, {{contact.first_name}}",
+    emailBody: "A welcome for new members. Variable slots stay as written until send time.",
+  },
+  everything: {
+    landingTitle: "Welcome",
+    landingBody:
+      "Say who you are, what you make, and how people can reach you.",
+    landingCta: "Get in touch",
+    postTitle: "A new post",
+    postBody: "Write the piece. The heading and this paragraph are only placeholders.",
+    productTitle: "This product",
+    productBody: "Describe what they get. Bind this layout to a live product when you publish it.",
+    serviceTitle: "This service",
+    serviceBody: "Describe the session. The booking block is a request, not a live calendar.",
+    emailTitle: "Hello {{contact.first_name}}",
+    emailBody: "A transactional letter starts here. Variable slots stay as written until send time.",
+  },
+  custom: {
+    landingTitle: "Welcome",
+    landingBody:
+      "Say who you are, what you make, and how people can reach you.",
+    landingCta: "Get in touch",
+    postTitle: "A new post",
+    postBody: "Write the piece. The heading and this paragraph are only placeholders.",
+    productTitle: "This product",
+    productBody: "Describe what they get. Bind this layout to a live product when you publish it.",
+    serviceTitle: "This service",
+    serviceBody: "Describe the session. The booking block is a request, not a live calendar.",
+    emailTitle: "Hello {{contact.first_name}}",
+    emailBody: "A transactional letter starts here. Variable slots stay as written until send time.",
+  },
+};
+
+export function seedTemplates(preset: TemplatePreset): SeedTemplate[] {
+  const copy = COPY[preset];
+  const landingChildren: BlockNode[] = [
+    heading(`${preset}-landing-h1`, copy.landingTitle),
+    body(`${preset}-landing-intro`, copy.landingBody),
+    button(
+      `${preset}-landing-cta`,
+      copy.landingCta,
+      preset === "shop" ? "/products" : preset === "community" ? "/join" : "/contact",
+    ),
+  ];
+  if (preset === "shop") {
+    landingChildren.push({
+      id: `${preset}-landing-index`,
+      type: "productsIndex",
+      props: { showSubtitle: true },
+    });
+  }
+  if (preset === "service-business") {
+    landingChildren.push({
+      id: `${preset}-landing-book`,
+      type: "booking",
+      props: { slug: "session", ctaHref: "/contact" },
+    });
+  }
+
+  return [
+    {
+      key: "page.blank",
+      kind: "page",
+      name: "Blank page",
+      blocks: [heading(`${preset}-blank-h1`, "Untitled page")],
+      variables: [],
+    },
+    {
+      key: "page.landing",
+      kind: "page",
+      name: "Landing page",
+      blocks: landingChildren,
+      variables: [],
+    },
+    {
+      // The optional link-in-bio preset (C9.39): one mobile-first profile
+      // block that follows the site's design tokens, with its links added in
+      // the editor or the Link in bio screen. Like the portfolio templates it
+      // names a module's block, so it is parsed only where that module is on.
+      key: "page.link-in-bio",
+      kind: "page",
+      name: "Link in bio",
+      blocks: [
+        {
+          id: `${preset}-link-in-bio`,
+          type: "linkInBio",
+          props: {
+            name: "",
+            bio: "A line or two about who you are and what you do. Add your links below.",
+            style: "solid",
+            links: [],
+            socials: [],
+          },
+        },
+      ],
+      variables: [],
+    },
+    {
+      key: "post.article",
+      kind: "post",
+      name: "Article",
+      blocks: [
+        heading(`${preset}-post-h1`, copy.postTitle),
+        body(`${preset}-post-body`, copy.postBody),
+      ],
+      variables: [],
+    },
+    {
+      key: "product.default",
+      kind: "product",
+      name: "Product page",
+      blocks: [
+        heading(`${preset}-product-h1`, copy.productTitle),
+        body(`${preset}-product-body`, copy.productBody),
+      ],
+      variables: [],
+    },
+    {
+      key: "service.default",
+      kind: "service",
+      name: "Service page",
+      blocks: [
+        heading(`${preset}-service-h1`, copy.serviceTitle),
+        body(`${preset}-service-body`, copy.serviceBody),
+        {
+          id: `${preset}-service-book`,
+          type: "booking",
+          props: { slug: "session", ctaHref: "/contact" },
+        },
+      ],
+      variables: [],
+    },
+    {
+      key: "portfolio.index",
+      kind: "page",
+      name: "Portfolio index",
+      blocks: [
+        heading(`${preset}-portfolio-h1`, "Our work"),
+        { id: `${preset}-portfolio-index`, type: "portfolioIndex", props: {} },
+        { id: `${preset}-portfolio-share`, type: "share", props: { label: "Share" } },
+      ],
+      variables: [],
+    },
+    {
+      key: "portfolio.collection",
+      kind: "page",
+      name: "Portfolio collection",
+      blocks: [
+        heading(`${preset}-collection-h1`, "Selected work"),
+        {
+          id: `${preset}-collection-projects`,
+          type: "portfolioCollection",
+          props: {
+            collectionId: "00000000-0000-4000-8000-000000000000",
+            description: null,
+            projects: [],
+          },
+        },
+        { id: `${preset}-collection-share`, type: "share", props: { label: "Share" } },
+      ],
+      variables: [],
+    },
+    {
+      key: "project.case-study",
+      kind: "page",
+      name: "Project case study",
+      blocks: [
+        heading(`${preset}-project-h1`, "Project"),
+        {
+          id: `${preset}-project-facts`,
+          type: "projectCaseStudy",
+          props: {
+            projectId: "00000000-0000-4000-8000-000000000000",
+            summary: null,
+            clientDisplayName: null,
+            occurredOn: null,
+            coverAssetId: null,
+            featured: false,
+            services: [],
+            outcomes: [],
+            media: [],
+            testimonials: [],
+          },
+        },
+        { id: `${preset}-project-share`, type: "share", props: { label: "Share" } },
+      ],
+      variables: [],
+    },
+    {
+      key: "email.transactional",
+      kind: "email",
+      name: "Transactional email",
+      blocks: [
+        heading(`${preset}-email-h1`, copy.emailTitle),
+        body(`${preset}-email-body`, copy.emailBody),
+      ],
+      variables: ["contact.first_name", "contact.email", "business.name"],
+    },
+    {
+      key: "sms.transactional",
+      kind: "sms",
+      name: "Transactional text message",
+      blocks: [
+        body(
+          `${preset}-sms-body`,
+          "Hello {{contact.first_name}} — this is a message from {{business.name}}.",
+        ),
+      ],
+      variables: ["contact.first_name", "business.name", "booking.starts_at_local"],
+    },
+    ...extraPresetTemplates(preset),
+  ];
+}
+
+export function extraPresetTemplates(preset: TemplatePreset): SeedTemplate[] {
+  const keys: PresetKey[] =
+    preset === "everything" || preset === "custom" ? listPresets() : listPresets().filter((key) => key === preset);
+  return keys.flatMap((key) => {
+    const pack = packagePreset(key);
+    return pack.emails.map((email) => ({
+      key: emailTemplateKey(email.key),
+      kind: "email" as const,
+      name: email.name,
+      blocks: email.blocks,
+      variables: [...email.variables],
+    }));
+  });
+}
+
+export function slugFromTitle(title: string): string {
+  const slug = title
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60);
+  return slug;
+}

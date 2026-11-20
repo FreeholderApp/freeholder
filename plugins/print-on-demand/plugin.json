@@ -1,0 +1,10 @@
+{
+  "name": "print-on-demand",
+  "version": "0.1.0",
+  "freeholder": "^0.2.0",
+  "license": "Apache-2.0",
+  "permissions": ["catalog:write", "contacts:read", "network:external"],
+  "requires": ["core", "catalog"],
+  "migrations": ["0000_reviewed-baseline.sql", "0003_print_on_demand_fulfillment.sql", "0008_printify_live_fulfillment.sql"],
+  "capabilities": { "adapters": [] }
+}

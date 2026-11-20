@@ -1,0 +1,641 @@
+// Copyright (C) 2026 Tony Aly
+// SPDX-License-Identifier: Apache-2.0
+// The single Zod env schema (MASTER.md §14, §17). Every environment variable
+// the platform reads is declared here — nothing reads process.env directly.
+// Validation is lazy so `next build` succeeds without a database attached;
+// anything that *uses* env at runtime gets a plain-English failure instead.
+import { z } from "zod";
+import { MEASUREMENT_PROVIDERS } from "../adapters/measurement/config";
+import { normalizeAgentProviderId } from "../adapters/agent/aliases";
+import { FORM_SCREENING_PROVIDERS } from "../adapters/form-screening/types";
+import { LEAD_SINK_PROVIDERS } from "../adapters/lead-sink/types";
+
+const envSchema = z.object({
+  NODE_ENV: z
+    .enum(["development", "test", "production"])
+    .default("development"),
+  /** The application's listening port, also used for internal loopback HTTP. */
+  PORT: z.string().regex(/^[1-9]\d{0,4}$/).transform(Number)
+    .pipe(z.number().int().min(1).max(65535)).optional(),
+  /** Node's listen host; internal requests select only a loopback address. */
+  HOSTNAME: z.string().optional(),
+  /** Only for a separate disposable instance with blocked network egress. */
+  FREEHOLDER_PLAYGROUND: z.enum(["0", "1"]).optional(),
+  /** Public playground link on the main website; absent on ordinary client sites. */
+  FREEHOLDER_PLAYGROUND_URL: z.string().url().optional(),
+  FREEHOLDER_UPDATE_SOCKET: z.string().startsWith("/").optional(),
+  /** C3.13: Daily private room and recording provider. */
+  DAILY_API_KEY: z.string().optional(),
+  DAILY_DOMAIN: z.string().optional(),
+  /** C3.13: own-store Shopify app credentials; never exposed by channel reads. */
+  SHOPIFY_SHOP: z.string().optional(),
+  SHOPIFY_CLIENT_ID: z.string().optional(),
+  SHOPIFY_CLIENT_SECRET: z.string().optional(),
+  /** Postgres connection string. Required at runtime, not at build time. */
+  DATABASE_URL: z.string().url().optional(),
+  /**
+   * Connections per pool. Coerced to a number on purpose.
+   *
+   * An idle instance held 21 connections: postgres.js defaults to 10, the
+   * instrumentation graph and the request graph each hold their own copy of the
+   * pool (see `src/core/runtime.ts`), and pg-boss adds 2. DigitalOcean's
+   * smallest managed Postgres allows 22, and App Platform starts the new
+   * instance beside the old one — so the second deploy could not connect at all
+   * ("remaining connection slots are reserved for roles with the SUPERUSER
+   * attribute"). Reported by a third party deploying Freeholder.
+   *
+   * 4 keeps two instances inside a 22-connection database with room to spare:
+   * 2 graphs x 4, plus 2 for pg-boss, is 10 per instance and 20 for a rollover.
+   *
+   * Coercion is the point. postgres.js reads `PGMAX` from the environment but
+   * leaves it a string, and `[...Array("6")]` has length 1 — so setting PGMAX
+   * to any value silently produced a *one*-connection pool. A setting that
+   * cannot be passed as a number is not a setting.
+   */
+  DATABASE_POOL_MAX: z.coerce.number().int().min(1).max(100).default(4),
+  /**
+   * Throwaway database for the test suite. Declared here because this file is
+   * the single register of what the platform reads — vitest.config.ts maps it
+   * onto DATABASE_URL so tests can never reach the development database.
+   */
+  TEST_DATABASE_URL: z.string().url().optional(),
+  /** Absolute base URL of this instance, e.g. https://example.com */
+  APP_URL: z.string().url().default("http://localhost:3000"),
+  /** 32+ char secret for session-token hashing. Required in production. */
+  SESSION_SECRET: z.string().min(32).optional(),
+  /** Independent deployment secret required to claim a fresh production instance. */
+  BOOTSTRAP_SECRET: z.string().min(32).optional(),
+  /**
+   * Only set behind a proxy that overwrites this header and blocks direct
+   * access. `do-connecting-ip` is DigitalOcean App Platform's. `x-forwarded-for`
+   * is for an edge that appends rather than overwrites: the client address is
+   * read `TRUSTED_PROXY_HOPS` entries from the right, so anything a visitor
+   * wrote on the left is ignored.
+   */
+  TRUSTED_CLIENT_IP_HEADER: z
+    .enum(["x-freeholder-client-ip", "cf-connecting-ip", "x-real-ip", "do-connecting-ip", "x-forwarded-for"])
+    .optional(),
+  /**
+   * With `TRUSTED_CLIENT_IP_HEADER=x-forwarded-for`: how many appending
+   * proxies the application sits behind. 1 (the default) takes the rightmost
+   * entry, the address the last proxy saw. Ignored for the other headers.
+   */
+  TRUSTED_PROXY_HOPS: z.coerce.number().int().min(1).max(10).default(1),
+  /**
+   * Encrypts an owner's third-party credentials at rest (§41's addendum to
+   * §17). 32 bytes as hex or base64url. Absent is fine until something is
+   * connected; doctor fails once anything is.
+   *
+   * Deliberately unconstrained here beyond being a string. The real rule is
+   * "32 bytes, in one of two encodings", which a character count cannot
+   * express — 64 hex characters and 43 base64url ones are both correct — and
+   * `core/connections/crypto.ts` checks it properly and says so in a sentence
+   * that names both forms. A weaker check here would only get in front of the
+   * accurate one with a worse message.
+   */
+  CREDENTIAL_KEY: z.string().optional(),
+  /** The previous key, during a rotation. See core/connections/crypto.ts. */
+  CREDENTIAL_KEY_PREVIOUS: z.string().optional(),
+
+  /**
+   * Member calls (§44.7). WebRTC needs a relay for people behind strict
+   * networks. These name the site's own TURN server (for example coturn with
+   * `use-auth-secret`); calls then get short-lived credentials. STUN_URLS is
+   * optional and defaults to the TURN servers. Nothing defaults to a third
+   * party: without these, calls connect only when a direct path exists.
+   */
+  TURN_URLS: z.string().optional(),
+  TURN_SECRET: z.string().min(16).optional(),
+  STUN_URLS: z.string().optional(),
+
+  /**
+   * Group calls (§44.7, C12.24) go through the site's own SFU. LiveKit is the
+   * first adapter: the server's WebSocket URL and an API key and secret from
+   * its config. Media is end-to-end encrypted, so the SFU forwards frames it
+   * cannot read. Without these, group calls are not offered.
+   */
+  /**
+   * Known-abuse-imagery hash matching on upload (C12.30). Each provider needs
+   * the site owner's own agreement with it: PhotoDNA through Microsoft's
+   * review, Safer through Thorn. Off by default.
+   */
+  ABUSE_SCAN_PROVIDER: z.enum(["none", "photodna", "safer"]).default("none"),
+  PHOTODNA_SUBSCRIPTION_KEY: z.string().optional(),
+  PHOTODNA_ENDPOINT: z.string().url().default("https://api.microsoftmoderator.com/photodna/v1.0"),
+
+  LIVEKIT_URL: z.string().url().optional(),
+  LIVEKIT_API_KEY: z.string().min(1).optional(),
+  LIVEKIT_API_SECRET: z.string().min(1).optional(),
+
+  /**
+   * S3-compatible object storage (§12). One set of names for DigitalOcean
+   * Spaces, Cloudflare R2, MinIO, Backblaze and AWS alike — they speak the
+   * same protocol, so naming them after a vendor would be a lie the next
+   * migration has to unpick. Required only when storage is set to "s3".
+   */
+  S3_ENDPOINT: z.string().url().optional(),
+  S3_REGION: z.string().optional(),
+  S3_BUCKET: z.string().optional(),
+  S3_ACCESS_KEY_ID: z.string().optional(),
+  S3_SECRET_ACCESS_KEY: z.string().optional(),
+  /** Use virtual for providers such as Railway that reject path-style URLs. */
+  S3_ADDRESSING_STYLE: z.enum(["path", "virtual"]).optional(),
+  /** Serve from a CDN or custom domain instead of the bucket host. */
+  S3_PUBLIC_BASE_URL: z.string().url().optional(),
+  /** "true" only if the bucket really is world-readable. Default: private. */
+  S3_PUBLIC: z.enum(["true", "false"]).optional(),
+
+  /**
+   * Exact external origins a reviewed third-party creative may use. Merely
+   * listing one never enables it: the visitor's separate `fh_tc=granted`
+   * choice is also required before the response policy includes these.
+   */
+  CSP_THIRD_PARTY_ORIGINS: z.string().optional(),
+
+  /**
+   * The measurement-provider category (C3.32): a third party's browser
+   * measurement and server-side lead conversions, only for visitors who
+   * explicitly allow it. `none` (the default) or one adapter.
+   */
+  MEASUREMENT_PROVIDER: z.enum(MEASUREMENT_PROVIDERS).optional(),
+  /** Paradise Modern measurement: the site's public id at the provider. */
+  PARADISEMODERN_SITE_ID: z.string().trim().uuid().optional(),
+  /** Paradise Modern measurement: the site's own edge host, one https origin. */
+  PARADISEMODERN_EDGE_URL: z
+    .string()
+    .url()
+    .refine((value) => {
+      const url = new URL(value);
+      return url.protocol === "https:" && url.pathname === "/" && !url.search && !url.hash && !url.username;
+    }, "must be one https origin, such as https://pm.example.com")
+    .optional(),
+
+  /**
+   * Transactional mail (§12). Overrides `adapters.mailTransactional`.
+   *
+   * The default is `console`, which prints and does not send — so a fresh
+   * instance can walk a password reset with no account anywhere, and says
+   * loudly in production that nothing is arriving.
+   */
+  MAIL_ADAPTER: z.enum(["smtp", "console", "gmail", "outlook", "paradise"]).optional(),
+  SMTP_HOST: z.string().optional(),
+  SMTP_PORT: z.string().optional(),
+  SMTP_USER: z.string().optional(),
+  SMTP_PASSWORD: z.string().optional(),
+  SMTP_SECURE: z.enum(["true", "false"]).optional(),
+  SMTP_TLS_CA: z.string().max(65_536).optional(),
+  /** The address mail comes from: "Aurora Coast <hello@auroracoast.ca>". */
+  MAIL_FROM: z.string().optional(),
+
+  /** OAuth applications used to connect user-held transactional mailboxes. */
+  GOOGLE_OAUTH_CLIENT_ID: z.string().optional(),
+  GOOGLE_OAUTH_CLIENT_SECRET: z.string().optional(),
+  MICROSOFT_OAUTH_CLIENT_ID: z.string().optional(),
+  MICROSOFT_OAUTH_CLIENT_SECRET: z.string().optional(),
+  MICROSOFT_OAUTH_TENANT: z.string().default("common"),
+
+  /**
+   * Social OAuth apps (C9.24). YouTube and Google Business Profile reuse the
+   * Google client above; Instagram and Facebook share the Meta client. A
+   * missing pair just means that network's Connect button stays off.
+   */
+  META_OAUTH_CLIENT_ID: z.string().optional(),
+  META_OAUTH_CLIENT_SECRET: z.string().optional(),
+  TIKTOK_OAUTH_CLIENT_ID: z.string().optional(),
+  TIKTOK_OAUTH_CLIENT_SECRET: z.string().optional(),
+  LINKEDIN_OAUTH_CLIENT_ID: z.string().optional(),
+  LINKEDIN_OAUTH_CLIENT_SECRET: z.string().optional(),
+  X_OAUTH_CLIENT_ID: z.string().optional(),
+  X_OAUTH_CLIENT_SECRET: z.string().optional(),
+  PINTEREST_OAUTH_CLIENT_ID: z.string().optional(),
+  PINTEREST_OAUTH_CLIENT_SECRET: z.string().optional(),
+
+  /** Bulk mail is separate so personal Gmail/Outlook can never broadcast. */
+  MAIL_BULK_ADAPTER: z
+    .enum(["resend", "postmark", "ses", "paradise", "none"])
+    .optional(),
+  MAIL_BULK_FROM: z.string().optional(),
+  /**
+   * The subscription topic campaign mail is sent under when Paradise Modern
+   * is the bulk adapter (C3.31). Freeholder records one marketing-email
+   * consent per contact, so one topic is the honest mapping.
+   */
+  PARADISEMODERN_MAIL_TOPIC: z
+    .string()
+    .trim()
+    .regex(/^[a-z0-9][a-z0-9._-]{0,199}$/)
+    .optional(),
+  RESEND_API_KEY: z.string().optional(),
+  RESEND_WEBHOOK_SECRET: z.string().optional(),
+  POSTMARK_SERVER_TOKEN: z.string().optional(),
+  POSTMARK_ACCOUNT_TOKEN: z.string().optional(),
+  POSTMARK_MESSAGE_STREAM: z.string().optional(),
+  POSTMARK_WEBHOOK_USER: z.string().optional(),
+  POSTMARK_WEBHOOK_PASSWORD: z.string().optional(),
+  SES_ACCESS_KEY_ID: z.string().optional(),
+  SES_SECRET_ACCESS_KEY: z.string().optional(),
+  SES_SESSION_TOKEN: z.string().optional(),
+  SES_REGION: z.string().optional(),
+  SES_CONFIGURATION_SET: z.string().optional(),
+  /** Exact SNS topic ARN accepted by the SES feedback endpoint. */
+  SES_SNS_TOPIC_ARN: z.string().optional(),
+
+  /** Hosted payments. The checked-in adapter choice remains in config. */
+  // Twilio SMS (C7.10). Secrets in the environment, everything else about a
+  // number in the database (§17). `TWILIO_WEBHOOK_URL` is the public URL Twilio
+  // was configured to call: it is part of the signed string, so it has to be
+  // what Twilio used rather than what this process thinks it is.
+  TWILIO_ACCOUNT_SID: z.string().optional(),
+  TWILIO_AUTH_TOKEN: z.string().optional(),
+  TWILIO_FROM_NUMBER: z.string().optional(),
+  TWILIO_WEBHOOK_URL: z.string().optional(),
+  STRIPE_SECRET_KEY: z.string().optional(),
+  /** C3.13: the print fulfillment plugin's merchant account. */
+  PRINTIFY_API_TOKEN: z.string().optional(),
+  PRINTIFY_SHOP_ID: z.string().optional(),
+  STRIPE_WEBHOOK_SECRET: z.string().optional(),
+  /** Kept only during Stripe endpoint-secret rotation. */
+  STRIPE_WEBHOOK_SECRET_PREVIOUS: z.string().optional(),
+  /** C12.26: the signing secret of the Connect webhook endpoint (account events). */
+  STRIPE_CONNECT_WEBHOOK_SECRET: z.string().optional(),
+  PAYPAL_CLIENT_ID: z.string().optional(),
+  PAYPAL_CLIENT_SECRET: z.string().optional(),
+  PAYPAL_WEBHOOK_ID: z.string().optional(),
+  PAYPAL_ENVIRONMENT: z.enum(["sandbox", "live"]).default("sandbox"),
+  SQUARE_ACCESS_TOKEN: z.string().optional(),
+  SQUARE_LOCATION_ID: z.string().optional(),
+  SQUARE_WEBHOOK_SIGNATURE_KEY: z.string().optional(),
+  /** Kept only while Square retries events signed before key rotation. */
+  SQUARE_WEBHOOK_SIGNATURE_KEY_PREVIOUS: z.string().optional(),
+  SQUARE_ENVIRONMENT: z.enum(["sandbox", "live"]).default("sandbox"),
+  MOLLIE_API_KEY: z.string().optional(),
+  /** Optional for next-generation events; classic payment callbacks are API-verified. */
+  MOLLIE_WEBHOOK_SECRET: z.string().optional(),
+  MOLLIE_WEBHOOK_SECRET_PREVIOUS: z.string().optional(),
+  RAZORPAY_KEY_ID: z.string().optional(),
+  RAZORPAY_KEY_SECRET: z.string().optional(),
+  RAZORPAY_WEBHOOK_SECRET: z.string().optional(),
+  RAZORPAY_WEBHOOK_SECRET_PREVIOUS: z.string().optional(),
+  PAYSTACK_SECRET_KEY: z.string().optional(),
+  FLUTTERWAVE_SECRET_KEY: z.string().optional(),
+  FLUTTERWAVE_WEBHOOK_SECRET: z.string().optional(),
+  FLUTTERWAVE_WEBHOOK_SECRET_PREVIOUS: z.string().optional(),
+
+  /** Replit Object Storage (§20). Discovered from the environment on Replit. */
+  REPLIT_BUCKET_ID: z.string().optional(),
+
+  /**
+   * Where `local` storage writes. Defaults to `.data/media` for development.
+   * In production it must be an absolute directory kept across updates and
+   * included in backups (C3.44): `/var/lib/freeholder/media` on the native
+   * Linux install, the media volume in Docker. See local-mode.ts.
+   */
+  LOCAL_STORAGE_ROOT: z.string().optional(),
+
+  /**
+   * Overrides `adapters.storage` from freeholder.config.ts.
+   *
+   * §17 describes that file as the instance, checked in — which holds when an
+   * owner forks and builds their own image. It cannot hold for the *published*
+   * image, because one artifact serves every instance and cannot carry any of
+   * their choices. So the declarative config remains the default and the
+   * environment overrides it, which is the only arrangement where a shared
+   * image and a per-instance configuration can both be true.
+   */
+  FREEHOLDER_STORAGE: z.enum(["s3", "replit", "local"]).optional(),
+
+  /** C10.32: opt-in exact-namespace inventory is required before writes. */
+  FREEHOLDER_STORAGE_QUOTA_BYTES: z.string().regex(/^[1-9]\d{0,15}$/)
+    .refine(value => Number.isSafeInteger(Number(value)), "Storage quota must be a safe byte count")
+    .optional(),
+  FREEHOLDER_STORAGE_QUOTA_INITIALIZE_EMPTY: z.enum(["true", "false"]).optional(),
+
+  /** Optional self-hosted ClamAV seam for originals (C1.12). */
+  MALWARE_SCANNER: z.enum(["none", "clamav"]).default("none"),
+  CLAMAV_HOST: z.string().min(1).optional(),
+  CLAMAV_PORT: z.string().regex(/^\d+$/).optional(),
+
+  /**
+   * Optional vision model used only after a person asks for an image alt-text
+   * suggestion. The checked-in `adapters.ai` choice selects the provider;
+   * credentials and the deliberately explicit model name stay in env.
+   */
+  // Blank values are normalized to absent by env(), so `.env.example` remains
+  // copyable as-is; the adapter and doctor then treat these as unconfigured.
+  OPENAI_API_KEY: z.string().trim().optional(),
+  /** Conventional key for managed Anthropic workforce connections (C4.05). */
+  ANTHROPIC_API_KEY: z.string().trim().optional(),
+  OPENAI_ALT_TEXT_MODEL: z
+    .string()
+    .trim()
+    .regex(/^(?:|[A-Za-z0-9][A-Za-z0-9._:-]{0,199})$/)
+    .optional(),
+
+  /** The owner-facing builder is a separate authority from drafting AI. */
+  // `pm_brain` is the deprecated name of the `paradise` choice; still read.
+  FREEHOLDER_AGENT: z
+    .enum(["gateway", "paradise", "pm_brain", "anthropic", "openai", "local", "none"])
+    .transform(normalizeAgentProviderId)
+    .optional(),
+  /**
+   * `gateway`: any OpenAI-compatible chat-completions endpoint. The URL is
+   * the origin the `/v1/chat/completions` path is appended to; the key is
+   * sent as a bearer token; the model is named explicitly, never guessed.
+   */
+  AGENT_GATEWAY_URL: z.string().url().optional(),
+  AGENT_GATEWAY_API_KEY: z.string().trim().min(1).optional(),
+  AGENT_GATEWAY_MODEL: z.string().trim().min(1).max(200).optional(),
+  /** `paradise`: purpose-bound Paradise Modern site credential (optional provider). */
+  PARADISEMODERN_API_KEY: z.string().trim().min(1).optional(),
+  /** Exact HTTPS voice/face worker origins for managed preview calls; no wildcard. */
+  PARADISEMODERN_ASSISTANT_ORIGINS: z.string().optional(),
+  /** `https://` only, or `http://` on a loopback host for tests and local work. */
+  PARADISEMODERN_URL: z
+    .string()
+    .url()
+    .refine((value) => {
+      const url = new URL(value);
+      return (
+        url.protocol === "https:" ||
+        (url.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname))
+      );
+    }, "must be an https:// address (http:// only for localhost)")
+    .optional(),
+  /**
+   * The project Paradise's model gateway meters calls against, sent as
+   * `x-pm-project` by the builder and workforce when Paradise is the chosen
+   * gateway. Paradise refuses a gateway call naming no project it knows.
+   */
+  // Sent exactly as written: Paradise issued ids before its lowercase-slug
+  // convention, so uppercase letters and underscores are accepted too.
+  PARADISEMODERN_PROJECT: z
+    .string()
+    .trim()
+    .regex(/^[A-Za-z0-9][A-Za-z0-9_-]*$/)
+    .max(64)
+    .optional(),
+  /**
+   * The form-screening category (C3.33): a second opinion on anonymous public
+   * form submissions that can only add a quarantine reason. `none` (default)
+   * or one adapter; Freeholder's own traps always run.
+   */
+  FORM_SCREENING_PROVIDER: z.enum(FORM_SCREENING_PROVIDERS).optional(),
+  /**
+   * The lead-sink category (C3.34): copy accepted form submissions to an
+   * outside CRM after commit. A switch of its own, `none` by default.
+   */
+  LEAD_SINK_PROVIDER: z.enum(LEAD_SINK_PROVIDERS).optional(),
+  /** Visible, hard monthly cap for builder model usage. */
+  BUILDER_MONTHLY_TOKEN_BUDGET: z.string().regex(/^\d+$/).default("250000"),
+  /** Per-proposal output ceiling; the adapter never gets an open-ended call. */
+  BUILDER_MAX_OUTPUT_TOKENS: z.string().regex(/^\d+$/).default("8000"),
+  /**
+   * The owner's own repository, for code-lane proposals (§37, C4.20).
+   *
+   * `owner/repo`. Absent means the builder still writes code proposals and
+   * still gates them; it hands them over as a patch instead of a pull request.
+   * A proposal must not be trapped inside an instance because a token is
+   * missing.
+   */
+  BUILDER_CODE_REPOSITORY: z
+    .string()
+    .trim()
+    .regex(/^[\w.-]+\/[\w.-]+$/)
+    .optional(),
+  /** A token that may open a pull request, and needs no other authority. */
+  BUILDER_CODE_TOKEN: z.string().trim().min(1).optional(),
+  BUILDER_CODE_BASE_BRANCH: z.string().trim().min(1).max(200).optional(),
+
+  /**
+   * Permits local-disk storage in production, against §18's mandate.
+   *
+   * Declared here rather than read where it is used, because a guard that
+   * decides what "production" means from a different source than the rest of
+   * the platform can disagree with it — and this particular disagreement ends
+   * with an owner's uploads on a disk that a rebuild throws away.
+   */
+  FREEHOLDER_UNSAFE_LOCAL_STORAGE: z.enum(["1"]).optional(),
+  /**
+   * SHA-256 digest of replaceable core files (`sha256:…`). When set, doctor
+   * and `platform.inspectSeams` fail if the running tree does not match —
+   * live edits of core files are not a supported customization.
+   */
+  FREEHOLDER_CORE_DIGEST: z
+    .string()
+    .trim()
+    .regex(/^sha256:[a-f0-9]{64}$/)
+    .optional(),
+
+  /**
+   * Daily signed-feed check (C10.04). On unless set to `off`. Reporting does
+   * not exist; this is a GET of a static file, never an instance identifier.
+   */
+  FREEHOLDER_UPDATE_CHECK: z.enum(["on", "off"]).optional(),
+  /** Override the signed `releases.json` URL. Must be a public http(s) origin. */
+  FREEHOLDER_UPDATE_FEED_URL: z.string().url().optional(),
+
+  /**
+   * Upstream, for the fork lane (§39.7, C10.09).
+   *
+   * Only forks read these. An instance updating by image swap never fetches a
+   * git remote at all, which is why neither is required and neither has a
+   * credential: the fork lane clones what is already public and opens a pull
+   * request with the repository token it already has.
+   */
+  FREEHOLDER_UPSTREAM_REMOTE: z
+    .string()
+    .url()
+    .refine((value) => value.startsWith("https://"), "must be an https URL")
+    .optional(),
+  /**
+   * Where to send a customer whose app binary is too old (§35.1, C10.12).
+   *
+   * Absent is the normal state: most owners never publish an app, and a
+   * discovery document that invents a store link would send someone to a
+   * listing that does not exist.
+   */
+  MOBILE_APP_STORE_URL: z.string().url().optional(),
+  MOBILE_PLAY_STORE_URL: z.string().url().optional(),
+
+  /**
+   * Which Tier-1 recipe this instance is deployed with (§39.8, C10.10).
+   *
+   * Absent means the updater migrates and smokes but swaps nothing: guessing a
+   * deploy strategy from the environment and then running a container command
+   * against it is how an update takes down a host nobody meant to touch.
+   */
+  FREEHOLDER_RECIPE_TARGET: z
+    .enum([
+      "replit",
+      "digitalocean-app",
+      "digitalocean-droplet",
+      "railway",
+      "render",
+      "docker-selfhost",
+    ])
+    .optional(),
+  /** The upstream branch a fork merges from. Defaults to `main`. */
+  FREEHOLDER_UPSTREAM_REF: z
+    .string()
+    .trim()
+    .regex(/^[A-Za-z0-9._\-/]{1,200}$/)
+    .optional(),
+
+  /**
+   * Control Aurora Coast demo installation at boot.
+   *
+   * Unset means on in development and off everywhere else. `1` asks for it
+   * explicitly (demo deploys, the plugin harness and CI); `0` gives a
+   * contributor a deliberately blank development instance for setup work.
+   * `busy` installs the demo plus six months of sample customers, sales,
+   * bookings and traffic — what the public playground (which implies it)
+   * shows evaluators; plain `1` stays quick for local development.
+   * Read once at startup and never in response to a request — a route that
+   * installs a demo business is a route somebody eventually hits on a real
+   * instance.
+   */
+  FREEHOLDER_SEED_DEMO: z.enum(["0", "1", "busy"]).optional(),
+
+  /**
+   * C3.35: private preview. A key of 32+ characters turns the whole public
+   * surface into a signed-link preview (src/core/preview/private-preview.ts):
+   * noindex everywhere, robots disallow, no IndexNow pings. Unset on a
+   * published site.
+   */
+  FREEHOLDER_PREVIEW_KEY: z.string().min(32).optional(),
+
+  /**
+   * C3.35: absolute path of a launch spec JSON file, installed once at boot
+   * into an empty instance (src/modules/seed/launch.ts). Like
+   * FREEHOLDER_SEED_DEMO, it is read at startup only and has no route.
+   */
+  FREEHOLDER_LAUNCH_SPEC: z.string().startsWith("/").optional(),
+
+  /**
+   * C3.36: on a private preview, the owner addresses that may receive the
+   * preview's transactional mail, comma-separated. Contacts of the site may
+   * receive it too; everything else is held in the preview outbox
+   * (src/core/mail/preview.ts). Ignored when FREEHOLDER_PREVIEW_KEY is unset.
+   */
+  FREEHOLDER_PREVIEW_MAIL_ALLOW: z
+    .string()
+    .max(4_000)
+    .refine(
+      (value) =>
+        value
+          .split(",")
+          .map((entry) => entry.trim())
+          .filter(Boolean)
+          .every((entry) => z.email().safeParse(entry).success),
+      "Every entry must be an email address, separated by commas.",
+    )
+    .optional(),
+
+  /**
+   * C3.36: how many messages a private preview may deliver in any rolling 24
+   * hours. Further messages are held in the preview outbox. Default 100.
+   */
+  FREEHOLDER_PREVIEW_MAIL_DAILY_CAP: z.coerce.number().int().min(0).max(10_000).optional(),
+
+  /**
+   * Whether this process runs background jobs.
+   *
+   * On by default wherever a database is configured, because §18's Tier-1
+   * targets run one container and a second process to forget is a job that
+   * silently stops. `off` is for a deploy that runs a dedicated worker;
+   * `on` forces them in the test environment, where they are otherwise
+   * suppressed so a suite never races a scheduler.
+   */
+  FREEHOLDER_JOBS: z.enum(["on", "off"]).optional(),
+
+  /**
+   * Seconds each job worker waits between empty polls of its queue.
+   *
+   * Every registered job has a worker, so pg-boss's two-second default is
+   * dozens of small queries a second against an idle database. That is the
+   * right trade for a business site whose confirmations should leave
+   * promptly; a box that shares its CPU (the public playground beside
+   * production, a small VPS) can raise it. Scheduled jobs still run — a cron
+   * firing waits at most this long for a worker to claim it.
+   */
+  FREEHOLDER_JOBS_POLL_SECONDS: z.coerce.number().min(0.5).max(300).optional(),
+});
+
+export type Env = z.infer<typeof envSchema>;
+
+let cached: Env | undefined;
+
+export function env(): Env {
+  if (!cached) {
+    // A copy of `.env.example` contains blank placeholders for optional
+    // credentials, URLs and enum switches. dotenv correctly represents those
+    // as empty strings, but an optional Zod field means `undefined`, not `""`.
+    // Normalize once at the boundary so every optional declaration shares the
+    // documented "leave blank to disable" behavior instead of each field
+    // inventing a slightly different empty-string workaround.
+    const source = Object.fromEntries(
+      Object.entries(process.env).filter(([, value]) => value !== ""),
+    );
+    const parsed = envSchema.safeParse(source);
+    if (!parsed.success) {
+      const details = parsed.error.issues
+        .map((i) => `  ${i.path.join(".")}: ${i.message}`)
+        .join("\n");
+      throw new Error(`Invalid environment:\n${details}\nSee .env.example.`);
+    }
+    cached = parsed.data;
+  }
+  return cached;
+}
+
+/** Tests only: forget the cached parse so a suite can vary the environment. */
+export function resetEnvForTests(): void {
+  cached = undefined;
+}
+
+/**
+ * Everything a production instance must have before it serves a request.
+ *
+ * Deliberately *not* a `.refine()` on the schema: `next build` runs with
+ * NODE_ENV=production and no secrets attached, so making the schema itself
+ * strict would break the build. This runs at boot instead, which is the first
+ * moment the distinction between building and running actually exists — and
+ * it reports everything missing at once rather than one failure per attempt.
+ */
+export function requireProductionEnv(): void {
+  const current = env();
+  if (current.NODE_ENV !== "production") return;
+
+  const missing: string[] = [];
+  if (!current.DATABASE_URL) {
+    missing.push("DATABASE_URL — the Postgres 15+ connection string");
+  }
+  if (!current.SESSION_SECRET) {
+    missing.push(
+      'SESSION_SECRET — 32+ random characters; generate one with:\n      node -e "console.log(crypto.randomBytes(32).toString(\'hex\'))"',
+    );
+  }
+  if (missing.length > 0) {
+    throw new Error(
+      `This instance cannot start in production. Missing:\n${missing
+        .map((m) => `  - ${m}`)
+        .join("\n")}\nSee .env.example.`,
+    );
+  }
+}
+
+/** Connections per pool, as a number. See DATABASE_POOL_MAX for the why. */
+export function databasePoolMax(): number {
+  return env().DATABASE_POOL_MAX;
+}
+
+/** Fails loudly, in plain English, when the database is needed but absent. */
+export function databaseUrl(): string {
+  const url = env().DATABASE_URL;
+  if (!url) {
+    throw new Error(
+      "DATABASE_URL is not set. Copy .env.example to .env and point it at a Postgres 15+ database.",
+    );
+  }
+  return url;
+}

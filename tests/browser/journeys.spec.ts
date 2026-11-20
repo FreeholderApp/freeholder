@@ -1,0 +1,707 @@
+// Copyright (C) 2026 Tony Aly
+// SPDX-License-Identifier: Apache-2.0
+// Chromium acceptance journeys for MASTER.md §43 C1.22. These prove the
+// browser-facing seams together: Server Actions, redirects, session cookies,
+// autosave, public rendering, JSON-RPC and password recovery.
+import { createHash, randomUUID } from "node:crypto";
+import { expect, test, type Page } from "@playwright/test";
+import AxeBuilder from "@axe-core/playwright";
+import { desc, eq } from "drizzle-orm";
+import { passwordResets } from "@/core/auth/schema";
+import { totpCode } from "@/core/auth/two-factor-crypto";
+import { contacts } from "@/core/contacts/schema";
+import { users } from "@/core/auth/schema";
+import { createSession, SESSION_COOKIE } from "@/core/auth/sessions";
+import { businessProfile } from "@/core/settings/schema";
+import { THEME_COOKIE } from "@/core/design/theme";
+import { translator } from "@/core/i18n";
+import { mailOutbox } from "@/core/mail/schema";
+import { decryptMailOutbox } from "@/core/mail/outbox-crypto";
+import { closeDb, db } from "@/core/db";
+import { invoices, payments, refunds, taxCategories } from "@/modules/invoicing/schema";
+import { paymentReturnToken } from "@/modules/invoicing/customer-tokens";
+import { galleries } from "@/modules/galleries/schema";
+import { resetBrowserDatabase } from "./database";
+
+const OWNER_EMAIL = "owner-journey@example.test";
+const OLD_PASSWORD = "correct horse battery staple";
+const NEW_PASSWORD = "river lantern copper meadow";
+const RESET_TOKEN = "journey-known-password-reset-token";
+
+async function passwordSignIn(page: Page, password: string): Promise<void> {
+  await page.goto("/login");
+  await page.getByLabel("Email").fill(OWNER_EMAIL);
+  await page.getByLabel("Password").fill(password);
+  await page.getByRole("button", { name: "Sign in", exact: true }).click();
+}
+
+test.describe("real-browser product journeys", () => {
+  test.beforeAll(resetBrowserDatabase);
+  test.afterAll(async () => {
+    // Later CI gates share this database; never leak browser fixture state.
+    await resetBrowserDatabase();
+    await closeDb();
+  });
+
+  test("covers setup, auth, editing, publishing, forms, contacts, translations, API keys, MCP and recovery", async ({ page, browser }) => {
+    test.setTimeout(300_000);
+    let totpSecret = "";
+    let recoveryCode = "";
+    let formId = "";
+
+    await test.step("first-boot setup works before owner 2FA exists", async () => {
+      await page.goto("/setup");
+      await page.getByLabel("Email").fill(OWNER_EMAIL);
+      await page.getByLabel("Password").fill(OLD_PASSWORD);
+      await page.getByLabel("Setup secret", { exact: true }).fill("browser-test-only-bootstrap-secret-32-characters");
+      await page.getByRole("button", { name: "Create owner account" }).click();
+      await expect(page).toHaveURL(/\/setup\/security$/);
+      // Authenticator apps remain available as an alternative to passkeys.
+      await page.getByRole("button", { name: "Set up authenticator app" }).click();
+      const secret = page.locator("p code").first();
+      await expect(secret).toBeVisible();
+      totpSecret = (await secret.textContent())?.trim() ?? "";
+      expect(totpSecret).toMatch(/^[A-Z2-7]+$/);
+
+      const code = totpCode(totpSecret, Math.floor(Date.now() / 30_000));
+      await page.getByLabel("Verification code").fill(code);
+      await page.getByRole("button", { name: "Confirm and turn on" }).click();
+      await expect(
+        page.getByText("Save these recovery codes now. They will not be shown again."),
+      ).toBeVisible();
+      const shownCodes = await page.locator("code").allTextContents();
+      recoveryCode = shownCodes.find((value) => /^(?:[A-Z2-7]{4}-){3}[A-Z2-7]{4}$/.test(value.trim()))?.trim() ?? "";
+      expect(recoveryCode).toMatch(/^(?:[A-Z2-7]{4}-){3}[A-Z2-7]{4}$/);
+
+      await page.getByLabel("I have saved my recovery codes somewhere safe.").check();
+      await page.getByRole("button", { name: "Continue to your business" }).click();
+      await expect(page).toHaveURL(/\/setup\/business$/);
+
+
+      await page.getByLabel("Business name").fill("Journey Studio");
+      await page.getByRole("button", { name: "Save and continue" }).click();
+      await expect(page).toHaveURL(/\/setup\/location$/);
+
+      await page.getByLabel("Street").fill("210 Fifth Street");
+      await page.getByLabel("City or town").fill("Courtenay");
+      await page.getByLabel("State, province or county").fill("BC");
+      await page.getByLabel("Postal code").fill("V9N 1A1");
+      await page.getByRole("button", { name: "Save and continue" }).click();
+      await expect(page).toHaveURL(/\/setup\/done$/);
+
+      await page.getByRole("button", { name: "Finish setup" }).click();
+      await expect(page).toHaveURL(/\/$/);
+      await expect(page.getByText("Journey Studio").first()).toBeVisible();
+
+      // The wizard is locked, and owner security is already enrolled.
+      await page.goto("/setup");
+      await expect(page).toHaveURL(/\/$/);
+      await page.goto("/admin");
+      await expect(page.getByRole("navigation", { name: "Admin" })).toBeVisible();
+    });
+
+
+    await test.step("role guidance starts, skips, resumes, resets and relaunches in context", async () => {
+      const ownerGuide = page.locator('[data-guidance-flow="core.owner-first-win"]');
+      await expect(ownerGuide.getByRole("heading", { name: "Win with the whole business loop" })).toBeVisible();
+      await expect(ownerGuide.getByRole("progressbar")).toHaveAttribute(
+        "aria-label",
+        "0 of 3 tasks complete",
+      );
+      await ownerGuide.getByRole("button", { name: "Start guide" }).click();
+      await expect(ownerGuide.getByRole("button", { name: "Skip for now" })).toBeVisible();
+
+      await page.goto("/admin/invitations");
+      await page.getByRole("link", { name: "Guided help" }).click();
+      await expect(page).toHaveURL(/\/admin\/guidance\?flow=core\.administrator-first-win/);
+      const adminGuide = page.locator('[data-guidance-flow="core.administrator-first-win"]');
+      await expect(adminGuide.getByRole("heading", { name: "Run the workspace" })).toBeVisible();
+      await adminGuide.getByRole("button", { name: "Skip for now" }).click();
+      await expect(adminGuide.getByText("Skipped for now")).toBeVisible();
+      await adminGuide.getByRole("button", { name: "Resume guide" }).click();
+      await expect(adminGuide.getByRole("button", { name: "Skip for now" })).toBeVisible();
+      await adminGuide.getByRole("button", { name: "Reset guide" }).click();
+      await expect(adminGuide.getByRole("progressbar")).toHaveAttribute(
+        "aria-label",
+        "0 of 2 tasks complete",
+      );
+      await page.goto("/admin");
+    });
+
+    await test.step("password and TOTP login take the real redirect path", async () => {
+      await page.getByRole("button", { name: "Sign out", exact: true }).click();
+      await expect(page).toHaveURL(/\/login$/);
+
+      await passwordSignIn(page, "definitely the wrong password");
+      await expect(page.getByText("Wrong email or password.")).toBeVisible();
+
+      await page.getByLabel("Password").fill(OLD_PASSWORD);
+      await page.getByRole("button", { name: "Sign in", exact: true }).click();
+      await expect(page).toHaveURL(/\/login\/verify$/);
+      // Enrolment consumed the current step; the verifier accepts the next
+      // step in its standard ±1 clock window and still proves replay defence.
+      const nextCode = totpCode(totpSecret, Math.floor(Date.now() / 30_000) + 1);
+      await page.getByLabel("Verification code").fill(nextCode);
+      await page.getByRole("button", { name: "Continue" }).click();
+      await expect(page).toHaveURL(/\/admin$/);
+    });
+
+    await test.step("offline payment and refund use the accessible shared money console", async () => {
+      // Seed only the issued-invoice prerequisite. The browser still drives the
+      // real Server Action and invoicing services for both money movements.
+      const contactId = randomUUID();
+      const invoiceId = randomUUID();
+      await db().insert(contacts).values({
+        id: contactId,
+        name: "Payment Journey",
+        email: "payment-journey@example.test",
+      });
+      await db().insert(invoices).values({
+        id: invoiceId,
+        contactId,
+        number: "INV-JOURNEY-001",
+        idempotencyKey: "browser-payment-invoice",
+        requestHash: createHash("sha256").update("browser-payment-invoice").digest("hex"),
+        status: "sent",
+        currency: "CAD",
+        subtotalMinor: 10_000,
+        discountMinor: 0,
+        shippingMinor: 0,
+        taxMinor: 0,
+        totalMinor: 10_000,
+        paidMinor: 0,
+        refundedMinor: 0,
+        issuedAt: new Date(),
+      });
+
+      await page.goto("/admin/payments");
+      await expect(page.getByRole("heading", { level: 1, name: "Payments" })).toBeVisible();
+      await expect(page.getByText("manual", { exact: true })).toBeVisible();
+      await page.getByLabel("Amount").first().fill("100.00");
+      await page.getByLabel("How this payment was verified").fill("Matched to the browser acceptance bank statement.");
+      await page.getByLabel("I confirm this money was received and the evidence is accurate.").check();
+      await page.getByRole("button", { name: "Record payment" }).click();
+      await expect(page).toHaveURL(/\/admin\/payments\?status=record/);
+      await expect(page.getByText("The payment ledger was updated.")).toBeVisible();
+      const [settled] = await db().select().from(payments).where(eq(payments.invoiceId, invoiceId));
+      expect(settled).toMatchObject({ provider: "manual", status: "succeeded", amountMinor: 10_000 });
+
+      await page.getByLabel("Amount", { exact: true }).fill("5.00");
+      await page.getByLabel("Refund reason").fill("Acceptance fixture partial refund");
+      await page.getByLabel("I confirm this refund amount and understand it moves real provider money when hosted.").check();
+      await page.getByRole("button", { name: "Submit refund" }).click();
+      await expect(page).toHaveURL(/\/admin\/payments\?status=refund/);
+      expect((await db().select().from(refunds).where(eq(refunds.paymentId, settled!.id)))[0]).toMatchObject({ provider: "manual", status: "succeeded", amountMinor: 500 });
+
+      const results = await new AxeBuilder({ page }).withTags(["wcag2a", "wcag2aa", "wcag21aa", "wcag22aa"]).analyze();
+      expect(results.violations).toEqual([]);
+    });
+
+    await test.step("admin invoices create and issue a draft, then install a tax starter", async () => {
+      await page.goto("/admin/invoices/new");
+      await expect(page.getByRole("heading", { name: "New invoice" })).toBeVisible();
+      await page.getByRole("combobox", { name: "Contact", exact: true }).selectOption({ label: "Payment Journey · payment-journey@example.test" });
+      await page.getByLabel("Line 1 description").fill("Discovery session");
+      await page.getByLabel("Line 1 unit amount").fill("50.00");
+      await page.getByRole("button", { name: "Create draft invoice" }).click();
+      await expect(page).toHaveURL(/\/admin\/invoices\/[0-9a-f-]+\?saved=created$/);
+      await expect(page.getByText("The draft invoice was created.")).toBeVisible();
+      await page.getByRole("button", { name: "Issue invoice" }).click();
+      await expect(page).toHaveURL(/\?saved=issue$/);
+      await expect(page.getByText("The invoice was issued.")).toBeVisible();
+      // By role, not by text: Next's route announcer (`__next-route-announcer__`)
+      // is an aria-live region that echoes the new page's heading after a
+      // client-side navigation, so a bare text match finds the heading *and*
+      // the announcement of it. The announcer is correct accessibility
+      // behaviour; the assertion was simply looser than what it meant.
+      await expect(page.getByRole("heading", { name: /^INV-/ })).toBeVisible();
+
+      await test.step("C5.25 customer invoice email, portal, offline payment and localized accessibility", async () => {
+        const id = new URL(page.url()).pathname.split("/").at(-1)!;
+        const [invoice] = await db().select().from(invoices).where(eq(invoices.id, id));
+        await page.getByRole("button", { name: "Email payment link", exact: true }).click();
+        await expect(page).toHaveURL(/\?saved=send(?:Preview)?$/);
+        const outbox = await db().select().from(mailOutbox).orderBy(desc(mailOutbox.createdAt));
+        const mail = outbox.map((row) => decryptMailOutbox(row.encryptedMessage, row.deliveryId)).find((body) => body.includes(`/portal/invoices/${id}?token=`));
+        expect(mail).toBeDefined();
+        const message = JSON.parse(mail!) as { text: string };
+        const link = message.text.split("\n").find((line) => line.includes(`/portal/invoices/${id}?token=`))!;
+        const path = new URL(link).pathname + new URL(link).search;
+        const [languagePolicy] = await db().select({ enabledLocales: businessProfile.enabledLocales }).from(businessProfile);
+        await db().update(businessProfile).set({ enabledLocales: ["en", "es", "fr"] });
+        for (const locale of ["en", "es", "fr"]) {
+          const t = translator(locale);
+          for (const theme of ["light", "dark"] as const) {
+            const visitor = await browser.newContext({ baseURL: new URL(page.url()).origin, viewport: { width: 390, height: 844 } });
+            try {
+              await visitor.addCookies([{ name: THEME_COOKIE, value: theme, url: new URL(page.url()).origin }]);
+              const customerPage = await visitor.newPage();
+              await customerPage.goto(`${locale === "en" ? "" : `/${locale}`}${path}`);
+              await expect(customerPage.getByRole("heading", { name: t("customerInvoice.title", { number: invoice!.number! }) })).toBeVisible();
+              await expect(customerPage.locator("html")).toHaveAttribute("lang", locale);
+              await expect(customerPage.locator("html")).toHaveAttribute("data-theme", theme);
+              await expect(customerPage).toHaveTitle(t("invoices.title"));
+              await expect(customerPage.getByRole("link", { name: t("app.invoice.return") })).toHaveAttribute("href", `freeholder://invoices?instance=${encodeURIComponent(new URL(customerPage.url()).origin)}`);
+              await customerPage.keyboard.press("Tab");
+              await expect(customerPage.getByRole("link", { name: t("a11y.skipToContent") })).toBeFocused();
+              await customerPage.screenshot({ path: test.info().outputPath(`customer-invoice-${locale}-${theme}.png`), fullPage: true });
+              const audit = await new AxeBuilder({ page: customerPage }).withTags(["wcag2a", "wcag2aa", "wcag21aa", "wcag22aa"]).analyze();
+              expect(audit.violations, `${locale}/${theme}`).toEqual([]);
+              await customerPage.getByRole("button", { name: t("customerInvoice.offline"), exact: true }).click();
+              await expect(customerPage.getByText(t("customerInvoice.offlineInstructions"), { exact: true })).toBeVisible();
+              expect((await db().select().from(invoices).where(eq(invoices.id, id)))[0]?.paidMinor).toBe(0);
+            } finally { await visitor.close(); }
+          }
+        }
+        // A session reaches the same page without exposing an email token in
+        // the portal list. The customer's own contact stays the identity.
+        const customerId = randomUUID();
+        await db().insert(users).values({ id: customerId, email: "invoice-customer@example.test", role: "customer" });
+        await db().update(contacts).set({ userId: customerId }).where(eq(contacts.id, invoice!.contactId));
+        const session = await db().transaction((tx) => createSession(tx, customerId));
+        const visitor = await browser.newContext({ baseURL: new URL(page.url()).origin });
+        try {
+          await visitor.addCookies([{ name: SESSION_COOKIE, value: session.token, url: new URL(page.url()).origin }]);
+          const customerPage = await visitor.newPage();
+          await customerPage.goto("/portal/invoices");
+          const entry = customerPage.getByRole("link", { name: invoice!.number!, exact: true });
+          await expect(entry).toHaveAttribute("href", `/portal/invoices/${id}`);
+          await entry.click();
+          await expect(customerPage.getByRole("button", { name: "Arrange offline payment" })).toBeVisible();
+          // Only the owner's verified offline receipt settles the amount.
+          await page.goto("/admin/payments");
+          await page.getByLabel(translator("en")("payments.invoice"), { exact: true }).first().selectOption(id);
+          await page.getByLabel("Amount", { exact: true }).first().fill("50.00");
+          await page.getByLabel("How this payment was verified").fill("Cash received and counted for the customer invoice journey.");
+          await page.getByLabel("I confirm this money was received and the evidence is accurate.").check();
+          await page.getByRole("button", { name: "Record payment", exact: true }).click();
+          await expect(page).toHaveURL(/\/admin\/payments\?status=record/);
+          await customerPage.reload();
+          await expect(customerPage.getByText("This invoice is no longer open for payment.", { exact: true })).toBeVisible();
+          expect((await db().select().from(invoices).where(eq(invoices.id, id)))[0]?.paidMinor).toBe(5_000);
+          // The loading boundary can start a 200 stream before notFound().
+          // Assert the rendered denial and absence of private invoice content.
+          await customerPage.goto(path);
+          // Was asserting Next's bare "404" heading, which is what the missing
+          // not-found route used to render — an empty body inside this site's
+          // own layout. This test had codified that. The denial is what matters
+          // and it still has to be a denial, so it now asserts the real page.
+          await expect(
+            customerPage.getByRole("heading", { name: translator("en")("notFound.title"), exact: true }),
+          ).toBeVisible();
+          await expect(customerPage.getByRole("heading", { name: translator("en")("customerInvoice.title", { number: invoice!.number! }), exact: true })).toHaveCount(0);
+          await expect(customerPage.getByRole("button", { name: "Arrange offline payment" })).toHaveCount(0);
+          const [receipt] = await db().select().from(payments).where(eq(payments.invoiceId, id));
+          await customerPage.goto(`/portal/invoices/confirmation/${paymentReturnToken(receipt!)}`);
+          await expect(customerPage).toHaveTitle("Payment confirmation");
+          await expect(customerPage.getByText(translator("en")("customerInvoice.succeeded"), { exact: true })).toBeVisible();
+          await expect(customerPage.getByRole("link", { name: translator("en")("app.invoice.return") })).toHaveAttribute("href", `freeholder://invoices?instance=${encodeURIComponent(new URL(customerPage.url()).origin)}`);
+          expect((await new AxeBuilder({ page: customerPage }).withTags(["wcag2a", "wcag2aa", "wcag21aa", "wcag22aa"]).analyze()).violations).toEqual([]);
+          // C10.29: the same contact reaches their gallery through the portal.
+          const [ownGallery] = await db().insert(galleries).values({ contactId: invoice!.contactId,
+            title: "Customer coastal proofs", slug: "customer-coastal-proofs", access: "login" }).returning();
+          const [otherGalleryContact] = await db().insert(contacts).values({ name: "Another customer", email: "other-gallery@example.test" }).returning();
+          await db().insert(galleries).values({ contactId: otherGalleryContact!.id, title: "Another customer's private proofs",
+            slug: "other-private-proofs", access: "login" });
+          for (const locale of ["en", "es", "fr"]) {
+            // Signed-in portal language follows the contact, above URL prefixes.
+            await db().update(contacts).set({ preferredLocale: locale }).where(eq(contacts.id, invoice!.contactId));
+            for (const theme of ["light", "dark"] as const) {
+              const prefix = locale === "en" ? "" : `/${locale}`;
+              await visitor.addCookies([{ name: THEME_COOKIE, value: theme, url: new URL(page.url()).origin }]);
+              await customerPage.goto(`${prefix}/portal/galleries`);
+              await expect(customerPage).toHaveTitle(translator(locale)("portal.room.galleries"));
+              await expect(customerPage.getByRole("heading", { name: translator(locale)("portal.room.galleries"), exact: true })).toBeVisible();
+              await expect(customerPage.locator("html")).toHaveAttribute("lang", locale);
+              await expect(customerPage.locator("html")).toHaveAttribute("data-theme", theme);
+              await expect(customerPage.getByRole("link", { name: ownGallery!.title, exact: true })).toHaveAttribute("href", `${prefix}/g/${ownGallery!.slug}`);
+              await expect(customerPage.getByText("Another customer's private proofs", { exact: true })).toHaveCount(0);
+              expect((await new AxeBuilder({ page: customerPage }).withTags(["wcag2a", "wcag2aa", "wcag21aa", "wcag22aa"]).analyze()).violations).toEqual([]);
+              await customerPage.screenshot({ path: test.info().outputPath(`customer-galleries-${locale}-${theme}.png`), fullPage: true });
+            }
+          }
+          await db().update(contacts).set({ preferredLocale: "en" }).where(eq(contacts.id, invoice!.contactId));
+          await customerPage.goto("/portal/galleries");
+          await customerPage.getByRole("link", { name: ownGallery!.title, exact: true }).click();
+          await customerPage.getByRole("button", { name: translator("en")("galleries.lock.login"), exact: true }).click();
+          await expect(customerPage.getByRole("heading", { name: ownGallery!.title, exact: true })).toBeVisible();
+        } finally {
+          await visitor.close();
+          await db().update(businessProfile).set({ enabledLocales: languagePolicy!.enabledLocales });
+        }
+      });
+
+      await page.goto("/admin/invoices/tax");
+      await expect(page.getByRole("heading", { name: "Tax setup" })).toBeVisible();
+      await page.getByRole("button", { name: "Install Alberta GST/HST" }).click();
+      await expect(page).toHaveURL(/\/admin\/invoices\/tax\?saved=install$/);
+      await expect(page.getByText("The tax starter was installed in monitoring mode.")).toBeVisible();
+      await expect(page.getByText("Installed").first()).toBeVisible();
+
+      const results = await new AxeBuilder({ page })
+        .withTags(["wcag2a", "wcag2aa", "wcag21aa", "wcag22aa"])
+        .analyze();
+      expect(results.violations).toEqual([]);
+    });
+
+    await test.step("admin catalog creates, activates and describes a real service product", async () => {
+      const [taxCategory] = await db()
+        .insert(taxCategories)
+        .values({ code: "journey_standard", name: "Journey standard taxable" })
+        .returning();
+      if (!taxCategory) throw new Error("The catalog journey tax category was not created.");
+
+      await page.goto("/admin/products/new");
+      await expect(page.getByRole("heading", { name: "New product" })).toBeVisible();
+      await page.getByLabel("Name").fill("Portrait session");
+      await page.getByLabel("Page link").fill("portrait-session");
+      await page.getByLabel("Product kind").selectOption("service");
+      await page.getByLabel("Tax category").selectOption(taxCategory.id);
+      await page.getByRole("button", { name: "Create draft product" }).click();
+      await expect(page).toHaveURL(/\/admin\/products\/[0-9a-f-]+\?saved=created$/);
+      await expect(page.getByRole("heading", { name: "Portrait session" })).toBeVisible();
+      await expect(page.getByText("The draft product was created.")).toBeVisible();
+
+      await page.getByRole("button", { name: "Activate product" }).click();
+      await expect(page).toHaveURL(/\?saved=activate$/);
+      await expect(page.getByText("The product is active.")).toBeVisible();
+
+      await page.getByLabel("Duration in minutes").fill("90");
+      await page.getByLabel("Where it happens").selectOption("in_person");
+      await page.getByRole("button", { name: "Save service offering" }).click();
+      await expect(page.getByText("The service offering was saved.")).toBeVisible();
+
+      await page.getByLabel("Option type name").fill("Size");
+      await page.getByLabel("Option type code").fill("size");
+      await page.getByRole("button", { name: "Create option type" }).click();
+      await expect(page.getByText("The option type was created.")).toBeVisible();
+      await page.getByLabel("Value name").fill("Small");
+      await page.getByLabel("SKU fragment").fill("s");
+      await page.getByRole("button", { name: "Add value" }).click();
+      await expect(page.getByText("The option value was added.")).toBeVisible();
+      await page.getByRole("button", { name: "Use on this product" }).click();
+      await expect(page.getByText("The option type was assigned to this product.")).toBeVisible();
+      await page.getByRole("checkbox", { name: /Small/ }).check();
+      await page.getByRole("button", { name: "Save selected values" }).click();
+      await expect(page.getByText("The selected option values were saved.")).toBeVisible();
+      await page.getByRole("button", { name: "Apply variant matrix" }).click();
+      await expect(page.getByText("The variant matrix was reconciled.")).toBeVisible();
+      await expect(page.getByText("portrait-session-s")).toBeVisible();
+
+      await page.getByRole("button", { name: "Add a block" }).click();
+      await page.getByRole("button", { name: "Heading", exact: true }).click();
+      await page.getByLabel("Text").fill("A thoughtful portrait experience");
+      await expect(page.getByRole("status")).toHaveText("Saved", { timeout: 15_000 });
+
+      const results = await new AxeBuilder({ page })
+        .withTags(["wcag2a", "wcag2aa", "wcag21aa", "wcag22aa"])
+        .analyze();
+      expect(results.violations).toEqual([]);
+    });
+
+    await test.step("form builder creates a public form", async () => {
+      await page.goto("/admin/forms/new");
+      await page.getByLabel("Form name").fill("Journey enquiry");
+      await page.getByLabel("Web address").fill("journey-enquiry");
+      await page.getByLabel("Button text").fill("Send journey");
+      await page.getByLabel("What to say afterwards").fill("Journey received.");
+      await page.getByRole("button", { name: "Save changes" }).click();
+      await expect(page).toHaveURL(/\/admin\/forms\/[0-9a-f-]+\/edit$/);
+      formId = new URL(page.url()).pathname.split("/")[3] ?? "";
+      expect(formId).toMatch(/^[0-9a-f-]{36}$/);
+      await expect(page.getByRole("heading", { name: "Journey enquiry" })).toBeVisible();
+    });
+
+    await test.step("block editor autosaves and publishing reaches the storefront", async () => {
+      await page.goto("/admin/pages/new");
+      await page.getByLabel("Title").fill("Journey Page");
+      await page.getByLabel("Web address").fill("journey");
+      await page.getByRole("button", { name: "Create page" }).click();
+      await expect(page).toHaveURL(/\/admin\/pages\/[0-9a-f-]+$/);
+
+      await page.getByRole("button", { name: "Add a block" }).click();
+      await page.getByRole("button", { name: "Heading", exact: true }).click();
+      await page.getByLabel("Text").fill("Start a journey");
+      await page.getByLabel("Size").selectOption("1");
+      await page.getByRole("button", { name: "Add a block" }).click();
+      await page.getByRole("button", { name: "Form", exact: true }).click();
+      await page.getByLabel("formSlug").fill("journey-enquiry");
+      await expect(page.getByRole("status")).toHaveText("Saved", { timeout: 15_000 });
+
+      await page.getByRole("button", { name: "Publish" }).click();
+      await expect(page.getByRole("button", { name: "Unpublish" })).toBeVisible();
+      await page.goto("/journey");
+      await expect(page.getByRole("heading", { name: "Start a journey" })).toBeVisible();
+      await expect(page.getByRole("button", { name: "Send journey" })).toBeVisible();
+    });
+
+    await test.step("sharing mints a tracked link and switching it off revokes the link", async () => {
+      await page.getByRole("button", { name: "Copy link", exact: true }).click();
+      await expect(page).toHaveURL(/\/journey\?shared=[a-z0-9]+$/);
+
+      const shared = new URL(page.url()).searchParams.get("shared");
+      expect(shared).toMatch(/^[a-z0-9]{10}$/);
+      const shareValue = await page
+        .getByLabel("Copy this and paste it anywhere.")
+        .inputValue();
+      const shortUrl = shareValue.match(/https?:\/\/\S+\/s\/[a-z0-9]+$/)?.[0];
+      expect(shortUrl).toBeTruthy();
+
+      await page.goto(shortUrl!);
+      const destination = new URL(page.url());
+      expect(destination.pathname).toBe("/journey");
+      expect(destination.searchParams.get("utm_source")).toBe("link");
+      expect(destination.searchParams.get("utm_medium")).toBe("share");
+      expect(destination.searchParams.get("utm_campaign")).toBe(`share:${shared}`);
+
+      await page.goto("/admin/sharing");
+      const journey = page.getByRole("row").filter({ hasText: "/journey" });
+      await journey.getByRole("button", { name: "Switch off", exact: true }).click();
+      await expect(page).toHaveURL(/\/admin\/sharing\?saved=1$/);
+      await expect(page.getByText("Saved.", { exact: true })).toBeVisible();
+
+      const revoked = await page.goto(shortUrl!);
+      expect(revoked?.status()).toBe(404);
+      await page.goto("/journey");
+      await expect(page.getByRole("heading", { name: "Share this" })).toHaveCount(0);
+      await expect(page.getByRole("button", { name: "Send journey" })).toBeVisible();
+    });
+
+    await test.step("a popup is composed, published, dismissed and then stays dismissed", async () => {
+      await page.goto("/admin/popups");
+      await page.getByLabel("Name").last().fill("Journey announcement");
+      await page.getByLabel("Handle").last().fill("journey-announcement");
+      await page.getByLabel("Heading").last().fill("A small announcement");
+      await page.getByLabel("Appears").last().selectOption("immediate");
+      await page.getByRole("button", { name: "Create it" }).click();
+      await expect(page).toHaveURL(/\/admin\/popups\/[0-9a-f-]+\?saved=1$/);
+
+      await page.getByRole("button", { name: "Add a block" }).click();
+      await page.getByRole("button", { name: "Heading", exact: true }).click();
+      await page.getByLabel("Text").fill("Only once after you close it");
+      await expect(page.getByRole("status")).toHaveText("Saved", { timeout: 15_000 });
+      await page.getByRole("button", { name: "Make it live" }).click();
+      // C11.15: creation already left ?saved=1 and its Saved message on this
+      // page. Wait for the committed status before navigation can interrupt
+      // the publish action; the old message proves only creation succeeded.
+      await expect(page.getByText("Live", { exact: true })).toBeVisible();
+
+      await page.goto("/journey");
+      await expect(page.getByRole("heading", { name: "A small announcement" })).toBeVisible();
+      const dismissed = page.waitForResponse(
+        (response) =>
+          response.url().endsWith("/api/popups") &&
+          response.request().postData()?.includes('"event":"dismissed"') === true,
+      );
+      await page.getByRole("button", { name: "Close" }).click();
+      expect((await dismissed).status()).toBe(200);
+      await page.reload();
+      await expect(page.getByRole("heading", { name: "A small announcement" })).toHaveCount(0);
+      await expect(page.getByRole("button", { name: "Send journey" })).toBeVisible();
+    });
+
+    await test.step("link in bio: set up, add a smart link, follow it, hide it", async () => {
+      // C9.39 end to end through the owner's screen: the page is created, a
+      // smart link to a page on this site is added from its picker, a visitor
+      // follows it through the first-party click door to the page with the
+      // link's campaign attached, and hiding it removes it and stops the door.
+      await page.goto("/admin/link-in-bio");
+      await page.getByLabel("Address").fill("links");
+      await page.getByLabel("Publish it straight away").check();
+      await page.getByRole("button", { name: "Create page" }).click();
+      await expect(page).toHaveURL(/\/admin\/link-in-bio\?saved=1/);
+
+      await page.getByLabel("Label", { exact: true }).fill("Start a journey");
+      await page.getByLabel("Links to", { exact: true }).selectOption("page");
+      await page.getByLabel("Page", { exact: true }).selectOption({ label: "Journey Page" });
+      await page.getByRole("button", { name: "Add link" }).click();
+      await expect(page).toHaveURL(/\/admin\/link-in-bio\?saved=1$/);
+      await expect(page.getByText("Showing", { exact: true })).toBeVisible();
+
+      await page.goto("/links");
+      const button = page.getByRole("link", { name: "Start a journey" });
+      const clickUrl = await button.getAttribute("href");
+      expect(clickUrl).toMatch(/^\/go\/link\/[a-z0-9]+\?from=%2Flinks$/);
+      await button.click();
+      await expect(page).toHaveURL(/\/journey\?/);
+      const landed = new URL(page.url());
+      expect(landed.searchParams.get("utm_medium")).toBe("link-in-bio");
+      expect(landed.searchParams.get("utm_campaign")).toMatch(/^bio:[a-z0-9]+$/);
+
+      await page.goto("/admin/link-in-bio");
+      await page.getByRole("button", { name: "Hide", exact: true }).click();
+      await expect(page).toHaveURL(/\/admin\/link-in-bio\?saved=1$/);
+      await expect(page.getByText("Hidden", { exact: true })).toBeVisible();
+      await page.goto("/links");
+      await expect(page.getByRole("link", { name: "Start a journey" })).toHaveCount(0);
+      const gone = await page.goto(clickUrl!);
+      expect(gone?.status()).toBe(404);
+      // The next step fills in the journey page's form.
+      await page.goto("/journey");
+    });
+
+    await test.step("public form creates a visible submission and contact", async () => {
+      // Let the signed form timestamp clear its intentional three-second trap.
+      await page.waitForTimeout(3_100);
+      await page.getByLabel("Your name").fill("Public Journey");
+      await page.getByLabel("Email").fill("public-journey@example.test");
+      await page.getByRole("button", { name: "Send journey" }).click();
+      await expect(page).toHaveURL(/\/journey\?sent=journey-enquiry$/);
+      await expect(page.getByText("Journey received.")).toBeVisible();
+
+      await page.goto(`/admin/forms/${formId}`);
+      await expect(page.getByText("Public Journey")).toBeVisible();
+      await expect(page.getByText("public-journey@example.test")).toBeVisible();
+      await expect(page.getByRole("link", { name: "Open contact" })).toBeVisible();
+    });
+
+    await test.step("contact entry uses the shared admin record", async () => {
+      await page.goto("/admin/contacts/new");
+      await page.getByLabel("Name").fill("Ada Journey");
+      await page.getByLabel("Email").fill("ada-journey@example.test");
+      await page.getByLabel("Phone").fill("+1 250 555 0199");
+      await page.getByLabel("Preferred language").selectOption("fr-CA");
+      await page.getByLabel("Time zone").selectOption("America/Vancouver");
+      await page.getByLabel("Country").fill("CA");
+      await page.getByRole("button", { name: "Add contact" }).click();
+      await expect(page).toHaveURL(/\/admin\/contacts\/[0-9a-f-]+$/);
+      await expect(page.getByRole("heading", { name: "Ada Journey" })).toBeVisible();
+      await expect(page.getByLabel("Email")).toHaveValue("ada-journey@example.test");
+      await page.locator("#lifecycleStage").selectOption("prospect");
+      await page.getByRole("button", { name: "Save changes" }).click();
+      await expect(page.getByText("Saved.")).toBeVisible();
+    });
+
+    await test.step("guidance completes only after the real business outcomes", async () => {
+      // The overview leads with the next unfinished first win once this one
+      // is done (2026-10-22 first-run audit); the completed record lives on
+      // the guides page.
+      await page.goto("/admin");
+      await expect(page.locator('[data-guidance-flow="core.owner-first-win"]')).toHaveCount(0);
+      await page.goto("/admin/guidance");
+      const ownerGuide = page.locator('[data-guidance-flow="core.owner-first-win"]');
+      await expect(ownerGuide.locator("header").getByText("Completed")).toBeVisible();
+      await expect(ownerGuide.getByRole("progressbar")).toHaveAttribute(
+        "aria-label",
+        "3 of 3 tasks complete",
+      );
+    });
+
+    await test.step("reviewed translation replaces source words on the locale route", async () => {
+      await page.goto("/admin/translations");
+      const row = page.getByRole("row", { name: /Journey Page/ });
+      await row.getByRole("link", { name: "Translate" }).click();
+      await page.locator('input[name="t.title"]').fill("Page parcours");
+      await page.locator('input[name="t.0.props.text"]').fill("Commencez un parcours");
+      await page
+        .getByRole("checkbox", {
+          name: "Checked by a person — show this to visitors",
+        })
+        .check();
+      await page.getByRole("button", { name: "Save changes" }).click();
+      await expect(
+        page.getByText("Saved. Your public site uses these straight away."),
+      ).toBeVisible();
+
+      await page.goto("/fr-CA/journey");
+      await expect(
+        page.getByRole("heading", { name: "Commencez un parcours" }),
+      ).toBeVisible();
+    });
+
+    let apiKey = "";
+    await test.step("owner mints a least-privilege API key", async () => {
+      await page.goto("/admin/settings");
+      await page.locator("#key-name").fill("Journey MCP");
+      await page.locator("#access-contacts").selectOption("full");
+      await page.getByRole("button", { name: "Create key" }).click();
+      const token = page
+        .locator("code")
+        .filter({ hasText: /^fh_live_[A-Za-z0-9_-]{43}$/ });
+      await expect(token).toBeVisible();
+      apiKey = (await token.textContent())?.trim() ?? "";
+      expect(apiKey).toMatch(/^fh_live_[A-Za-z0-9_-]+$/);
+    });
+
+    await test.step("that key discovers and invokes the live MCP server", async () => {
+      const headers = { authorization: `Bearer ${apiKey}` };
+      const listed = await page.request.post("/api/mcp", {
+        headers,
+        data: { jsonrpc: "2.0", id: 1, method: "tools/list" },
+      });
+      expect(listed.ok()).toBe(true);
+      const listBody = (await listed.json()) as {
+        result: { tools: Array<{ name: string }> };
+      };
+      expect(listBody.result.tools.map((tool) => tool.name)).toContain("contacts_list");
+      expect(listBody.result.tools.map((tool) => tool.name)).not.toContain("media_trash");
+
+      const called = await page.request.post("/api/mcp", {
+        headers,
+        data: {
+          jsonrpc: "2.0",
+          id: 2,
+          method: "tools/call",
+          params: {
+            name: "contacts_list",
+            arguments: { search: "Ada Journey" },
+          },
+        },
+      });
+      expect(called.ok()).toBe(true);
+      const callBody = (await called.json()) as {
+        result: {
+          isError: boolean;
+          structuredContent: { result: { rows: Array<{ email: string }> } };
+        };
+      };
+      expect(callBody.result.isError).toBe(false);
+      expect(callBody.result.structuredContent.result.rows).toEqual([
+        expect.objectContaining({ email: "ada-journey@example.test" }),
+      ]);
+    });
+
+    await test.step("password recovery revokes the session and recovery code restores access", async () => {
+      await page.goto("/forgot");
+      await page.getByLabel("Email").fill(OWNER_EMAIL);
+      await page.getByRole("button", { name: "Send the link" }).click();
+      await expect(
+        page.getByText(/If that address has an account, a reset link is on its way/),
+      ).toBeVisible();
+
+      const [pending] = await db()
+        .select({ id: passwordResets.id })
+        .from(passwordResets)
+        .orderBy(desc(passwordResets.createdAt))
+        .limit(1);
+      if (!pending) throw new Error("The forgot-password journey did not create a reset.");
+      await db()
+        .update(passwordResets)
+        .set({
+          tokenHash: createHash("sha256").update(RESET_TOKEN).digest("hex"),
+        })
+        .where(eq(passwordResets.id, pending.id));
+
+      await page.goto(`/reset?token=${encodeURIComponent(RESET_TOKEN)}`);
+      await page.getByLabel("New password").fill(NEW_PASSWORD);
+      await page
+        .getByRole("button", { name: "Set password and sign out everywhere" })
+        .click();
+      await expect(page.getByText("Password set. Sign in with it now.")).toBeVisible();
+
+      await page.getByRole("link", { name: "Back to sign in" }).click();
+      await page.getByLabel("Email").fill(OWNER_EMAIL);
+      await page.getByLabel("Password").fill(OLD_PASSWORD);
+      await page.getByRole("button", { name: "Sign in", exact: true }).click();
+      await expect(page.getByText("Wrong email or password.")).toBeVisible();
+
+      await page.getByLabel("Password").fill(NEW_PASSWORD);
+      await page.getByRole("button", { name: "Sign in", exact: true }).click();
+      await expect(page).toHaveURL(/\/login\/verify$/);
+      await page.getByLabel("Verification code").fill(recoveryCode);
+      await page.getByRole("button", { name: "Continue" }).click();
+      await expect(page).toHaveURL(/\/admin$/);
+      await expect(page.getByRole("navigation", { name: "Admin" })).toBeVisible();
+    });
+  });
+});

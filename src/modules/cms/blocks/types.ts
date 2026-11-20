@@ -1,0 +1,249 @@
+// Copyright (C) 2026 Tony Aly
+// SPDX-License-Identifier: Apache-2.0
+// The block contract (MASTER.md §32).
+//
+// "Typed blocks, never markup blobs": every block is a Zod-schema'd JSON node
+// rendered by a server component. §32 is explicit about why — stored HTML soup
+// "forfeits the SEO gate, sane migrations, and re-theming forever". A schema is
+// what lets the platform validate a tree it did not author, migrate a block
+// type without a find-and-replace over strings, and guarantee that what
+// reaches the page is semantic HTML.
+//
+// A block definition is the whole vocabulary entry: its name, its shape, and
+// how it renders. Plugins register new ones through the module manifest (§24)
+// and they appear in the editor palette with no editor changes, because the
+// palette is generated from this registry rather than hand-listed.
+import type { ReactNode } from "react";
+import type { z } from "zod";
+import type { Translate } from "@/core/i18n";
+import type { Actor } from "@/core/service";
+import type { FieldHint } from "./fields";
+import type { FormReturn } from "@/core/http/public-form-return";
+
+export type BlockContext = "page" | "chrome" | "email";
+
+/**
+ * What a block can see while rendering.
+ *
+ * Deliberately narrow. A block gets the request's locale and the business
+ * profile because those are properties of *where it is being rendered*; it
+ * does not get a database handle or the ability to call services at will.
+ * Who is looking is passed as `actor` so a paywall can ask a service about
+ * this person; the block still goes through `resolve` rather than querying
+ * itself. A block is a function from its validated props to semantic HTML.
+ */
+export interface BlockRenderContext {
+  locale: string;
+  t: Translate;
+  business: {
+    name: string;
+    tagline: string | null;
+    /** §4.9: what the language switcher offers, and what hreflang matches. */
+    defaultLocale?: string;
+    enabledLocales?: string[];
+  } | null;
+  /** Path currently being rendered, so nav can mark itself current. */
+  path: string;
+  /** Keep internal public/customer links in this render's selected locale. */
+  localizeHref?: (href: string) => string;
+  /**
+   * The URL's query, for blocks whose state survives a page load.
+   *
+   * Added for the form block, and kept deliberately narrow: a form that
+   * confirms a submission by re-rendering the page needs to know a submission
+   * just happened, and the alternative — a client component holding the result
+   * in state — would put the first hydration boundary on the public surface.
+   * §5 and the SEO gate both rest on that surface being plain server-rendered
+   * HTML, so a query parameter is the cheaper answer by a wide margin.
+   *
+   * Repeated keys stay arrays: the browse machinery (filter[option:size]=s&
+   * filter[option:size]=l) reads several values for one name, while a block
+   * asking "was this form just sent?" wants an answer, not an array — it
+   * compares, and a comparison with an array is simply false.
+   */
+  query?: Record<string, string | string[] | undefined>;
+  /**
+   * Wrap each block so the editor can trace a click back to a node.
+   *
+   * Only ever true inside the admin preview. The public surface renders
+   * unwrapped, so what a visitor and a crawler receive is exactly what the
+   * blocks produced — the SEO gate has to be checking the real markup, not a
+   * version with editor scaffolding in it.
+   */
+  identifyBlocks?: boolean;
+  /**
+   * Which of this block's props may be typed into directly on the canvas.
+   *
+   * A block marks a *text* element with `editable(prop)` and the renderer
+   * turns that into `contenteditable` — but only in the preview. The mechanism
+   * is the block's, because only the block knows which element shows which
+   * prop; the decision to allow it at all is the editor's.
+   */
+  editable?: (prop: string) => Record<string, string> | undefined;
+  /**
+   * Mark a *rich-text* region for canvas editing — a container whose children
+   * are the typed document's paragraphs and lists, as opposed to one flat
+   * string. The canvas serializes the region's DOM back to the typed document
+   * on input, so formatting the owner types inside marks survives; a plain
+   * `editable` region is plaintext-only by contrast. Preview-only, like
+   * `editable`.
+   */
+  editableRich?: (prop: string) => Record<string, string> | undefined;
+  /**
+   * Sticky experiment assignments for this visitor (C2.17). Server-side only;
+   * the public HTML contains the chosen variant, never a client swap.
+   */
+  experimentAssignments?: Readonly<Record<string, string>>;
+  /** First-party visitor id used to assign variants when no assignment exists. */
+  visitorId?: string | null;
+  /**
+   * Who is looking, so a paywall can ask entitlements about this person.
+   * Absent means anonymous. Never a database handle: the block still goes
+   * through `resolve` / a service rather than querying itself.
+   */
+  actor?: Actor;
+  /**
+   * Visitor's `fh_tc` choice for third-party creatives (C9.20). Only
+   * `granted` emits somebody else's script. Absent means they have not
+   * chosen yet.
+   */
+  thirdPartyConsent?: "granted" | "denied";
+  /** Request CSP nonce, so a reviewed tag's inline scripts can run. */
+  cspNonce?: string;
+  /**
+   * The request's guest-cart snapshot, for the cart widget block (C3.25).
+   * A loader rather than a value so a chrome tree without the widget costs
+   * nothing; absent means "no request cart to show" (emails, previews) and
+   * the widget renders nothing. The routing layer owns reading the cookie —
+   * blocks never touch the jar themselves (§10).
+   */
+  shopperCart?: () => Promise<ShopperCartSnapshot | null>;
+  /**
+   * The visitor's own answers to a public form that was just refused, so the
+   * form re-renders filled in rather than empty (see
+   * `src/core/http/public-form-return.ts`). The routing layer reads the
+   * cookie; a block only compares the key with its own.
+   */
+  formReturn?: FormReturn | null;
+}
+
+/**
+ * The cart-widget's view of the caller's cart: counts and line totals only.
+ * Deliberately no ids, tokens or contact data — what the chrome needs and
+ * nothing the chrome must not print.
+ */
+export interface ShopperCartSnapshot {
+  currency: string;
+  lineCount: number;
+  subtotalMinor: number;
+  lines: Array<{
+    variantId: string;
+    productName: string;
+    quantity: number;
+    lineTotalMinor: number | null;
+  }>;
+}
+
+/**
+ * One entry in the vocabulary.
+ *
+ * `resolve` exists for blocks whose content is *live* rather than authored —
+ * a nav that lists published pages, a brand that reads the business name. It
+ * runs before render, on the server, and its result is passed to `render`.
+ * Blocks without one are pure and render straight from their props.
+ */
+export interface BlockDefinition<
+  Props extends z.ZodType = z.ZodType,
+  Resolved = void,
+> {
+  /** Stable identifier, stored in the tree. Renaming one is a migration. */
+  type: string;
+  /** Catalog key for the editor palette — copy, so it is not a literal. */
+  labelKey: string;
+  /** Where this block may be used. Email excludes interactive blocks (§32). */
+  contexts: ReadonlyArray<BlockContext>;
+  schema: Props;
+  /**
+   * The props a freshly added block starts with.
+   *
+   * Required rather than derived, because a schema cannot invent copy: a
+   * heading's `text` has no default and `""` fails its own `min(1)`, so
+   * deriving would produce a block that cannot be saved the moment it is
+   * added. Starter values are placeholder content the owner immediately
+   * replaces, which is a different thing from a default.
+   */
+  starter: () => z.input<Props>;
+  /**
+   * Per-field editing hints — that a string is a paragraph, that a field is
+   * machinery. On the block rather than in the editor, so a plugin carries its
+   * own (§24).
+   */
+  fieldHints?: Record<string, FieldHint>;
+  /** True when this block holds other blocks, so the tree walker recurses. */
+  container?: boolean;
+  /**
+   * When this returns false, children are not rendered at all (C2.10).
+   * The paywall uses it so gated copy is never present in the HTML.
+   */
+  includeChildren?: (args: {
+    props: z.output<Props>;
+    ctx: BlockRenderContext;
+    resolved: Resolved;
+  }) => boolean | Promise<boolean>;
+  /**
+   * Pick which child nodes to render (C2.17). The public surface returns one
+   * variant; the editor preview returns all of them.
+   */
+  selectChildren?: (args: {
+    props: z.output<Props>;
+    children: BlockNode[];
+    ctx: BlockRenderContext;
+    resolved: Resolved;
+  }) => BlockNode[];
+  resolve?: (
+    props: z.output<Props>,
+    ctx: BlockRenderContext,
+  ) => Promise<Resolved>;
+  render: (args: {
+    props: z.output<Props>;
+    ctx: BlockRenderContext;
+    resolved: Resolved;
+    /** Rendered children, for container blocks. */
+    children?: ReactNode;
+  }) => ReactNode;
+  /**
+   * JSON-LD this block contributes to the page it is on (§5: "FAQPage/HowTo
+   * where blocks warrant"). Returning a value is how a block earns structured
+   * data without the SEO layer knowing what an FAQ is.
+   */
+  jsonLd?: (props: z.output<Props>) => Record<string, unknown> | undefined;
+}
+
+/** A node in a stored tree. Children are only meaningful on containers. */
+export interface BlockNode {
+  id: string;
+  type: string;
+  props: Record<string, unknown>;
+  children?: BlockNode[];
+}
+
+/**
+ * The first value of a query parameter.
+ *
+ * Blocks that ask a yes/no question ("was this form just sent?") want an
+ * answer, not an array — a comparison with an array is simply false. The
+ * browse machinery reads repeated keys whole; everything else reads the
+ * first value, which is what a repeated key never means on those params.
+ */
+export function firstQueryValue(
+  value: string | string[] | undefined,
+): string | undefined {
+  return Array.isArray(value) ? value[0] : value;
+}
+
+/** Helper that keeps a definition's generics inferred rather than widened. */
+export function defineBlock<Props extends z.ZodType, Resolved = void>(
+  definition: BlockDefinition<Props, Resolved>,
+): BlockDefinition<Props, Resolved> {
+  return definition;
+}

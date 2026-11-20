@@ -1,0 +1,37 @@
+{
+  "name": "@freeholder/templates",
+  "version": "0.2.0-beta.6",
+  "description": "Bench-token business presets with full page, entity and email trees for Freeholder",
+  "license": "Apache-2.0",
+  "author": "Tony Aly <tony@paradisemodern.com> (https://tonyaly.com)",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/CampDenman/freeholder.git",
+    "directory": "packages/templates"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=20.19"
+  },
+  "main": "dist/presets.js",
+  "types": "dist/presets.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/presets.d.ts",
+      "import": "./dist/presets.js"
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test"
+  }
+}

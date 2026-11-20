@@ -1,0 +1,185 @@
+// Copyright (C) 2026 Tony Aly
+// SPDX-License-Identifier: Apache-2.0
+// Doctor, in the admin (MASTER.md §17).
+//
+// The same report the CLI prints and the recipe matrix asserts on, because it
+// is the same service. An owner should not have to open a terminal to find out
+// that their bucket stopped accepting uploads.
+import type { Metadata } from "next";
+import {
+  CheckCircle,
+  WarningCircle,
+  XCircle,
+} from "@phosphor-icons/react/dist/ssr";
+import { formatDateTime } from "@/core/i18n";
+import { doctor } from "@/core/doctor/service";
+import { platformVersion } from "@/core/portability/service";
+import { currentBusiness } from "@/core/settings/read";
+import { Callout, Card, CardBody, CardHeader, Pill } from "@/ui/primitives";
+import { getT } from "../../../i18n";
+import { requireStaffActor } from "../guard";
+import { listCspViolations } from "@/core/security/csp-reports";
+
+export const dynamic = "force-dynamic";
+export const metadata: Metadata = { robots: { index: false, follow: false } };
+
+type DoctorCheck = Awaited<ReturnType<typeof doctor.call>>["checks"][number];
+
+/**
+ * A check that carries a catalog message, shown in the owner's language.
+ * Literal keys, one per message, so the i18n gate can see every one of them.
+ */
+function localized(
+  check: DoctorCheck,
+  t: Awaited<ReturnType<typeof getT>>,
+): DoctorCheck {
+  const params = check.message?.params ?? {};
+  switch (check.message?.key) {
+    case "doctor.pluginPermissions.review":
+      return { ...check, title: t("doctor.pluginPermissions.title"), detail: t("doctor.pluginPermissions.review", params), remedy: t("doctor.pluginPermissions.remedy") };
+    case "doctor.pluginTrust.failed":
+      return { ...check, title: t("doctor.pluginTrust.title"), detail: t("doctor.pluginTrust.failed", params), remedy: t("doctor.pluginTrust.remedy") };
+    case "doctor.timeZone.agree":
+      return { ...check, title: t("doctor.timeZone.title"), detail: t("doctor.timeZone.agree", params) };
+    case "doctor.timeZone.disagree":
+      return {
+        ...check,
+        title: t("doctor.timeZone.title"),
+        detail: t("doctor.timeZone.disagree", params),
+        remedy: t("doctor.timeZone.disagreeRemedy", params),
+      };
+    case "doctor.timeZone.unknown":
+      return {
+        ...check,
+        title: t("doctor.timeZone.title"),
+        detail: t("doctor.timeZone.unknown", params),
+        remedy: t("doctor.timeZone.unknownRemedy", params),
+      };
+    case "doctor.timeZone.unreadable":
+      return {
+        ...check,
+        title: t("doctor.timeZone.title"),
+        detail: t("doctor.timeZone.unreadable", params),
+        remedy: t("doctor.timeZone.unreadableRemedy", params),
+      };
+    default:
+      return check;
+  }
+}
+
+export default async function HealthPage() {
+  const actor = await requireStaffActor("platform");
+  const [report, business, violations, t, version] = await Promise.all([
+    doctor.call({}, actor),
+    currentBusiness(),
+    listCspViolations.call({ days: 7, limit: 20 }, actor),
+    getT(),
+    platformVersion.call({}, actor),
+  ]);
+
+  const icon = {
+    ok: <CheckCircle size={17} weight="fill" className="text-success" />,
+    warn: <WarningCircle size={17} weight="fill" className="text-warning" />,
+    fail: <XCircle size={17} weight="fill" className="text-danger" />,
+  };
+  const tone = { ok: "success", warn: "warning", fail: "danger" } as const;
+
+  return (
+    <div className="grid gap-6">
+      <div>
+        <h1 className="text-xl font-bold tracking-tight">{t("doctor.title")}</h1>
+        <p className="mt-1 max-w-prose text-sm text-ink-muted">
+          {t("doctor.intro")}
+        </p>
+        <p className="mt-2 font-mono text-xs text-ink-muted">
+          {t("doctor.version", { version: String(version.version) })}
+        </p>
+      </div>
+
+      <Callout tone={tone[report.verdict]} icon={icon[report.verdict]}>
+        {t(`doctor.${report.verdict}`)}
+      </Callout>
+
+      <Card>
+        <CardHeader
+          title={t("doctor.ranAt")}
+          status={
+            <Pill tone="neutral">
+              {formatDateTime(
+                new Date(report.ranAt),
+                business?.timezone ?? "UTC",
+                business?.defaultLocale ?? "en",
+              )}
+            </Pill>
+          }
+        />
+        <CardBody>
+          <ul className="grid list-none gap-4 p-0">
+            {report.checks.map((each) => localized(each, t)).map((check) => (
+              <li key={check.id} className="grid gap-1">
+                <span className="flex items-center gap-2 text-sm font-semibold text-ink">
+                  {icon[check.verdict]}
+                  {check.title}
+                </span>
+                <span className="max-w-prose text-sm text-ink-muted">
+                  {check.detail}
+                </span>
+                {check.remedy ? (
+                  <span className="max-w-prose text-sm text-ink">
+                    <span className="font-medium">{t("doctor.remedy")}: </span>
+                    {check.remedy}
+                  </span>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+        </CardBody>
+      </Card>
+
+      <Card>
+        <CardHeader title={t("csp.violations.title")} />
+        <CardBody>
+          <p className="mb-4 max-w-prose text-sm text-ink-muted">
+            {t("csp.violations.intro")}
+          </p>
+          {violations.length === 0 ? (
+            <p className="text-sm text-ink-muted">{t("csp.violations.empty")}</p>
+          ) : (
+            <ul className="grid list-none gap-4 p-0">
+              {violations.map((violation) => (
+                <li
+                  key={violation.fingerprint}
+                  className="grid gap-1 border-b border-rule pb-4 last:border-0"
+                >
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Pill tone={violation.disposition === "enforce" ? "warning" : "neutral"}>
+                      {violation.effectiveDirective}
+                    </Pill>
+                    <span className="font-mono text-xs text-ink">
+                      {violation.documentPath}
+                    </span>
+                    <span className="ms-auto text-xs text-ink-muted">
+                      {t("csp.violations.count", { count: violation.occurrences })}
+                    </span>
+                  </div>
+                  <span className="font-mono text-xs text-ink-muted">
+                    {t("csp.violations.blocked", { source: violation.blockedSource })}
+                  </span>
+                  <span className="text-xs text-ink-muted">
+                    {t("csp.violations.lastSeen", {
+                      value: formatDateTime(
+                        violation.lastAt,
+                        business?.timezone ?? "UTC",
+                        business?.defaultLocale ?? "en",
+                      ),
+                    })}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </CardBody>
+      </Card>
+    </div>
+  );
+}

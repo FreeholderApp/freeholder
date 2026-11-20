@@ -1,0 +1,1052 @@
+// Copyright (C) 2026 Tony Aly
+// SPDX-License-Identifier: Apache-2.0
+// Persistent contact-attached carts and wishlists (C5.20).
+//
+// A guest cart is a token. Identifying a contact merges that token into the
+// contact's open cart so a phone and a laptop become one basket. Prices and
+// stock are refreshed on every read; they are never stored as truth.
+
+import { and, asc, desc, eq, inArray, isNull, lt, sql } from "drizzle-orm";
+import { z } from "zod";
+import { listed, okResult, row, timestamp, uuid } from "@/core/contract";
+import { contacts } from "@/core/contacts/schema";
+import { registerContactReference } from "@/core/contacts/service";
+import { registerContactPrivacySource } from "@/core/privacy/service";
+import { env } from "@/core/env";
+import {
+  defineService,
+  hasModuleAccess,
+  permits,
+  ServiceError,
+  type Actor,
+  type ServiceContext,
+  type Tx,
+} from "@/core/service";
+import { managesCartTokens, requireCartAccess, requireOwnedContact, shopperClientKey } from "./cart-access";
+import { CART_KINDS, CART_STATUSES } from "./contract";
+import { availabilityForCart } from "./inventory";
+import { lockCartStock, mergeCartStock, reconcileCartStock, releaseCartStock } from "./cart-stock";
+import { resolvePrice } from "./pricing";
+import { cartItems, carts, productVariants, products, wishlistItems, wishlists } from "./schema";
+import { assertSellable } from "./market";
+import { hashCatalogShareToken, newCatalogShareToken } from "./tokens";
+
+const id = z.string().uuid();
+const currency = z.string().trim().toUpperCase().regex(/^[A-Z]{3}$/);
+const ABANDON_AFTER_MS = 24 * 60 * 60 * 1000;
+
+const cartRow = row({
+  id: uuid,
+  token: z.string().nullable(),
+  contactId: uuid.nullable(),
+  currency: z.string(),
+  kind: z.enum(CART_KINDS),
+  status: z.enum(CART_STATUSES),
+  name: z.string().nullable(),
+  lastActivityAt: timestamp,
+  abandonedAt: timestamp.nullable(),
+  createdAt: timestamp,
+  updatedAt: timestamp,
+});
+const cartStock = z.discriminatedUnion("tracked", [
+  z.object({
+    tracked: z.literal(false),
+    available: z.boolean(),
+    quantity: z.number().int().optional(),
+  }),
+  z.object({
+    tracked: z.literal(true),
+    available: z.boolean(),
+    backordered: z.boolean(),
+    restockAt: timestamp.nullable(),
+    onHand: z.number().int(),
+    reserved: z.number().int(),
+    incoming: z.number().int(),
+    canPromise: z.number().int(),
+  }),
+]);
+const cartLineRow = row({
+  id: uuid,
+  cartId: uuid,
+  variantId: uuid,
+  productId: uuid,
+  locationId: uuid.nullable(),
+  quantity: z.number().int(),
+  reservationId: uuid.nullable(),
+  galleryId: uuid.nullable(),
+  assetId: uuid.nullable(),
+  createdAt: timestamp,
+  updatedAt: timestamp,
+  sku: z.string(),
+  productName: z.string(),
+  requiresShipping: z.boolean(),
+  weightG: z.number().int().nullable(),
+  lengthMm: z.number().int().nullable(),
+  widthMm: z.number().int().nullable(),
+  heightMm: z.number().int().nullable(),
+  unitAmountMinor: z.number().int().nullable(),
+  lineTotalMinor: z.number().int().nullable(),
+  priceAvailable: z.boolean(),
+  priceReason: z.string().nullable(),
+  stock: cartStock,
+});
+const cartProjection = z.object({
+  cart: cartRow,
+  lines: listed(cartLineRow),
+  subtotalMinor: z.number().int(),
+  allPriced: z.boolean(),
+  allAvailable: z.boolean(),
+});
+const wishlistRow = row({
+  id: uuid,
+  contactId: uuid,
+  name: z.string(),
+  createdAt: timestamp,
+  updatedAt: timestamp,
+});
+const wishlistItemRow = row({
+  id: uuid,
+  variantId: uuid,
+  sku: z.string(),
+  productName: z.string(),
+});
+
+async function lockCartRows(tx: Tx, ids: string[]) {
+  if (ids.length) await tx.select({ id: carts.id }).from(carts).where(inArray(carts.id, [...new Set(ids)])).orderBy(asc(carts.id)).for("update");
+}
+
+async function mergeCartLines(tx: Tx, fromCartId: string, toCartId: string) {
+  const incoming = await tx.select().from(cartItems).where(eq(cartItems.cartId, fromCartId));
+  for (const line of incoming) {
+    const [already] = await tx
+      .select()
+      .from(cartItems)
+      .where(and(eq(cartItems.cartId, toCartId), eq(cartItems.variantId, line.variantId), line.assetId ? eq(cartItems.assetId, line.assetId) : isNull(cartItems.assetId)))
+      .limit(1);
+    if (already) {
+      await tx
+        .update(cartItems)
+        .set({ quantity: already.quantity + line.quantity, locationId: already.locationId ?? line.locationId, updatedAt: sql`now()` })
+        .where(eq(cartItems.id, already.id));
+      await tx.delete(cartItems).where(eq(cartItems.id, line.id));
+    } else {
+      await tx.update(cartItems).set({ cartId: toCartId, updatedAt: sql`now()` }).where(eq(cartItems.id, line.id));
+    }
+  }
+}
+
+registerContactReference({
+  table: "carts",
+  repoint: async (tx, from, to, context) => {
+    if (context && context.tx !== tx) throw new ServiceError("internal", "The contact merge transaction does not match its service context.");
+    const affected = await tx.select({ id: carts.id }).from(carts).where(inArray(carts.contactId, [from, to]));
+    await lockCartRows(tx, affected.map(cart => cart.id));
+    if (context) await lockCartStock(context, affected.map(cart => cart.id));
+    const incoming = await tx.select().from(carts).where(eq(carts.contactId, from));
+    const openTargets = await tx
+      .select()
+      .from(carts)
+      .where(and(eq(carts.contactId, to), eq(carts.status, "open"), eq(carts.kind, "cart")));
+    const byCurrency = new Map(openTargets.map((row) => [row.currency, row]));
+    for (const cart of incoming) {
+      const target = cart.status === "open" && cart.kind === "cart" ? byCurrency.get(cart.currency) : undefined;
+      if (target) {
+        if (!context) throw new ServiceError("internal", "Merging cart stock requires its transactional service context.");
+        await mergeCartLines(tx, cart.id, target.id);
+        await mergeCartStock(context, cart.id, target.id);
+        await tx
+          .update(carts)
+          .set({ status: "converted", contactId: to, updatedAt: sql`now()` })
+          .where(eq(carts.id, cart.id));
+      } else {
+        await tx.update(carts).set({ contactId: to, updatedAt: sql`now()` }).where(eq(carts.id, cart.id));
+        if (cart.status === "open" && cart.kind === "cart") {
+          byCurrency.set(cart.currency, { ...cart, contactId: to });
+        }
+      }
+    }
+  },
+  captureForUndo: async (tx, duplicateId, survivingId) => {
+    const rows = await tx
+      .select({ id: carts.id })
+      .from(carts)
+      .where(inArray(carts.contactId, [duplicateId, survivingId]));
+    return {
+      state: rows,
+      undoable: rows.length === 0,
+      blocker:
+        rows.length > 0
+          ? "Open carts were merged and cannot be split back apart safely."
+          : undefined,
+    };
+  },
+  restoreAfterUndo: async () => undefined,
+});
+
+registerContactReference({
+  table: "wishlists",
+  repoint: async (tx, from, to) => {
+    const [duplicate] = await tx.select().from(wishlists).where(eq(wishlists.contactId, from)).limit(1);
+    const [surviving] = await tx.select().from(wishlists).where(eq(wishlists.contactId, to)).limit(1);
+    if (duplicate && surviving) {
+      const items = await tx.select().from(wishlistItems).where(eq(wishlistItems.wishlistId, duplicate.id));
+      for (const item of items) {
+        await tx
+          .insert(wishlistItems)
+          .values({ wishlistId: surviving.id, variantId: item.variantId })
+          .onConflictDoNothing({ target: [wishlistItems.wishlistId, wishlistItems.variantId] });
+      }
+      await tx.delete(wishlists).where(eq(wishlists.id, duplicate.id));
+      return;
+    }
+    if (duplicate) {
+      await tx.update(wishlists).set({ contactId: to }).where(eq(wishlists.id, duplicate.id));
+    }
+  },
+  captureForUndo: async (tx, duplicateId, survivingId) => {
+    const rows = await tx
+      .select({ id: wishlists.id })
+      .from(wishlists)
+      .where(inArray(wishlists.contactId, [duplicateId, survivingId]));
+    return {
+      state: rows,
+      undoable: rows.length === 0,
+      blocker:
+        rows.length > 0
+          ? "Wishlists were merged and cannot be split back apart safely."
+          : undefined,
+    };
+  },
+  restoreAfterUndo: async () => undefined,
+});
+
+registerContactPrivacySource({
+  scope: "catalog.carts",
+  tables: ["carts", "cart_items"],
+  exportData: async (tx: Tx, contactId: string) =>
+    tx
+      .select({ id: carts.id, currency: carts.currency, status: carts.status, kind: carts.kind })
+      .from(carts)
+      .where(eq(carts.contactId, contactId)),
+  erase: async (tx: Tx, contactId: string) => {
+    const rows = await tx
+      .update(carts)
+      .set({ contactId: null, status: "abandoned", abandonedAt: sql`now()` })
+      .where(eq(carts.contactId, contactId))
+      .returning({ id: carts.id });
+    return { affected: rows.length };
+  },
+});
+
+registerContactPrivacySource({
+  scope: "catalog.wishlists",
+  tables: ["wishlists", "wishlist_items"],
+  exportData: async (tx: Tx, contactId: string) =>
+    tx
+      .select({ id: wishlists.id, name: wishlists.name })
+      .from(wishlists)
+      .where(eq(wishlists.contactId, contactId)),
+  erase: async (tx: Tx, contactId: string) => {
+    const rows = await tx
+      .delete(wishlists)
+      .where(eq(wishlists.contactId, contactId))
+      .returning({ id: wishlists.id });
+    return { affected: rows.length };
+  },
+});
+
+async function requireContact(tx: Tx, contactId: string) {
+  const [row] = await tx.select({ id: contacts.id }).from(contacts).where(eq(contacts.id, contactId)).limit(1);
+  if (!row) throw new ServiceError("not_found", "That contact is not here.");
+}
+
+/**
+ * Naming a contact is a claim of authority over that contact's basket: the
+ * caller can read it back and put lines in it. A UUID is an identifier, not
+ * a credential, so an anonymous visitor who has one proves nothing. Staff
+ * with catalog access, system composition and catalog-scoped agent keys
+ * carry real authority; the storefront paths that identify a customer
+ * (signed form submission, magic link, the future portal session) compose
+ * through services that verify first and elevate with ctx.callAsSystem.
+ */
+export function requireContactAuthority(ctx: ServiceContext, serviceName: string) {
+  if (permits(ctx.actor, "scoped", serviceName, "mutation")) return;
+  throw new ServiceError(
+    "permission",
+    "Sign in, or open the link we emailed you, to use a saved customer profile.",
+  );
+}
+
+async function loadCart(tx: Tx, cartId: string) {
+  const [cart] = await tx.select().from(carts).where(eq(carts.id, cartId)).limit(1);
+  if (!cart) throw new ServiceError("not_found", "That cart is not here.");
+  return cart;
+}
+
+export const getOrCreateCart = defineService({
+  name: "catalog.getOrCreateCart",
+  summary: "Open a guest or authorized contact cart and issue its private access token.",
+  kind: "mutation",
+  permission: "public",
+  // Opening carts is bounded per shopper, so fresh carts cannot reset limits
+  // that other cart services count (C11.10). Staff are not limited.
+  rateLimit: {
+    limit: 60,
+    windowSeconds: 10 * 60,
+    message: "Too many carts opened. Wait a few minutes and try again.",
+    subject: (_input, actor) => (managesCartTokens(actor) ? undefined : `cart-open:${shopperClientKey(actor).key}`),
+  },
+  input: z.object({
+    token: z.string().uuid().optional(),
+    contactId: id.optional(),
+    currency,
+  }),
+  output: cartProjection,
+  handler: async (input, ctx) => {
+    if (input.contactId) {
+      await requireOwnedContact(ctx, input.contactId, "catalog.getOrCreateCart", "mutation");
+      await requireContact(ctx.tx, input.contactId);
+    }
+    const [byToken] = input.token
+      ? await ctx.tx.select().from(carts).where(eq(carts.token, input.token)).limit(1)
+      : [];
+    if (byToken && byToken.status === "open" && byToken.kind === "cart") {
+      if (input.contactId && byToken.contactId !== input.contactId) {
+        return ctx.callAsSystem(attachCartToContact, {
+          token: input.token!,
+          contactId: input.contactId,
+        });
+      }
+      return projectCart(ctx, byToken.id, true);
+    }
+    if (input.contactId) {
+      const [existing] = await ctx.tx
+        .select()
+        .from(carts)
+        .where(
+          and(
+            eq(carts.contactId, input.contactId),
+            eq(carts.status, "open"),
+            eq(carts.kind, "cart"),
+            eq(carts.currency, input.currency),
+          ),
+        )
+        .limit(1);
+      if (existing) return projectCart(ctx, existing.id, true);
+    }
+    const [created] = await ctx.tx
+      .insert(carts)
+      .values({
+        token: byToken ? crypto.randomUUID() : (input.token ?? crypto.randomUUID()),
+        contactId: input.contactId ?? null,
+        currency: input.currency,
+      })
+      .returning();
+    ctx.setSubject("cart", created!.id);
+    ctx.queueEvent("catalog.cartOpened", { cartId: created!.id });
+    return projectCart(ctx, created!.id, true);
+  },
+});
+
+export const attachCartToContact = defineService({
+  name: "catalog.attachCartToContact",
+  summary: "Merge a guest cart into the contact's open cart.",
+  kind: "mutation",
+  permission: "public",
+  input: z.object({ token: z.string().uuid(), contactId: id }),
+  output: cartProjection,
+  handler: async (input, ctx) => {
+    const own = await requireOwnedContact(ctx, input.contactId, "catalog.attachCartToContact", "mutation");
+    await requireContact(ctx.tx, input.contactId);
+    let [guest] = await ctx.tx.select().from(carts).where(eq(carts.token, input.token)).limit(1);
+    if (!guest || guest.status !== "open" || guest.kind !== "cart") {
+      throw new ServiceError("not_found", "That guest cart is not here.");
+    }
+    let [owned] = await ctx.tx
+      .select()
+      .from(carts)
+      .where(
+        and(
+          eq(carts.contactId, input.contactId),
+          eq(carts.status, "open"),
+          eq(carts.kind, "cart"),
+          eq(carts.currency, guest.currency),
+          sql`${carts.id} <> ${guest.id}`,
+        ),
+      )
+      .limit(1);
+    await lockCartRows(ctx.tx, [guest.id, ...(owned ? [owned.id] : [])]);
+    [guest] = await ctx.tx.select().from(carts).where(eq(carts.id, guest.id)).limit(1);
+    if (!guest || guest.token !== input.token || guest.status !== "open" || guest.kind !== "cart") throw new ServiceError("conflict", "That guest cart changed; try again.");
+    if (owned) {
+      [owned] = await ctx.tx.select().from(carts).where(eq(carts.id, owned.id)).limit(1);
+      if (!owned || owned.contactId !== input.contactId || owned.status !== "open" || owned.kind !== "cart" || owned.currency !== guest.currency) throw new ServiceError("conflict", "The saved cart changed; try again.");
+    }
+    if (!owned) {
+      await ctx.tx
+        .update(carts)
+        .set({ contactId: input.contactId, lastActivityAt: sql`now()`, updatedAt: sql`now()` })
+        .where(eq(carts.id, guest.id));
+      return projectCart(ctx, guest.id, own);
+    }
+    await mergeCartLines(ctx.tx, guest.id, owned.id);
+    await mergeCartStock(ctx, guest.id, owned.id);
+    await ctx.tx
+      .update(carts)
+      .set({ status: "converted", contactId: input.contactId, updatedAt: sql`now()` })
+      .where(eq(carts.id, guest.id));
+    return projectCart(ctx, owned.id, own);
+  },
+});
+
+export const addCartItem = defineService({
+  name: "catalog.addCartItem",
+  summary: "Add or increase a variant on an open cart and hold tracked stock.",
+  kind: "mutation",
+  permission: "public",
+  input: z.object({
+    cartId: id,
+    cartToken: z.string().uuid().optional(),
+    variantId: id,
+    quantity: z.number().int().min(1).max(1_000_000).default(1),
+    locationId: id.optional(),
+    /**
+     * Where this line came from, when it came from a gallery (§4.5,
+     * C8.08). Supplied together or not at all, and the reason gallery
+     * sales need no commerce path of their own: the line is an ordinary
+     * cart line that happens to know which photograph it is for.
+     */
+    galleryId: id.optional(),
+    assetId: id.optional(),
+  }),
+  output: cartProjection,
+  handler: async (input, ctx) => {
+    const access = await requireCartAccess(ctx, input, "catalog.addCartItem", "mutation");
+    const cart = access.cart;
+    if (cart.status !== "open" || cart.kind !== "cart") {
+      throw new ServiceError("conflict", "Only an open shopping cart can change lines.");
+    }
+    const [variant] = await ctx.tx
+      .select({ id: productVariants.id, status: productVariants.status, sellerUserId: products.sellerUserId })
+      .from(productVariants)
+      .innerJoin(products, eq(products.id, productVariants.productId))
+      .where(eq(productVariants.id, input.variantId))
+      .limit(1);
+    if (!variant || variant.status !== "active") {
+      throw new ServiceError("not_found", "That variant is not here.");
+    }
+    if (variant.sellerUserId) {
+      // §44.8: the seller must be payable, and the payout model may limit a cart to one seller.
+      const existing = await ctx.tx.select({ variantId: cartItems.variantId }).from(cartItems).where(eq(cartItems.cartId, input.cartId));
+      await assertSellable(ctx, [...existing.map((row) => row.variantId), variant.id]);
+    }
+    if (Boolean(input.galleryId) !== Boolean(input.assetId)) {
+      throw new ServiceError(
+        "validation",
+        "A gallery line needs both the gallery and the photograph.",
+      );
+    }
+    // Two photographs ordered as the same 8x10 are two lines, not one line
+    // of quantity two: the lab has to know which images to print. Ordinary
+    // shopping still matches on the variant alone and still merges.
+    const [existing] = await ctx.tx
+      .select()
+      .from(cartItems)
+      .where(
+        and(
+          eq(cartItems.cartId, cart.id),
+          eq(cartItems.variantId, input.variantId),
+          input.assetId
+            ? eq(cartItems.assetId, input.assetId)
+            : isNull(cartItems.assetId),
+        ),
+      )
+      .limit(1);
+    const nextQty = (existing?.quantity ?? 0) + input.quantity;
+    const locationId = input.locationId ?? existing?.locationId ?? null;
+    if (locationId) {
+      const colocated=await ctx.tx.select({id:cartItems.id,quantity:cartItems.quantity}).from(cartItems)
+        .where(and(eq(cartItems.cartId,cart.id),eq(cartItems.variantId,input.variantId),eq(cartItems.locationId,locationId)));
+      const quantity=nextQty+colocated.filter(line=>line.id!==existing?.id).reduce((total,line)=>total+line.quantity,0);
+      const stock = await ctx.callAsSystem(availabilityForCart, {
+        cartId:cart.id,
+        variantId: input.variantId,
+        locationId,
+        quantity,
+      });
+      if (!stock.available) {
+        throw new ServiceError("validation", "There is not enough stock to add that quantity.");
+      }
+    }
+    if (existing) {
+      await ctx.tx
+        .update(cartItems)
+        .set({ quantity: nextQty, locationId, updatedAt: sql`now()` })
+        .where(eq(cartItems.id, existing.id));
+    } else {
+      await ctx.tx.insert(cartItems).values({
+        cartId: cart.id,
+        variantId: input.variantId,
+        quantity: nextQty,
+        locationId,
+        galleryId: input.galleryId ?? null,
+        assetId: input.assetId ?? null,
+      });
+    }
+    await reconcileCartStock(ctx, cart.id, [input.variantId]);
+    await ctx.tx
+      .update(carts)
+      .set({ lastActivityAt: sql`now()`, updatedAt: sql`now()` })
+      .where(eq(carts.id, cart.id));
+    ctx.setSubject("cart", cart.id);
+    ctx.queueEvent("catalog.cartItemAdded", { cartId: cart.id, variantId: input.variantId });
+    return projectCart(ctx, cart.id, access.revealToken);
+  },
+});
+
+export const setCartItemQuantity = defineService({
+  name: "catalog.setCartItemQuantity",
+  summary: "Set a cart line quantity, or remove it at zero.",
+  kind: "mutation",
+  permission: "public",
+  input: z.object({
+    cartId: id,
+    cartToken: z.string().uuid().optional(),
+    variantId: id,
+    lineId: id.optional(),
+    quantity: z.number().int().min(0).max(1_000_000),
+    locationId: id.optional(),
+  }),
+  output: cartProjection,
+  handler: async (input, ctx) => {
+    const access = await requireCartAccess(ctx, input, "catalog.setCartItemQuantity", "mutation");
+    if (access.cart.status !== "open") throw new ServiceError("conflict", "That cart is no longer open.");
+    if (input.quantity === 0) {
+      await ctx.callAsSystem(removeCartItem, { cartId: input.cartId, variantId: input.variantId, lineId: input.lineId });
+      return projectCart(ctx, input.cartId, access.revealToken);
+    }
+    const cart = access.cart;
+    const matching = await ctx.tx
+      .select()
+      .from(cartItems)
+      .where(and(eq(cartItems.cartId, cart.id), eq(cartItems.variantId, input.variantId), input.lineId ? eq(cartItems.id, input.lineId) : undefined))
+      .limit(2);
+    if (matching.length > 1) throw new ServiceError("validation", "Choose the photograph-specific cart line to change.");
+    const existing = matching[0];
+    if (!existing) throw new ServiceError("not_found", "That cart line is not here.");
+    const locationId = input.locationId ?? existing.locationId;
+    const requireAvailable = cart.kind === "cart" && (input.quantity > existing.quantity || locationId !== existing.locationId);
+    if (locationId && requireAvailable) {
+      const colocated = await ctx.tx.select({ id: cartItems.id, quantity: cartItems.quantity }).from(cartItems).where(and(eq(cartItems.cartId, cart.id), eq(cartItems.variantId, input.variantId), eq(cartItems.locationId, locationId)));
+      const quantity = input.quantity + colocated.filter(line => line.id !== existing.id).reduce((total, line) => total + line.quantity, 0);
+      const stock = await ctx.callAsSystem(availabilityForCart, {
+        cartId: cart.id,
+        variantId: input.variantId,
+        locationId,
+        quantity,
+      });
+      if (!stock.available) throw new ServiceError("validation", "There is not enough stock to add that quantity.");
+    }
+    await ctx.tx
+      .update(cartItems)
+      .set({ quantity: input.quantity, locationId, updatedAt: sql`now()` })
+      .where(eq(cartItems.id, existing.id));
+    if (cart.kind === "cart") await reconcileCartStock(ctx, cart.id, [input.variantId], { allowPartial: !requireAvailable });
+    else await releaseCartStock(ctx, cart.id);
+    await ctx.tx
+      .update(carts)
+      .set({ lastActivityAt: sql`now()`, updatedAt: sql`now()` })
+      .where(eq(carts.id, cart.id));
+    return projectCart(ctx, cart.id, access.revealToken);
+  },
+});
+
+export const removeCartItem = defineService({
+  name: "catalog.removeCartItem",
+  summary: "Remove a variant from an open cart and release its hold.",
+  kind: "mutation",
+  permission: "public",
+  input: z.object({ cartId: id, cartToken: z.string().uuid().optional(), variantId: id, lineId: id.optional() }),
+  output: cartProjection,
+  handler: async (input, ctx) => {
+    const access = await requireCartAccess(ctx, input, "catalog.removeCartItem", "mutation");
+    if (access.cart.status !== "open") throw new ServiceError("conflict", "That cart is no longer open.");
+    const cart = access.cart;
+    const matching = await ctx.tx
+      .select()
+      .from(cartItems)
+      .where(and(eq(cartItems.cartId, cart.id), eq(cartItems.variantId, input.variantId), input.lineId ? eq(cartItems.id, input.lineId) : undefined))
+      .limit(2);
+    if (matching.length > 1) throw new ServiceError("validation", "Choose the photograph-specific cart line to remove.");
+    const existing = matching[0];
+    if (!existing) throw new ServiceError("not_found", "That cart line is not here.");
+    await ctx.tx.delete(cartItems).where(eq(cartItems.id, existing.id));
+    if (cart.kind === "cart") await reconcileCartStock(ctx, cart.id, [input.variantId], { allowPartial: true });
+    else await releaseCartStock(ctx, cart.id);
+    await ctx.tx
+      .update(carts)
+      .set({ lastActivityAt: sql`now()`, updatedAt: sql`now()` })
+      .where(eq(carts.id, cart.id));
+    return projectCart(ctx, cart.id, access.revealToken);
+  },
+});
+
+export const getCart = defineService({
+  name: "catalog.getCart",
+  summary: "Read a cart with live prices and stock.",
+  kind: "query",
+  permission: "public",
+  input: z.object({ cartId: id.optional(), token: z.string().uuid().optional() }),
+  output: cartProjection,
+  handler: async (input, ctx) => {
+    if (!input.cartId && !input.token) {
+      throw new ServiceError("validation", "A cart id or token is required.");
+    }
+    const [cart] = input.cartId
+      ? await ctx.tx.select().from(carts).where(eq(carts.id, input.cartId)).limit(1)
+      : await ctx.tx.select().from(carts).where(eq(carts.token, input.token!)).limit(1);
+    if (!cart) throw new ServiceError("not_found", "That cart is not here.");
+    const access = await requireCartAccess(ctx, { cartId: cart.id, cartToken: input.token }, "catalog.getCart", "query");
+    return projectCart(ctx, cart.id, access.revealToken);
+  },
+});
+
+export const saveCart = defineService({
+  name: "catalog.saveCart",
+  summary: "Snapshot the current lines onto a named saved cart.",
+  kind: "mutation",
+  permission: "public",
+  input: z.object({ cartId: id, cartToken: z.string().uuid().optional(), name: z.string().trim().min(1).max(80) }),
+  output: cartProjection,
+  handler: async (input, ctx) => {
+    const access = await requireCartAccess(ctx, input, "catalog.saveCart", "mutation");
+    const source = await projectCart(ctx, input.cartId, access.revealToken);
+    if (!source.cart.contactId) {
+      throw new ServiceError("validation", "A saved cart must belong to a contact.");
+    }
+    await requireOwnedContact(ctx, source.cart.contactId, "catalog.saveCart", "mutation");
+    const [saved] = await ctx.tx
+      .insert(carts)
+      .values({
+        token: crypto.randomUUID(),
+        contactId: source.cart.contactId,
+        currency: source.cart.currency,
+        kind: "saved",
+        status: "open",
+        name: input.name,
+      })
+      .returning();
+    for (const line of source.lines) {
+      await ctx.tx.insert(cartItems).values({
+        cartId: saved!.id,
+        variantId: line.variantId,
+        quantity: line.quantity,
+        locationId: line.locationId,
+        galleryId: line.galleryId,
+        assetId: line.assetId,
+      });
+    }
+    ctx.setSubject("cart", saved!.id);
+    return projectCart(ctx, saved!.id, access.revealToken);
+  },
+});
+
+export const listSavedCarts = defineService({
+  name: "catalog.listSavedCarts",
+  summary: "Named saved carts for one contact.",
+  kind: "query",
+  permission: "public",
+  input: z.object({ contactId: id }),
+  output: listed(cartProjection),
+  handler: async (input, ctx) => {
+    const own = await requireOwnedContact(ctx, input.contactId, "catalog.listSavedCarts", "query");
+    const rows = await ctx.tx
+      .select()
+      .from(carts)
+      .where(and(eq(carts.contactId, input.contactId), eq(carts.kind, "saved")))
+      .orderBy(desc(carts.updatedAt));
+    return Promise.all(rows.map((row) => projectCart(ctx, row.id, own)));
+  },
+});
+
+export const addWishlistItem = defineService({
+  name: "catalog.addWishlistItem",
+  summary: "Put a variant on the contact's wishlist.",
+  kind: "mutation",
+  permission: "public",
+  input: z.object({ contactId: id, variantId: id }),
+  output: z.object({
+    wishlist: wishlistRow.nullable(),
+    items: listed(wishlistItemRow),
+  }),
+  handler: async (input, ctx) => {
+    await requireOwnedContact(ctx, input.contactId, "catalog.addWishlistItem", "mutation");
+    await requireContact(ctx.tx, input.contactId);
+    let [list] = await ctx.tx.select().from(wishlists).where(eq(wishlists.contactId, input.contactId)).limit(1);
+    if (!list) {
+      [list] = await ctx.tx.insert(wishlists).values({ contactId: input.contactId }).returning();
+    }
+    await ctx.tx
+      .insert(wishlistItems)
+      .values({ wishlistId: list!.id, variantId: input.variantId })
+      .onConflictDoNothing({ target: [wishlistItems.wishlistId, wishlistItems.variantId] });
+    ctx.setSubject("wishlist", list!.id);
+    return ctx.callAsSystem(listWishlist, { contactId: input.contactId });
+  },
+});
+
+export const removeWishlistItem = defineService({
+  name: "catalog.removeWishlistItem",
+  summary: "Remove a variant from the contact's wishlist.",
+  kind: "mutation",
+  permission: "public",
+  input: z.object({ contactId: id, variantId: id }),
+  output: z.object({
+    wishlist: wishlistRow.nullable(),
+    items: listed(wishlistItemRow),
+  }),
+  handler: async (input, ctx) => {
+    await requireOwnedContact(ctx, input.contactId, "catalog.removeWishlistItem", "mutation");
+    const [list] = await ctx.tx.select().from(wishlists).where(eq(wishlists.contactId, input.contactId)).limit(1);
+    if (list) {
+      await ctx.tx
+        .delete(wishlistItems)
+        .where(and(eq(wishlistItems.wishlistId, list.id), eq(wishlistItems.variantId, input.variantId)));
+    }
+    return ctx.callAsSystem(listWishlist, { contactId: input.contactId });
+  },
+});
+
+export const listWishlist = defineService({
+  name: "catalog.listWishlist",
+  summary: "The contact's wishlist variants.",
+  kind: "query",
+  permission: "public",
+  input: z.object({ contactId: id.optional() }),
+  output: z.object({
+    wishlist: wishlistRow.nullable(),
+    items: listed(wishlistItemRow),
+  }),
+  handler: async (input, ctx) => {
+    const contactId =
+      input.contactId ??
+      (ctx.actor.kind === "user" ? await contactForUser(ctx.tx, ctx.actor.userId) : null);
+    if (!contactId) return { wishlist: null, items: [] };
+    await requireOwnedContact(ctx, contactId, "catalog.listWishlist", "query");
+    const [list] = await ctx.tx.select().from(wishlists).where(eq(wishlists.contactId, contactId)).limit(1);
+    if (!list) return { wishlist: null, items: [] };
+    const items = await ctx.tx
+      .select({
+        id: wishlistItems.id,
+        variantId: wishlistItems.variantId,
+        sku: productVariants.sku,
+        productName: products.name,
+      })
+      .from(wishlistItems)
+      .innerJoin(productVariants, eq(productVariants.id, wishlistItems.variantId))
+      .innerJoin(products, eq(products.id, productVariants.productId))
+      .where(eq(wishlistItems.wishlistId, list.id))
+      .orderBy(asc(products.name));
+    return { wishlist: list, items };
+  },
+});
+
+async function contactForUser(tx: Tx, userId: string): Promise<string | null> {
+  const [contact] = await tx
+    .select({ id: contacts.id })
+    .from(contacts)
+    .where(eq(contacts.userId, userId))
+    .limit(1);
+  return contact?.id ?? null;
+}
+
+async function wishlistContactId(actor: Actor, tx: Tx, requested?: string): Promise<string> {
+  const own = actor.kind === "user" ? await contactForUser(tx, actor.userId) : null;
+  const staff = actor.kind === "user" && hasModuleAccess(actor, "catalog", "manage");
+  if (staff && requested) return requested;
+  if (own && (!requested || requested === own)) return own;
+  throw new ServiceError("permission", "Sign in to share a gift list.");
+}
+
+export const shareWishlist = defineService({
+  name: "catalog.shareWishlist",
+  summary: "Turn this contact's wishlist into a public gift-registry link.",
+  kind: "mutation",
+  permission: "authenticated",
+  writeClass: "write",
+  input: z.object({ contactId: id.optional() }),
+  output: z.object({
+    id: uuid,
+    token: z.string(),
+    link: z.string(),
+  }),
+  handler: async (input, ctx) => {
+    const contactId = await wishlistContactId(ctx.actor, ctx.tx, input.contactId);
+    const [list] = await ctx.tx
+      .select()
+      .from(wishlists)
+      .where(eq(wishlists.contactId, contactId))
+      .limit(1);
+    if (!list) throw new ServiceError("not_found", "There is nothing on this gift list yet.");
+    const items = await ctx.tx
+      .select({ id: wishlistItems.id })
+      .from(wishlistItems)
+      .where(eq(wishlistItems.wishlistId, list.id))
+      .limit(1);
+    if (items.length === 0) {
+      throw new ServiceError("validation", "Add something to the list before sharing it.");
+    }
+    const token = newCatalogShareToken();
+    const shareTokenHash = hashCatalogShareToken("wishlist", token);
+    await ctx.tx
+      .update(wishlists)
+      .set({ shareTokenHash, updatedAt: sql`now()` })
+      .where(eq(wishlists.id, list.id));
+    ctx.setSubject("wishlist", list.id);
+    ctx.queueEvent("catalog.wishlistShared", { id: list.id, contactId });
+    return {
+      id: list.id,
+      token,
+      link: `${env().APP_URL.replace(/\/+$/, "")}/registry/${encodeURIComponent(token)}`,
+    };
+  },
+});
+
+export const revokeWishlistShare = defineService({
+  name: "catalog.revokeWishlistShare",
+  summary: "Take down the public gift-registry link.",
+  kind: "mutation",
+  permission: "authenticated",
+  writeClass: "write",
+  input: z.object({ contactId: id.optional() }),
+  output: okResult,
+  handler: async (input, ctx) => {
+    const contactId = await wishlistContactId(ctx.actor, ctx.tx, input.contactId);
+    const [updated] = await ctx.tx
+      .update(wishlists)
+      .set({ shareTokenHash: null, updatedAt: sql`now()` })
+      .where(eq(wishlists.contactId, contactId))
+      .returning({ id: wishlists.id });
+    if (!updated) throw new ServiceError("not_found", "There is nothing on this gift list yet.");
+    ctx.setSubject("wishlist", updated.id);
+    return { ok: true as const };
+  },
+});
+
+export const wishlistByShareToken = defineService({
+  name: "catalog.wishlistByShareToken",
+  summary: "A public gift list, for anyone holding the share link.",
+  kind: "query",
+  permission: "public",
+  mcpExclude: true,
+  agentCallable: false,
+  input: z.object({ token: z.string().trim().min(16).max(200) }),
+  output: z
+    .object({
+      name: z.string(),
+      items: listed(
+        row({
+          id: uuid,
+          sku: z.string(),
+          productName: z.string(),
+          href: z.string().nullable(),
+        }),
+      ),
+    })
+    .nullable(),
+  handler: async (input, ctx) => {
+    const [list] = await ctx.tx
+      .select()
+      .from(wishlists)
+      .where(eq(wishlists.shareTokenHash, hashCatalogShareToken("wishlist", input.token)))
+      .limit(1);
+    if (!list) return null;
+    const items = await ctx.tx
+      .select({
+        id: wishlistItems.id,
+        sku: productVariants.sku,
+        productName: products.name,
+        slug: products.slug,
+        status: products.status,
+        visibility: products.visibility,
+      })
+      .from(wishlistItems)
+      .innerJoin(productVariants, eq(productVariants.id, wishlistItems.variantId))
+      .innerJoin(products, eq(products.id, productVariants.productId))
+      .where(eq(wishlistItems.wishlistId, list.id))
+      .orderBy(asc(products.name));
+    return {
+      name: list.name,
+      items: items.map((item) => ({
+        id: item.id,
+        sku: item.sku,
+        productName: item.productName,
+        href:
+          item.status === "active" && item.visibility === "public"
+            ? `/products/${item.slug}`
+            : null,
+      })),
+    };
+  },
+});
+
+export const listSellableVariants = defineService({
+  name: "catalog.listSellableVariants",
+  summary: "Active variants staff can add to a cart or wishlist.",
+  kind: "query",
+  permission: "scoped",
+  input: z.object({}),
+  output: listed(
+    row({
+      id: uuid,
+      sku: z.string(),
+      productName: z.string(),
+      requiresShipping: z.boolean(),
+    }),
+  ),
+  handler: (_input, ctx) =>
+    ctx.tx
+      .select({
+        id: productVariants.id,
+        sku: productVariants.sku,
+        productName: products.name,
+        requiresShipping: productVariants.requiresShipping,
+      })
+      .from(productVariants)
+      .innerJoin(products, eq(products.id, productVariants.productId))
+      .where(eq(productVariants.status, "active"))
+      .orderBy(asc(products.name), asc(productVariants.sku))
+      .limit(500),
+});
+
+export const listCarts = defineService({
+  name: "catalog.listCarts",
+  summary: "Open and abandoned carts for the owner workspace.",
+  kind: "query",
+  permission: "scoped",
+  input: z.object({ status: z.enum(["open", "converted", "abandoned"]).optional() }),
+  output: listed(cartRow),
+  handler: async (input, ctx) => {
+    const rows = await ctx.tx
+      .select()
+      .from(carts)
+      .where(input.status ? eq(carts.status, input.status) : undefined)
+      .orderBy(desc(carts.lastActivityAt))
+      .limit(200);
+    return rows.map(cart => ({ ...cart, token: managesCartTokens(ctx.actor) ? cart.token : null }));
+  },
+});
+
+export const abandonStaleCarts = defineService({
+  name: "catalog.abandonStaleCarts",
+  summary: "Mark inactive open carts abandoned and release their stock holds.",
+  kind: "mutation",
+  permission: "scoped",
+  input: z.object({}),
+  output: z.object({ abandoned: z.number().int() }),
+  auditWhen: (out: { abandoned: number }) => out.abandoned > 0,
+  handler: async (_input, ctx) => {
+    const cutoff = new Date(Date.now() - ABANDON_AFTER_MS);
+    const stale = await ctx.tx
+      .select()
+      .from(carts)
+      .where(
+        and(
+          eq(carts.status, "open"),
+          eq(carts.kind, "cart"),
+          lt(carts.lastActivityAt, cutoff),
+        ),
+      ).orderBy(asc(carts.id)).for("update", { skipLocked: true });
+    await lockCartStock(ctx, stale.map(cart => cart.id));
+    for (const cart of stale) {
+      await releaseCartStock(ctx, cart.id);
+      await ctx.tx
+        .update(carts)
+        .set({ status: "abandoned", abandonedAt: sql`now()`, updatedAt: sql`now()` })
+        .where(eq(carts.id, cart.id));
+      ctx.queueEvent("catalog.cartAbandoned", { cartId: cart.id });
+    }
+    return { abandoned: stale.length };
+  },
+});
+
+async function projectCart(ctx: ServiceContext, cartId: string, revealToken = false) {
+  const cart = await loadCart(ctx.tx, cartId);
+  const rows = await ctx.tx
+    .select({
+      item: cartItems,
+      productId: productVariants.productId,
+      sku: productVariants.sku,
+      productName: products.name,
+      requiresShipping: productVariants.requiresShipping,
+      weightG: productVariants.weightG,
+      lengthMm: productVariants.lengthMm,
+      widthMm: productVariants.widthMm,
+      heightMm: productVariants.heightMm,
+    })
+    .from(cartItems)
+    .innerJoin(productVariants, eq(productVariants.id, cartItems.variantId))
+    .innerJoin(products, eq(products.id, productVariants.productId))
+    .where(eq(cartItems.cartId, cart.id));
+  const lines = [];
+  for (const row of rows) {
+    const priced = await ctx.callAsSystem(resolvePrice, {
+      variantId: row.item.variantId,
+      currency: cart.currency,
+      contactId: cart.contactId ?? undefined,
+      quantity: row.item.quantity,
+    });
+    const stock = row.item.locationId
+      ? await ctx.callAsSystem(availabilityForCart, {
+          cartId:cart.id,
+          variantId: row.item.variantId,
+          locationId: row.item.locationId,
+          quantity: rows.filter(line=>line.item.variantId===row.item.variantId && line.item.locationId===row.item.locationId).reduce((total,line)=>total+line.item.quantity,0),
+        })
+      : { tracked: false, available: true };
+    lines.push({
+      ...row.item,
+      productId: row.productId,
+      sku: row.sku,
+      productName: row.productName,
+      requiresShipping: row.requiresShipping,
+      weightG: row.weightG,
+      lengthMm: row.lengthMm,
+      widthMm: row.widthMm,
+      heightMm: row.heightMm,
+      unitAmountMinor: priced.available ? priced.amountMinor ?? null : null,
+      lineTotalMinor: priced.available ? priced.totalMinor ?? null : null,
+      priceAvailable: priced.available,
+      priceReason: priced.reason ?? null,
+      stock,
+    });
+  }
+  const subtotalMinor = lines.reduce((sum, line) => sum + (line.lineTotalMinor ?? 0), 0);
+  return {
+    cart: { ...cart, token: revealToken || managesCartTokens(ctx.actor) ? cart.token : null },
+    lines,
+    subtotalMinor,
+    allPriced: lines.every((line) => line.priceAvailable && line.lineTotalMinor != null),
+    allAvailable: lines.every((line) => line.stock.available !== false),
+  };
+}
+
+export default [
+  getOrCreateCart,
+  attachCartToContact,
+  addCartItem,
+  setCartItemQuantity,
+  removeCartItem,
+  getCart,
+  saveCart,
+  listSavedCarts,
+  addWishlistItem,
+  removeWishlistItem,
+  listWishlist,
+  shareWishlist,
+  revokeWishlistShare,
+  wishlistByShareToken,
+  listSellableVariants,
+  listCarts,
+  abandonStaleCarts,
+];

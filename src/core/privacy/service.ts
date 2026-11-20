@@ -1,0 +1,2112 @@
+// Copyright (C) 2026 Tony Aly
+// SPDX-License-Identifier: Apache-2.0
+// Consent, preference, and privacy-rights services (MASTER.md C1.08, §30).
+import { createHash, randomUUID } from "node:crypto";
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  getTableColumns,
+  inArray,
+  lt,
+  ne,
+  or,
+  sql,
+} from "drizzle-orm";
+import { z } from "zod";
+import { registerSearchSource, matchesIlike } from "@/core/search/registry";
+import { loginSecurityEvents, passwordResets, roleGrants, sessions, totpFactors, twoFactorChallenges, twoFactorRecoveryCodes, users, webauthnCredentials } from "@/core/auth/schema";
+import { apiKeys } from "@/core/apikeys/schema";
+import {
+  contactMergeOperations,
+  contactRelationships,
+  contacts,
+  customerMagicLinks,
+  mergeCandidates,
+  timelineEvents,
+} from "@/core/contacts/schema";
+import {
+  registerContactReference,
+  updateContact,
+} from "@/core/contacts/service";
+import { db } from "@/core/db";
+import {lockContactIdentity} from "@/core/contacts/identity-lock";
+import {contactPrivacyIdentity,contactPrivacyHistory,contactHistoryOwnership} from "./contact-identity";
+import { auditLog } from "@/core/events/schema";
+import { enqueueJob } from "@/core/jobs";
+import { jobIdempotencyKeys } from "@/core/jobs/schema";
+import {
+  consentRecords,
+  dataRequestArtifacts,
+  dataRequests,
+  privacyRetentionExceptions,
+} from "@/core/privacy/schema";
+import { listed, okResult, row, timestamp, uuid } from "@/core/contract";
+import {
+  actorString,
+  defineService,
+  ServiceError,
+  type Actor,
+  type ServiceContext,
+  type Tx,
+} from "@/core/service";
+
+export const CONSENT_PURPOSES = [
+  "marketing",
+  "analytics",
+  "data_processing",
+] as const;
+export const CONSENT_CHANNELS = ["email", "sms", "push", "web"] as const;
+export const MARKETING_CHANNELS = ["email", "sms", "push"] as const;
+export const DATA_REQUEST_KINDS = [
+  "access",
+  "export",
+  "correction",
+  "erasure",
+] as const;
+
+const consentPurpose = z.enum(CONSENT_PURPOSES);
+const consentChannel = z.enum(CONSENT_CHANNELS);
+const marketingChannel = z.enum(MARKETING_CHANNELS);
+const consentState = z.enum(["granted", "denied", "withdrawn"]);
+const consentMethod = z.enum([
+  "form",
+  "preference_center",
+  "double_opt_in",
+  "verbal",
+  "written",
+  "contract",
+  "import",
+  "system",
+]);
+const dataRequestStatus = z.enum([
+  "submitted",
+  "verified",
+  "in_progress",
+  "completed",
+  "partially_completed",
+  "denied",
+  "cancelled",
+]);
+const retentionReason = z.enum([
+  "legal_obligation",
+  "legal_claim",
+  "contractual_obligation",
+  "accounting_tax",
+  "security_fraud",
+]);
+
+const evidenceValue = z.union([
+  z.string().max(500),
+  z.number().finite(),
+  z.boolean(),
+  z.null(),
+]);
+const boundedEvidence = z
+  .record(z.string().min(1).max(80), evidenceValue)
+  .refine((value) => Object.keys(value).length <= 20, "Use at most 20 evidence fields.");
+const note = z.string().trim().max(4_000).optional();
+const correctionChanges = z
+  .object({
+    name: z.string().trim().min(1).max(200).optional(),
+    email: z.string().trim().email().max(320).nullable().optional(),
+    phone: z.string().trim().max(50).nullable().optional(),
+    preferredLocale: z.string().trim().max(35).nullable().optional(),
+    timezone: z.string().trim().max(100).nullable().optional(),
+    country: z.string().trim().length(2).nullable().optional(),
+  })
+  .refine(
+    (value) => Object.values(value).some((item) => item !== undefined),
+    "Choose at least one profile field to correct.",
+  );
+
+const requestDetails = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("access"), note }),
+  z.object({ kind: z.literal("export"), note }),
+  z.object({ kind: z.literal("erasure"), note }),
+  z.object({ kind: z.literal("correction"), note, changes: correctionChanges }),
+]);
+
+type ConsentPurpose = z.infer<typeof consentPurpose>;
+type ConsentChannel = z.infer<typeof consentChannel>;
+type ConsentState = z.infer<typeof consentState>;
+type RequestDetails = z.infer<typeof requestDetails>;
+
+export interface ContactPrivacySource {
+  /** Stable owner-facing retention scope. */
+  scope: string;
+  /** Physical tables this source covers; enforced by the completeness test. */
+  tables: readonly string[];
+  /** Parent stores inherit holds for children they would cascade-delete. */
+  retentionScopes?: readonly string[];
+  /** A held source needs its inert login parent and contact link for later erasure. */
+  requiresLogin?: boolean;
+  /**
+   * Erasure order, lowest first (default 100). A source whose rows the login
+   * deletion would cascade over or be blocked by runs before it.
+   */
+  eraseOrder?: number;
+  exportData: (tx: Tx, contactId: string) => Promise<unknown>;
+  /** Protect held copies; context.requestId identifies the hold's originating request. */
+  retain?: (tx: Tx, contactId: string, context: { requestId: string; exceptionId: string; service?: ServiceContext }) => Promise<void>;
+  /** Non-destructive original-membership capture when a documented hold is
+   * recorded, including before identity verification. Unlike retain, this
+   * must not disable credentials, retire data or perform provider I/O.
+   * isNew identifies the actual first insert; updates must not silently
+   * expand an originally empty source-generation snapshot.
+   */
+  captureRetention?: (tx: Tx, contactId: string, context: { requestId: string; exceptionId: string; isNew: boolean; service: ServiceContext }) => Promise<void>;
+  /** Opt in to erasing only the originals outside all current named holds.
+   * Runs once after every original hold is validated. requestId identifies
+   * the current erasure, unlike retain's originating hold request.
+   * Physical cleanup remains after commit through actual returned job IDs.
+   */
+  eraseUnheld?: (tx: Tx, contactId: string, context: { requestId: string; service: ServiceContext }) => Promise<{ affected: number; pendingJobs?: string[] }>;
+  erase: (
+    tx: Tx,
+    contactId: string,
+    // Production supplies the real parent context so a source can compose
+    // audited services and queue after-commit work in this same transaction.
+    // Optional only for existing direct source-level tests and integrations.
+    context: { requestId: string; service?: ServiceContext },
+  ) => Promise<{ affected: number; pendingJobs?: string[] }>;
+}
+
+const privacySourceRegistry: ContactPrivacySource[] = [];
+
+/** Modules register personal-data export and erasure beside their own schema. */
+export function registerContactPrivacySource(
+  source: ContactPrivacySource,
+): void {
+  const existing = privacySourceRegistry.find((item) => item.scope === source.scope);
+  if (
+    existing &&
+    existing.tables.length === source.tables.length &&
+    existing.tables.every((table, index) => table === source.tables[index])
+  ) {
+    return;
+  }
+  if (existing) {
+    throw new Error(`contact privacy source "${source.scope}" registered twice`);
+  }
+  privacySourceRegistry.push(source);
+}
+
+export function contactPrivacySources(): readonly ContactPrivacySource[] {
+  return privacySourceRegistry;
+}
+
+function addDays(date: Date, days: number): Date {
+  return new Date(date.getTime() + days * 24 * 60 * 60 * 1_000);
+}
+
+function canonicalJson(value: unknown): string {
+  if (value instanceof Date) return JSON.stringify(value.toISOString());
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJson).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+function artifactChecksum(value: unknown): string {
+  return createHash("sha256").update(canonicalJson(value)).digest("hex");
+}
+
+/** Source workers must verify the exact current receipt before acknowledging it. */
+export function erasureArtifactIsIntact(artifact: { body: unknown; sha256: string } | undefined): boolean {
+  return Boolean(artifact && artifact.sha256 === artifactChecksum(artifact.body));
+}
+
+function requireUser(actor: Actor): Extract<Actor, { kind: "user" }> {
+  if (actor.kind !== "user") {
+    throw new ServiceError("permission", "Sign in as a person to continue.");
+  }
+  return actor;
+}
+
+async function requireContact(tx: Tx, id: string) {
+  const [contact] = await tx
+    .select()
+    .from(contacts)
+    .where(eq(contacts.id, id))
+    .limit(1);
+  if (!contact) throw new ServiceError("not_found", "That contact no longer exists.");
+  return contact;
+}
+
+async function personalContact(tx: Tx, actor: Actor) {
+  const user = requireUser(actor);
+  const [contact] = await tx
+    .select()
+    .from(contacts)
+    .where(eq(contacts.userId, user.userId))
+    .limit(1);
+  if (!contact) {
+    throw new ServiceError(
+      "not_found",
+      "Your sign-in is not linked to a contact profile.",
+    );
+  }
+  return contact;
+}
+
+function consentKey(purpose: ConsentPurpose, channel: ConsentChannel | null): string {
+  return `${purpose}:${channel ?? "all"}`;
+}
+
+export interface EffectiveConsent {
+  purpose: ConsentPurpose;
+  channel: ConsentChannel | null;
+  state: ConsentState | "expired";
+  record: typeof consentRecords.$inferSelect | null;
+}
+
+function effectiveConsent(
+  rows: Array<typeof consentRecords.$inferSelect>,
+  now = new Date(),
+): EffectiveConsent[] {
+  const latest = new Map<string, typeof consentRecords.$inferSelect>();
+  for (const row of rows) {
+    const key = consentKey(row.purpose, row.channel);
+    if (!latest.has(key)) latest.set(key, row);
+  }
+  const choices: Array<[ConsentPurpose, ConsentChannel | null]> = [
+    ...MARKETING_CHANNELS.map(
+      (channel) => ["marketing", channel] as [ConsentPurpose, ConsentChannel],
+    ),
+    ["analytics", "web"],
+    ["data_processing", null],
+  ];
+  return choices.map(([purpose, channel]) => {
+    const record = latest.get(consentKey(purpose, channel)) ?? null;
+    return {
+      purpose,
+      channel,
+      state:
+        record?.expiresAt && record.expiresAt <= now
+          ? "expired"
+          : (record?.state ?? "denied"),
+      record,
+    };
+  });
+}
+
+async function consentBundle(tx: Tx, contactId: string) {
+  const history = await tx
+    .select()
+    .from(consentRecords)
+    .where(eq(consentRecords.contactId, contactId))
+    .orderBy(desc(consentRecords.occurredAt), desc(consentRecords.createdAt));
+  return { effective: effectiveConsent(history), history };
+}
+
+const recordConsentInput = z
+  .object({
+    contactId: z.string().uuid(),
+    purpose: consentPurpose,
+    channel: consentChannel.nullable().optional(),
+    state: consentState,
+    method: consentMethod,
+    termsVersion: z.string().trim().max(100).nullable().optional(),
+    sourceUrl: z.string().trim().max(2_048).nullable().optional(),
+    /** Original request address preserved by trusted, deferred workflows. */
+    sourceIp: z.string().trim().max(64).nullable().optional(),
+    evidence: boundedEvidence.default({}),
+    occurredAt: z.string().datetime().optional(),
+    expiresAt: z.string().datetime().nullable().optional(),
+  })
+  .superRefine((input, ctx) => {
+    if (input.purpose === "marketing" && !input.channel) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["channel"],
+        message: "Marketing consent must name a channel.",
+      });
+    }
+    const occurredAt = input.occurredAt ? new Date(input.occurredAt) : new Date();
+    if (input.expiresAt && new Date(input.expiresAt) <= occurredAt) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["expiresAt"],
+        message: "Expiry must be after the consent event.",
+      });
+    }
+  });
+
+async function insertConsent(
+  tx: Tx,
+  input: z.output<typeof recordConsentInput>,
+  actor: Actor,
+) {
+  await requireContact(tx, input.contactId);
+  const [record] = await tx
+    .insert(consentRecords)
+    .values({
+      contactId: input.contactId,
+      purpose: input.purpose,
+      channel:
+        input.channel ?? (input.purpose === "analytics" ? "web" : null),
+      state: input.state,
+      method: input.method,
+      termsVersion: input.termsVersion ?? null,
+      sourceUrl: input.sourceUrl ?? null,
+      ip: input.sourceIp ?? actor.request?.ip ?? null,
+      evidence: input.evidence,
+      actor: actorString(actor),
+      occurredAt: input.occurredAt ? new Date(input.occurredAt) : new Date(),
+      expiresAt: input.expiresAt ? new Date(input.expiresAt) : null,
+    })
+    .returning();
+  return record!;
+}
+
+const contactRow = row({
+  id: uuid,
+  userId: uuid.nullable(),
+  name: z.string(),
+  email: z.string().nullable(),
+  phone: z.string().nullable(),
+  orgId: uuid.nullable(),
+  source: z.string().nullable(),
+  tags: z.array(z.string()),
+  customFields: z.unknown(),
+  lifecycleStage: z.enum(["lead", "prospect", "customer", "repeat"]),
+  preferredLocale: z.string().nullable(),
+  timezone: z.string().nullable(),
+  country: z.string().nullable(),
+  ownerNotes: z.string().nullable(),
+  createdAt: timestamp,
+  updatedAt: timestamp,
+});
+const consentRow = row({
+  id: uuid,
+  contactId: uuid,
+  purpose: consentPurpose,
+  channel: consentChannel.nullable(),
+  state: consentState,
+  method: consentMethod,
+  termsVersion: z.string().nullable(),
+  sourceUrl: z.string().nullable(),
+  ip: z.string().nullable(),
+  evidence: z.unknown(),
+  actor: z.string(),
+  occurredAt: timestamp,
+  expiresAt: timestamp.nullable(),
+  createdAt: timestamp,
+});
+const effectiveConsentItem = row({
+  purpose: consentPurpose,
+  channel: consentChannel.nullable(),
+  state: z.enum(["granted", "denied", "withdrawn", "expired"]),
+  record: consentRow.nullable(),
+});
+const consentBundleResult = z.object({
+  effective: listed(effectiveConsentItem),
+  history: listed(consentRow),
+});
+const dataRequestRow = row({
+  id: uuid,
+  contactId: uuid,
+  kind: z.enum(DATA_REQUEST_KINDS),
+  status: dataRequestStatus,
+  jurisdiction: z.string().nullable(),
+  details: z.unknown(),
+  requestedBy: z.string(),
+  verificationMethod: z.string().nullable(),
+  verifiedAt: timestamp.nullable(),
+  responseDueAt: timestamp,
+  resolution: z.string().nullable(),
+  fulfilledAt: timestamp.nullable(),
+  createdAt: timestamp,
+  updatedAt: timestamp,
+});
+const retentionExceptionRow = row({
+  id: uuid,
+  dataRequestId: uuid,
+  scope: z.string(),
+  reason: retentionReason,
+  legalBasis: z.string(),
+  notes: z.string().nullable(),
+  expiresAt: timestamp.nullable(),
+  createdBy: z.string(),
+  createdAt: timestamp,
+});
+const artifactRow = row({
+  id: uuid,
+  dataRequestId: uuid,
+  filename: z.string(),
+  mime: z.string(),
+  body: z.unknown(),
+  sha256: z.string(),
+  expiresAt: timestamp,
+  lastDownloadedAt: timestamp.nullable(),
+  createdAt: timestamp,
+});
+const artifactMeta = row({
+  id: uuid,
+  filename: z.string(),
+  mime: z.string(),
+  sha256: z.string(),
+  expiresAt: timestamp,
+  createdAt: timestamp,
+});
+const downloadableArtifactResult = z.object({
+  id: uuid,
+  filename: z.string(),
+  mime: z.string(),
+  sha256: z.string(),
+  expiresAt: timestamp,
+  content: z.string(),
+});
+
+export const recordConsent = defineService({
+  name: "contacts.recordConsent",
+  summary: "Append evidence of one contact's consent decision.",
+  kind: "mutation",
+  permission: "scoped",
+  input: recordConsentInput,
+  output: consentRow,
+  handler: async (input, ctx) => {
+    if (input.sourceIp !== undefined && ctx.actor.kind !== "system") {
+      throw new ServiceError("permission", "Only a trusted workflow may preserve a source address.");
+    }
+    const record = await insertConsent(ctx.tx, input, ctx.actor);
+    ctx.setSubject("consent", record.id);
+    await ctx.emitTimeline({
+      contactId: record.contactId,
+      eventType: "contact.consentChanged",
+      subjectType: "consent",
+      subjectId: record.id,
+      payload: {
+        purpose: record.purpose,
+        channel: record.channel,
+        state: record.state,
+      },
+    });
+    ctx.queueEvent("contact.consentChanged", {
+      contactId: record.contactId,
+      purpose: record.purpose,
+      channel: record.channel,
+      state: record.state,
+    });
+    return record;
+  },
+});
+
+export const getConsentPreferences = defineService({
+  name: "contacts.getConsentPreferences",
+  summary: "Read current consent choices and their immutable evidence history.",
+  kind: "query",
+  permission: "scoped",
+  input: z.object({ contactId: z.string().uuid() }),
+  output: consentBundleResult.extend({ contact: contactRow }),
+  handler: async (input, ctx) => {
+    const contact = await requireContact(ctx.tx, input.contactId);
+    return { contact, ...(await consentBundle(ctx.tx, contact.id)) };
+  },
+});
+
+export const canContact = defineService({
+  name: "contacts.canContact",
+  summary: "Decide from immutable evidence whether one purpose and channel is allowed.",
+  kind: "query",
+  permission: "scoped",
+  input: z.object({
+    contactId: z.string().uuid(),
+    purpose: consentPurpose,
+    channel: consentChannel.nullable(),
+  }),
+  output: z.object({
+    allowed: z.boolean(),
+    reason: z.string(),
+    evidenceId: uuid.nullable(),
+    expiresAt: timestamp.nullable(),
+  }),
+  handler: async (input, ctx) => {
+    await requireContact(ctx.tx, input.contactId);
+    const { effective } = await consentBundle(ctx.tx, input.contactId);
+    const choice = effective.find(
+      (item) => item.purpose === input.purpose && item.channel === input.channel,
+    );
+    const allowed = choice?.state === "granted";
+    return {
+      allowed,
+      reason: allowed ? "granted" : (choice?.state ?? "no_evidence"),
+      evidenceId: choice?.record?.id ?? null,
+      expiresAt: choice?.record?.expiresAt ?? null,
+    };
+  },
+});
+
+export const getMyPrivacyProfile = defineService({
+  name: "privacy.getMyProfile",
+  summary: "Read the signed-in customer's profile and consent preferences.",
+  kind: "query",
+  permission: "authenticated",
+  input: z.object({}),
+  output: consentBundleResult.extend({
+    contact: row({
+      id: uuid,
+      name: z.string(),
+      email: z.string().nullable(),
+      phone: z.string().nullable(),
+      preferredLocale: z.string().nullable(),
+      timezone: z.string().nullable(),
+      country: z.string().nullable(),
+    }),
+  }),
+  handler: async (_input, ctx) => {
+    const contact = await personalContact(ctx.tx, ctx.actor);
+    return {
+      contact: {
+        id: contact.id,
+        name: contact.name,
+        email: contact.email,
+        phone: contact.phone,
+        preferredLocale: contact.preferredLocale,
+        timezone: contact.timezone,
+        country: contact.country,
+      },
+      ...(await consentBundle(ctx.tx, contact.id)),
+    };
+  },
+});
+
+export const setMyMarketingPreference = defineService({
+  name: "privacy.setMyMarketingPreference",
+  summary: "Grant or withdraw one marketing channel from the preference centre.",
+  kind: "mutation",
+  permission: "authenticated",
+  input: z.object({
+    channel: marketingChannel,
+    state: z.enum(["granted", "withdrawn"]),
+    termsVersion: z.string().trim().min(1).max(100),
+  }),
+  output: z.object({
+    contactId: uuid,
+    preference: consentRow,
+  }),
+  handler: async (input, ctx) => {
+    const contact = await personalContact(ctx.tx, ctx.actor);
+    const record = await insertConsent(
+      ctx.tx,
+      {
+        contactId: contact.id,
+        purpose: "marketing",
+        channel: input.channel,
+        state: input.state,
+        method: "preference_center",
+        termsVersion: input.termsVersion,
+        sourceUrl: "/portal/privacy",
+        evidence: {},
+      },
+      ctx.actor,
+    );
+    ctx.setSubject("consent", record.id);
+    await ctx.emitTimeline({
+      contactId: contact.id,
+      eventType: "contact.consentChanged",
+      subjectType: "consent",
+      subjectId: record.id,
+      payload: {
+        purpose: "marketing",
+        channel: input.channel,
+        state: input.state,
+      },
+    });
+    ctx.queueEvent("contact.consentChanged", {
+      contactId: contact.id,
+      purpose: "marketing",
+      channel: input.channel,
+      state: input.state,
+    });
+    return { contactId: contact.id, preference: record };
+  },
+});
+
+function requestValues(
+  details: RequestDetails,
+  actor: Actor,
+  contactId: string,
+  verified: boolean,
+  jurisdiction?: string | null,
+) {
+  const now = new Date();
+  return {
+    contactId,
+    kind: details.kind,
+    status: verified ? ("verified" as const) : ("submitted" as const),
+    jurisdiction: jurisdiction || null,
+    details,
+    requestedBy: actorString(actor),
+    verificationMethod: verified ? "authenticated_portal" : null,
+    verifiedAt: verified ? now : null,
+    // A conservative follow-up target, not a claim about any jurisdiction's law.
+    responseDueAt: addDays(now, 30),
+  };
+}
+
+export const createDataRequest = defineService({
+  name: "contacts.createDataRequest",
+  summary: "Record a privacy request for a contact and start its response clock.",
+  kind: "mutation",
+  permission: "scoped",
+  input: z.object({
+    contactId: z.string().uuid(),
+    jurisdiction: z.string().trim().max(100).nullable().optional(),
+    request: requestDetails,
+  }),
+  output: dataRequestRow,
+  handler: async (input, ctx) => {
+    await requireContact(ctx.tx, input.contactId);
+    const [request] = await ctx.tx
+      .insert(dataRequests)
+      .values(
+        requestValues(
+          input.request,
+          ctx.actor,
+          input.contactId,
+          false,
+          input.jurisdiction,
+        ),
+      )
+      .returning();
+    ctx.setSubject("dataRequest", request!.id);
+    await ctx.emitTimeline({
+      contactId: request!.contactId,
+      eventType: "contact.dataRequestSubmitted",
+      subjectType: "dataRequest",
+      subjectId: request!.id,
+      payload: { kind: request!.kind, status: request!.status },
+    });
+    ctx.queueEvent("contact.dataRequestSubmitted", {
+      contactId: request!.contactId,
+      dataRequestId: request!.id,
+      kind: request!.kind,
+    });
+    return request!;
+  },
+});
+
+export const createMyDataRequest = defineService({
+  name: "privacy.createMyDataRequest",
+  summary: "Submit a verified privacy request for the signed-in customer.",
+  kind: "mutation",
+  permission: "authenticated",
+  input: z.object({
+    jurisdiction: z.string().trim().max(100).nullable().optional(),
+    request: requestDetails,
+  }),
+  output: dataRequestRow,
+  handler: async (input, ctx) => {
+    const contact = await personalContact(ctx.tx, ctx.actor);
+    const [request] = await ctx.tx
+      .insert(dataRequests)
+      .values(
+        requestValues(
+          input.request,
+          ctx.actor,
+          contact.id,
+          true,
+          input.jurisdiction,
+        ),
+      )
+      .returning();
+    ctx.setSubject("dataRequest", request!.id);
+    await ctx.emitTimeline({
+      contactId: contact.id,
+      eventType: "contact.dataRequestSubmitted",
+      subjectType: "dataRequest",
+      subjectId: request!.id,
+      payload: { kind: request!.kind, status: request!.status },
+    });
+    ctx.queueEvent("contact.dataRequestSubmitted", {
+      contactId: contact.id,
+      dataRequestId: request!.id,
+      kind: request!.kind,
+    });
+    return request!;
+  },
+});
+
+async function contactRetentionExceptions(tx: Tx, contactId: string) {
+  return tx.select(getTableColumns(privacyRetentionExceptions)).from(privacyRetentionExceptions)
+    .innerJoin(dataRequests, eq(dataRequests.id, privacyRetentionExceptions.dataRequestId))
+    .where(eq(dataRequests.contactId, contactId))
+    .orderBy(asc(privacyRetentionExceptions.scope), asc(privacyRetentionExceptions.createdAt), asc(privacyRetentionExceptions.id));
+}
+
+async function requestWithDetails(tx: Tx, id: string) {
+  const [request] = await tx
+    .select()
+    .from(dataRequests)
+    .where(eq(dataRequests.id, id))
+    .limit(1);
+  if (!request) throw new ServiceError("not_found", "That privacy request is not here.");
+  const [exceptions, artifact] = await Promise.all([
+    contactRetentionExceptions(tx, request.contactId),
+    tx
+      .select({
+        id: dataRequestArtifacts.id,
+        filename: dataRequestArtifacts.filename,
+        mime: dataRequestArtifacts.mime,
+        sha256: dataRequestArtifacts.sha256,
+        expiresAt: dataRequestArtifacts.expiresAt,
+        createdAt: dataRequestArtifacts.createdAt,
+      })
+      .from(dataRequestArtifacts)
+      .where(eq(dataRequestArtifacts.dataRequestId, id))
+      .limit(1)
+      .then((rows) => rows[0] ?? null),
+  ]);
+  return { request, exceptions, artifact };
+}
+
+export const listDataRequests = defineService({
+  name: "contacts.listDataRequests",
+  summary: "List contact privacy requests by status and response deadline.",
+  kind: "query",
+  permission: "scoped",
+  input: z.object({
+    status: dataRequestStatus.optional(),
+    contactId: z.string().uuid().optional(),
+    limit: z.number().int().min(1).max(100).default(50),
+    offset: z.number().int().min(0).default(0),
+  }),
+  output: listed(
+    row({
+      request: dataRequestRow,
+      contact: contactRow,
+    }),
+  ),
+  handler: (input, ctx) => {
+    const where = and(
+      input.status ? eq(dataRequests.status, input.status) : undefined,
+      input.contactId ? eq(dataRequests.contactId, input.contactId) : undefined,
+    );
+    return ctx.tx
+      .select({ request: dataRequests, contact: contacts })
+      .from(dataRequests)
+      .innerJoin(contacts, eq(contacts.id, dataRequests.contactId))
+      .where(where)
+      .orderBy(asc(dataRequests.responseDueAt), desc(dataRequests.createdAt))
+      .limit(input.limit)
+      .offset(input.offset);
+  },
+});
+
+export const getDataRequest = defineService({
+  name: "contacts.getDataRequest",
+  summary: "Read one privacy request, its retention exceptions, and artifact metadata.",
+  kind: "query",
+  permission: "scoped",
+  input: z.object({ id: z.string().uuid() }),
+  output: z.object({
+    request: dataRequestRow,
+    exceptions: listed(retentionExceptionRow),
+    artifact: artifactMeta.nullable(),
+  }),
+  handler: (input, ctx) => requestWithDetails(ctx.tx, input.id),
+});
+
+export const listMyDataRequests = defineService({
+  name: "privacy.listMyDataRequests",
+  summary: "List privacy requests belonging to the signed-in customer.",
+  kind: "query",
+  permission: "authenticated",
+  input: z.object({}),
+  output: listed(
+    row({
+      request: dataRequestRow,
+      artifact: row({
+        id: uuid.nullable(),
+        filename: z.string().nullable(),
+        sha256: z.string().nullable(),
+        expiresAt: timestamp.nullable(),
+      }).nullable(),
+    }),
+  ),
+  handler: async (_input, ctx) => {
+    const contact = await personalContact(ctx.tx, ctx.actor);
+    return ctx.tx
+      .select({
+        request: dataRequests,
+        artifact: {
+          id: dataRequestArtifacts.id,
+          filename: dataRequestArtifacts.filename,
+          sha256: dataRequestArtifacts.sha256,
+          expiresAt: dataRequestArtifacts.expiresAt,
+        },
+      })
+      .from(dataRequests)
+      .leftJoin(
+        dataRequestArtifacts,
+        eq(dataRequestArtifacts.dataRequestId, dataRequests.id),
+      )
+      .where(eq(dataRequests.contactId, contact.id))
+      .orderBy(desc(dataRequests.createdAt));
+  },
+});
+
+const openRequestStatuses = ["submitted", "verified", "in_progress"] as const;
+
+function isOpenRequestStatus(status: string): boolean {
+  return (openRequestStatuses as readonly string[]).includes(status);
+}
+
+export const verifyDataRequest = defineService({
+  name: "contacts.verifyDataRequest",
+  summary: "Confirm the requester's identity before personal data is handled.",
+  kind: "mutation",
+  permission: "scoped",
+  input: z.object({ id: z.string().uuid(), method: z.string().trim().min(1).max(200) }),
+  output: dataRequestRow,
+  handler: async (input, ctx) => {
+    const [request] = await ctx.tx
+      .update(dataRequests)
+      .set({
+        status: "verified",
+        verificationMethod: input.method,
+        verifiedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(dataRequests.id, input.id),
+          eq(dataRequests.status, "submitted"),
+        ),
+      )
+      .returning();
+    if (!request) {
+      throw new ServiceError("conflict", "That request is not awaiting verification.");
+    }
+    ctx.setSubject("dataRequest", request.id);
+    await ctx.emitTimeline({
+      contactId: request.contactId,
+      eventType: "contact.dataRequestVerified",
+      subjectType: "dataRequest",
+      subjectId: request.id,
+      payload: { kind: request.kind },
+    });
+    ctx.queueEvent("contact.dataRequestVerified", {
+      contactId: request.contactId,
+      dataRequestId: request.id,
+      kind: request.kind,
+    });
+    return request;
+  },
+});
+
+export const startDataRequest = defineService({
+  name: "contacts.startDataRequest",
+  summary: "Mark a verified privacy request as actively being handled.",
+  kind: "mutation",
+  permission: "scoped",
+  input: z.object({ id: z.string().uuid() }),
+  output: dataRequestRow,
+  handler: async (input, ctx) => {
+    const [request] = await ctx.tx
+      .update(dataRequests)
+      .set({ status: "in_progress" })
+      .where(
+        and(
+          eq(dataRequests.id, input.id),
+          eq(dataRequests.status, "verified"),
+        ),
+      )
+      .returning();
+    if (!request) {
+      throw new ServiceError("conflict", "Verify that request before starting it.");
+    }
+    ctx.setSubject("dataRequest", request.id);
+    return request;
+  },
+});
+
+export const addRetentionException = defineService({
+  name: "contacts.addPrivacyRetentionException",
+  summary: "Document why one data scope must survive an erasure request.",
+  kind: "mutation",
+  permission: "scoped",
+  input: z
+    .object({
+      dataRequestId: z.string().uuid(),
+      scope: z.string().trim().min(1).max(200),
+      reason: retentionReason,
+      legalBasis: z.string().trim().min(1).max(1_000),
+      notes: z.string().trim().max(4_000).nullable().optional(),
+      expiresAt: z.string().datetime().nullable().optional(),
+    })
+    .refine(
+      (input) => !input.expiresAt || new Date(input.expiresAt) > new Date(),
+      { path: ["expiresAt"], message: "Expiry must be in the future." },
+    ),
+  output: retentionExceptionRow,
+  handler: async (input, ctx) => {
+    await refusePendingErasure(ctx.tx, input.dataRequestId);
+    const [request] = await ctx.tx
+      .select()
+      .from(dataRequests)
+      .where(eq(dataRequests.id, input.dataRequestId))
+      .limit(1);
+    if (!request) throw new ServiceError("not_found", "That privacy request is not here.");
+    if (request.kind !== "erasure" || !isOpenRequestStatus(request.status)) {
+      throw new ServiceError(
+        "conflict",
+        "Retention exceptions belong only to open erasure requests.",
+      );
+    }
+    if (!privacySourceRegistry.some((source) => source.scope === input.scope)) {
+      throw new ServiceError("validation", "Choose a registered personal-data scope.");
+    }
+    // refusePendingErasure holds the shared identity and request locks, so
+    // concurrent hold changes cannot turn an update into an invented first
+    // snapshot. The unique request/scope index backs this exact lookup.
+    const [previous] = await ctx.tx.select({ id: privacyRetentionExceptions.id }).from(privacyRetentionExceptions)
+      .where(and(eq(privacyRetentionExceptions.dataRequestId, request.id), eq(privacyRetentionExceptions.scope, input.scope))).limit(1);
+    const [exception] = await ctx.tx
+      .insert(privacyRetentionExceptions)
+      .values({
+        dataRequestId: request.id,
+        scope: input.scope,
+        reason: input.reason,
+        legalBasis: input.legalBasis,
+        notes: input.notes ?? null,
+        expiresAt: input.expiresAt ? new Date(input.expiresAt) : null,
+        createdBy: actorString(ctx.actor),
+      })
+      .onConflictDoUpdate({
+        target: [
+          privacyRetentionExceptions.dataRequestId,
+          privacyRetentionExceptions.scope,
+        ],
+        set: {
+          reason: input.reason,
+          legalBasis: input.legalBasis,
+          notes: input.notes ?? null,
+          expiresAt: input.expiresAt ? new Date(input.expiresAt) : null,
+          createdBy: actorString(ctx.actor),
+        },
+      })
+      .returning();
+    const sources = privacySourceRegistry.filter(source => source.scope === input.scope || source.retentionScopes?.includes(input.scope))
+      .toSorted((a, b) => (a.eraseOrder ?? 100) - (b.eraseOrder ?? 100) || a.scope.localeCompare(b.scope));
+    for (const source of sources) {
+      await source.captureRetention?.(ctx.tx, request.contactId, { requestId: request.id, exceptionId: exception!.id, isNew: !previous, service: ctx });
+    }
+    ctx.setSubject("retentionException", exception!.id);
+    return exception!;
+  },
+});
+
+export const removeRetentionException = defineService({
+  name: "contacts.removePrivacyRetentionException",
+  summary: "Remove a no-longer-applicable erasure retention exception.",
+  kind: "mutation",
+  permission: "scoped",
+  input: z.object({ id: z.string().uuid() }),
+  output: okResult,
+  handler: async (input, ctx) => {
+    const [existing] = await ctx.tx.select().from(privacyRetentionExceptions).where(eq(privacyRetentionExceptions.id, input.id)).limit(1);
+    if (existing) await refusePendingErasure(ctx.tx, existing.dataRequestId);
+    const [exception] = await ctx.tx
+      .delete(privacyRetentionExceptions)
+      .where(eq(privacyRetentionExceptions.id, input.id))
+      .returning();
+    if (!exception) {
+      throw new ServiceError("not_found", "That retention exception is not here.");
+    }
+    ctx.setSubject("retentionException", exception.id);
+    return { ok: true };
+  },
+});
+
+export const cancelMyDataRequest = defineService({
+  name: "privacy.cancelMyDataRequest",
+  summary: "Cancel the signed-in customer's open privacy request.",
+  kind: "mutation",
+  permission: "authenticated",
+  input: z.object({ id: z.string().uuid() }),
+  output: dataRequestRow,
+  handler: async (input, ctx) => {
+    const contact = await personalContact(ctx.tx, ctx.actor);
+    const [owned] = await ctx.tx.select({ id: dataRequests.id }).from(dataRequests)
+      .where(and(eq(dataRequests.id, input.id), eq(dataRequests.contactId, contact.id))).limit(1);
+    if (!owned) throw new ServiceError("conflict", "That request can no longer be cancelled.");
+    await refusePendingErasure(ctx.tx, input.id);
+    const [request] = await ctx.tx
+      .update(dataRequests)
+      .set({ status: "cancelled", resolution: "Cancelled by the requester." })
+      .where(
+        and(
+          eq(dataRequests.id, input.id),
+          eq(dataRequests.contactId, contact.id),
+          inArray(dataRequests.status, [...openRequestStatuses]),
+        ),
+      )
+      .returning();
+    if (!request) {
+      throw new ServiceError("conflict", "That request can no longer be cancelled.");
+    }
+    ctx.setSubject("dataRequest", request.id);
+    return request;
+  },
+});
+
+async function saveArtifact(
+  tx: Tx,
+  request: typeof dataRequests.$inferSelect,
+  body: unknown,
+) {
+  const filename = `freeholder-${request.kind}-${request.id}.json`;
+  const values = {
+    dataRequestId: request.id,
+    filename,
+    mime: "application/json",
+    body,
+    sha256: artifactChecksum(body),
+    expiresAt: addDays(new Date(), 30),
+    lastDownloadedAt: null,
+  };
+  const [artifact] = await tx
+    .insert(dataRequestArtifacts)
+    .values(values)
+    .onConflictDoUpdate({
+      target: dataRequestArtifacts.dataRequestId,
+      set: {
+        filename: values.filename,
+        mime: values.mime,
+        body: values.body,
+        sha256: values.sha256,
+        expiresAt: values.expiresAt,
+        lastDownloadedAt: null,
+        createdAt: new Date(),
+      },
+    })
+    .returning();
+  return artifact!;
+}
+
+async function portableExport(
+  tx: Tx,
+  request: typeof dataRequests.$inferSelect,
+  contact: typeof contacts.$inferSelect,
+) {
+  await lockContactIdentity(tx);
+  const consent = await consentBundle(tx, contact.id);
+  const sources: Record<string, unknown> = {};
+  for (const source of privacySourceRegistry) {
+    sources[source.scope] = await source.exportData(tx, contact.id);
+  }
+  return {
+    format: "freeholder.contact-export",
+    version: 1,
+    generatedAt: new Date().toISOString(),
+    request: {
+      id: request.id,
+      kind: request.kind,
+      requestedAt: request.createdAt,
+    },
+    contact,
+    preferences: consent.effective,
+    consentHistory: consent.history,
+    sources,
+  };
+}
+
+function scrubContactSnapshot(value: unknown): Record<string, unknown> {
+  const id =
+    value && typeof value === "object" && "id" in value
+      ? String(value.id)
+      : "erased";
+  return { id, name: "Erased contact", erased: true };
+}
+
+registerContactPrivacySource({
+  scope: "contact.timeline",
+  tables: ["timeline_events"],
+  exportData: async (tx, contactId) => {
+    const { contactIds } = await contactPrivacyIdentity(tx, contactId);
+    const history = await contactPrivacyHistory(tx, contactIds);
+    return tx.select({
+      ...getTableColumns(timelineEvents),
+      contactId: sql<string | null>`case when ${timelineEvents.contactId} in (${sql.join(contactIds.map(id => sql`${id}::uuid`), sql`, `)}) then ${timelineEvents.contactId} else null end`,
+      subjectId: sql<string | null>`case when ${timelineEvents.subjectType}='contact' and not (${timelineEvents.subjectId} in (${sql.join(contactIds.map(id => sql`${id}`), sql`, `)})) then null else ${timelineEvents.subjectId} end`,
+      // Merge payloads name the other party even on an otherwise owned record.
+      payload: sql`case when ${timelineEvents.eventType} in ('contact.merged','contact.mergeUndone') or not ${contactHistoryOwnership(timelineEvents.contactId,timelineEvents.occurredAt,contactIds,"all")} then '{}'::jsonb else ${timelineEvents.payload} end`,
+    }).from(timelineEvents).where(and(
+      inArray(timelineEvents.contactId, history.contactIds),
+      contactHistoryOwnership(timelineEvents.contactId,timelineEvents.occurredAt,contactIds,"any"),
+    )).orderBy(asc(timelineEvents.occurredAt));
+  },
+  erase: async (tx, contactId) => {
+    const { contactIds } = await contactPrivacyIdentity(tx, contactId);
+    const history = await contactPrivacyHistory(tx, contactIds);
+    const rows = await tx.update(timelineEvents)
+      .set({ subjectId: null, payload: { erased: true } })
+      .where(and(inArray(timelineEvents.contactId, history.contactIds),
+        contactHistoryOwnership(timelineEvents.contactId,timelineEvents.occurredAt,contactIds,"any")))
+      .returning({ id: timelineEvents.id });
+    return { affected: rows.length };
+  },
+});
+
+registerContactPrivacySource({
+  scope: "contact.relationships",
+  tables: ["contact_relationships"],
+  exportData: (tx, contactId) =>
+    tx
+      .select()
+      .from(contactRelationships)
+      .where(
+        or(
+          eq(contactRelationships.fromContactId, contactId),
+          eq(contactRelationships.toContactId, contactId),
+        ),
+      ),
+  erase: async (tx, contactId) => {
+    const rows = await tx
+      .delete(contactRelationships)
+      .where(
+        or(
+          eq(contactRelationships.fromContactId, contactId),
+          eq(contactRelationships.toContactId, contactId),
+        ),
+      )
+      .returning({ id: contactRelationships.id });
+    return { affected: rows.length };
+  },
+});
+
+registerContactPrivacySource({
+  scope: "contact.credentials",
+  tables: ["customer_magic_links"],
+  retain: async (tx, contactId) => {
+    const contact = await requireContact(tx, contactId);
+    await tx.delete(customerMagicLinks).where(eq(customerMagicLinks.contactId, contactId));
+    if (!contact.userId) return;
+    const [account] = await tx.select().from(users).where(eq(users.id, contact.userId)).limit(1).for("update");
+    if (!account) return;
+    const grants = await tx.select({ module: roleGrants.module }).from(roleGrants).where(eq(roleGrants.roleKey, account.role));
+    if (account.role !== "customer" || grants.length > 0) throw new ServiceError("conflict", "This contact is linked to a staff-capable login. Unlink or reassign that login before erasure.");
+    // Keep only the parent identity needed by explicitly held children. No
+    // password, device proof, recovery token or agent credential stays usable.
+    for (const table of [sessions, passwordResets, totpFactors, webauthnCredentials, twoFactorRecoveryCodes, twoFactorChallenges, loginSecurityEvents]) {
+      await tx.delete(table).where(eq(table.userId, account.id));
+    }
+    await tx.update(apiKeys).set({ revokedAt: sql`coalesce(${apiKeys.revokedAt}, clock_timestamp())`, updatedAt: new Date() }).where(eq(apiKeys.actsAsUserId, account.id));
+    await tx.update(users).set({ email: `erased-${account.id}@erased.invalid`, passwordHash: null, otpSecret: null, lastLoginAt: null, updatedAt: new Date() }).where(eq(users.id, account.id));
+  },
+  exportData: async (tx, contactId) => {
+    const contact = await requireContact(tx, contactId);
+    const links = await tx
+      .select({
+        id: customerMagicLinks.id,
+        email: customerMagicLinks.email,
+        expiresAt: customerMagicLinks.expiresAt,
+        usedAt: customerMagicLinks.usedAt,
+        createdAt: customerMagicLinks.createdAt,
+      })
+      .from(customerMagicLinks)
+      .where(eq(customerMagicLinks.contactId, contactId));
+    if (!contact.userId) return { account: null, sessions: [], magicLinks: links };
+    const [account] = await tx
+      .select({
+        id: users.id,
+        email: users.email,
+        role: users.role,
+        lastLoginAt: users.lastLoginAt,
+        createdAt: users.createdAt,
+        updatedAt: users.updatedAt,
+      })
+      .from(users)
+      .where(eq(users.id, contact.userId))
+      .limit(1);
+    const accountSessions = await tx
+      .select({
+        id: sessions.id,
+        expiresAt: sessions.expiresAt,
+        lastSeenAt: sessions.lastSeenAt,
+        createdAt: sessions.createdAt,
+      })
+      .from(sessions)
+      .where(eq(sessions.userId, contact.userId));
+    return { account: account ?? null, sessions: accountSessions, magicLinks: links };
+  },
+  erase: async (tx, contactId) => {
+    const contact = await requireContact(tx, contactId);
+    const links = await tx
+      .delete(customerMagicLinks)
+      .where(eq(customerMagicLinks.contactId, contactId))
+      .returning({ id: customerMagicLinks.id });
+    if (!contact.userId) return { affected: links.length };
+    const [account] = await tx
+      .select()
+      .from(users)
+      .where(eq(users.id, contact.userId))
+      .limit(1);
+    if (!account) return { affected: links.length };
+    const grants = await tx
+      .select({ module: roleGrants.module })
+      .from(roleGrants)
+      .where(eq(roleGrants.roleKey, account.role));
+    if (account.role !== "customer" || grants.length > 0) {
+      throw new ServiceError(
+        "conflict",
+        "This contact is linked to a staff-capable login. Unlink or reassign that login before erasure.",
+      );
+    }
+    await tx.delete(users).where(eq(users.id, account.id));
+    return { affected: links.length + 1 };
+  },
+});
+
+async function mergePrivacyView(tx:Tx,contactId:string){
+  const identity=await contactPrivacyIdentity(tx,contactId);
+  const history=await contactPrivacyHistory(tx,identity.contactIds);
+  const rows=history.operations.length?await tx.select({
+    id:contactMergeOperations.id,candidateId:contactMergeOperations.candidateId,
+    survivingContactId:contactMergeOperations.survivingContactId,duplicateContactId:contactMergeOperations.duplicateContactId,
+    survivorBefore:contactMergeOperations.survivorBefore,duplicateBefore:contactMergeOperations.duplicateBefore,survivorAfter:contactMergeOperations.survivorAfter,
+    undoable:contactMergeOperations.undoable,mergedAt:contactMergeOperations.mergedAt,undoneAt:contactMergeOperations.undoneAt,
+  }).from(contactMergeOperations).where(inArray(contactMergeOperations.id,history.operations.map(operation=>operation.id))).orderBy(asc(contactMergeOperations.mergedAt),asc(contactMergeOperations.id)):[];
+  const operations=rows.map(operation=>{
+    const point=history.operation(operation.id)!;
+    const survivorBefore=history.at(operation.survivingContactId,point.mergedMicros,operation.id);
+    const duplicateBefore=history.at(operation.duplicateContactId,point.mergedMicros,operation.id);
+    const survivorAfter=history.at(operation.survivingContactId,point.mergedMicros);
+    return {operation,survivorBefore,duplicateBefore,survivorAfter};
+  }).filter(value=>value.survivorBefore.containsSubject||value.duplicateBefore.containsSubject||value.survivorAfter.containsSubject);
+  const candidateIds=operations.flatMap(({operation})=>operation.candidateId?[operation.candidateId]:[]);
+  const candidates=await tx.select({...getTableColumns(mergeCandidates),detectedMicros:sql<string>`(extract(epoch from ${mergeCandidates.detectedAt})*1000000)::bigint::text`}).from(mergeCandidates).where(or(
+    inArray(mergeCandidates.contactAId,history.contactIds),inArray(mergeCandidates.contactBId,history.contactIds),
+    candidateIds.length?inArray(mergeCandidates.id,candidateIds):undefined,
+  ));
+  const addresses=new Set(identity.emails);
+  const candidateViews=candidates.map(candidate=>{
+    const a=candidate.contactAId?history.at(candidate.contactAId,candidate.detectedMicros):null;
+    const b=candidate.contactBId?history.at(candidate.contactBId,candidate.detectedMicros):null;
+    const linked=candidateIds.includes(candidate.id);
+    const aContains=a?.containsSubject??(linked||!!candidate.contactAEmail&&addresses.has(candidate.contactAEmail.toLowerCase()));
+    const bContains=b?.containsSubject??(linked||!!candidate.contactBEmail&&addresses.has(candidate.contactBEmail.toLowerCase()));
+    return {candidate,a,b,aContains,bContains};
+  }).filter(value=>value.aContains||value.bContains);
+  return {identity,operations,candidates:candidateViews};
+}
+
+registerContactPrivacySource({
+  scope:"contact.merge_history",tables:["merge_candidates","contact_merge_operations"],
+  exportData:async(tx,contactId)=>{
+    const view=await mergePrivacyView(tx,contactId),owned=new Set(view.identity.contactIds);
+    return {
+      candidates:view.candidates.map(({candidate,a,b})=>({
+        id:candidate.id,score:candidate.score,status:candidate.status,detectedAt:candidate.detectedAt,dismissedAt:candidate.dismissedAt,mergedAt:candidate.mergedAt,updatedAt:candidate.updatedAt,
+        contactAId:a?.onlySubject?candidate.contactAId:null,contactAName:a?.onlySubject?candidate.contactAName:null,contactAEmail:a?.onlySubject?candidate.contactAEmail:null,
+        contactBId:b?.onlySubject?candidate.contactBId:null,contactBName:b?.onlySubject?candidate.contactBName:null,contactBEmail:b?.onlySubject?candidate.contactBEmail:null,
+        reasons:[],recoveryDataRedacted:true,
+      })),
+      operations:view.operations.map(({operation,survivorBefore,duplicateBefore,survivorAfter})=>({
+        id:operation.id,candidateId:operation.candidateId,
+        survivingContactId:owned.has(operation.survivingContactId)?operation.survivingContactId:null,
+        duplicateContactId:owned.has(operation.duplicateContactId)?operation.duplicateContactId:null,
+        survivorBefore:survivorBefore.onlySubject?operation.survivorBefore:{redacted:true},
+        duplicateBefore:duplicateBefore.onlySubject?operation.duplicateBefore:{redacted:true},
+        survivorAfter:survivorAfter.onlySubject?operation.survivorAfter:{redacted:true},
+        referenceState:[],undoable:operation.undoable,undoBlockers:[],mergedAt:operation.mergedAt,undoneAt:operation.undoneAt,recoveryDataRedacted:true,
+      })),
+    };
+  },
+  erase:async(tx,contactId)=>{
+    const view=await mergePrivacyView(tx,contactId);
+    for(const {candidate,aContains,bContains} of view.candidates)await tx.update(mergeCandidates).set({
+      contactAName:aContains?"Erased contact":candidate.contactAName,contactAEmail:aContains?null:candidate.contactAEmail,
+      contactBName:bContains?"Erased contact":candidate.contactBName,contactBEmail:bContains?null:candidate.contactBEmail,reasons:[],
+    }).where(eq(mergeCandidates.id,candidate.id));
+    for(const {operation,survivorBefore,duplicateBefore,survivorAfter} of view.operations)await tx.update(contactMergeOperations).set({
+      survivorBefore:survivorBefore.containsSubject?scrubContactSnapshot(operation.survivorBefore):operation.survivorBefore,
+      duplicateBefore:duplicateBefore.containsSubject?scrubContactSnapshot(operation.duplicateBefore):operation.duplicateBefore,
+      survivorAfter:survivorAfter.containsSubject?scrubContactSnapshot(operation.survivorAfter):operation.survivorAfter,
+      referenceState:[],undoable:false,undoBlockers:["Personal data was erased after this merge, so it cannot be undone."],
+    }).where(eq(contactMergeOperations.id,operation.id));
+    return {affected:view.candidates.length+view.operations.length};
+  },
+});
+
+registerContactPrivacySource({
+  scope: "contact.audit",
+  tables: ["audit_log"],
+  exportData: async (tx, contactId) => {
+    const {contactIds}=await contactPrivacyIdentity(tx,contactId);
+    const history=await contactPrivacyHistory(tx,contactIds);
+    const requestIds = await tx
+      .select({ id: dataRequests.id })
+      .from(dataRequests)
+      .where(eq(dataRequests.contactId, contactId));
+    return tx
+      .select({...getTableColumns(auditLog),
+        subjectId:sql<string|null>`case when ${auditLog.subjectType}='contact' and ${auditLog.subjectId} not in (${sql.join(contactIds.map(id=>sql`${id}`),sql`, `)}) then null else ${auditLog.subjectId} end`,
+        diff:sql`case when ${auditLog.subjectType}='contact' and not ${contactHistoryOwnership(auditLog.subjectId,auditLog.at,contactIds,"all")} then '{}'::jsonb else ${auditLog.diff} end`,
+      })
+      .from(auditLog)
+      .where(
+        or(
+          and(eq(auditLog.subjectType,"contact"),inArray(auditLog.subjectId,history.contactIds),contactHistoryOwnership(auditLog.subjectId,auditLog.at,contactIds,"any")),
+          requestIds.length
+            ? and(
+                eq(auditLog.subjectType, "dataRequest"),
+                inArray(
+                  auditLog.subjectId,
+                  requestIds.map((row) => row.id),
+                ),
+              )
+            : undefined,
+        ),
+      )
+      .orderBy(asc(auditLog.at));
+  },
+  erase: async (tx, contactId) => {
+    const contact = await requireContact(tx, contactId);
+    const {contactIds}=await contactPrivacyIdentity(tx,contactId);
+    const history=await contactPrivacyHistory(tx,contactIds);
+    const requestIds = await tx
+      .select({ id: dataRequests.id })
+      .from(dataRequests)
+      .where(eq(dataRequests.contactId, contactId));
+    const contactRows = await tx
+      .update(auditLog)
+      .set({ diff: {} })
+      .where(
+        or(
+          and(eq(auditLog.subjectType,"contact"),inArray(auditLog.subjectId,history.contactIds),contactHistoryOwnership(auditLog.subjectId,auditLog.at,contactIds,"any")),
+          requestIds.length
+            ? and(
+                eq(auditLog.subjectType, "dataRequest"),
+                inArray(
+                  auditLog.subjectId,
+                  requestIds.map((row) => row.id),
+                ),
+              )
+            : undefined,
+        ),
+      )
+      .returning({ id: auditLog.id });
+    if (contact.userId) {
+      await tx
+        .update(auditLog)
+        .set({ actor: "erased:user" })
+        .where(eq(auditLog.actor, `user:${contact.userId}`));
+    }
+    return { affected: contactRows.length };
+  },
+});
+
+registerContactPrivacySource({
+  scope: "privacy.records",
+  tables: ["consent_records", "data_requests"],
+  exportData: async (tx, contactId) => {
+    const requests = await tx
+      .select()
+      .from(dataRequests)
+      .where(eq(dataRequests.contactId, contactId))
+      .orderBy(asc(dataRequests.createdAt));
+    const artifacts = requests.length
+      ? await tx
+          .select({
+            id: dataRequestArtifacts.id,
+            dataRequestId: dataRequestArtifacts.dataRequestId,
+            filename: dataRequestArtifacts.filename,
+            mime: dataRequestArtifacts.mime,
+            sha256: dataRequestArtifacts.sha256,
+            expiresAt: dataRequestArtifacts.expiresAt,
+            createdAt: dataRequestArtifacts.createdAt,
+          })
+          .from(dataRequestArtifacts)
+          .where(
+            inArray(
+              dataRequestArtifacts.dataRequestId,
+              requests.map((row) => row.id),
+            ),
+          )
+      : [];
+    return {
+      consent: await tx
+        .select()
+        .from(consentRecords)
+        .where(eq(consentRecords.contactId, contactId))
+        .orderBy(asc(consentRecords.occurredAt)),
+      requests,
+      artifacts,
+    };
+  },
+  erase: async (tx, contactId, context) => {
+    const requests = await tx
+      .select({ id: dataRequests.id })
+      .from(dataRequests)
+      .where(eq(dataRequests.contactId, contactId));
+    let affected = 0;
+    if (requests.length) {
+      const removed = await tx
+        .delete(dataRequestArtifacts)
+        .where(
+          and(
+            inArray(
+              dataRequestArtifacts.dataRequestId,
+              requests.map((row) => row.id),
+            ),
+            sql`${dataRequestArtifacts.dataRequestId} <> ${context.requestId}`,
+          ),
+        )
+        .returning({ id: dataRequestArtifacts.id });
+      affected += removed.length;
+      const scrubbed = await tx
+        .update(dataRequests)
+        .set({
+          jurisdiction: null,
+          details: {},
+          requestedBy: "erased",
+          verificationMethod: "identity verified before erasure",
+          resolution: "Personal details erased.",
+        })
+        .where(eq(dataRequests.contactId, contactId))
+        .returning({ id: dataRequests.id });
+      affected += scrubbed.length;
+      await tx
+        .update(privacyRetentionExceptions)
+        .set({ notes: null })
+        .where(
+          inArray(
+            privacyRetentionExceptions.dataRequestId,
+            requests.map((row) => row.id),
+          ),
+        );
+    }
+    const consent = await tx
+      .update(consentRecords)
+      .set({
+        termsVersion: null,
+        sourceUrl: null,
+        ip: null,
+        evidence: {},
+        actor: "erased",
+      })
+      .where(eq(consentRecords.contactId, contactId))
+      .returning({ id: consentRecords.id });
+    return { affected: affected + consent.length };
+  },
+});
+
+async function eraseContact(
+  ctx: ServiceContext,
+  request: typeof dataRequests.$inferSelect,
+) {
+  const tx = ctx.tx;
+  await lockContactIdentity(tx);
+  const now = new Date();
+  const exceptions = (await contactRetentionExceptions(tx, request.contactId))
+    .filter((item) => !item.expiresAt || item.expiresAt > now);
+  const outcomes: Array<Record<string, unknown>> = [];
+  const ordered = [...privacySourceRegistry].sort((a, b) => (a.eraseOrder ?? 100) - (b.eraseOrder ?? 100));
+  const loginScopes = ordered.filter(source => source.requiresLogin)
+    .flatMap(source => [source.scope, ...(source.retentionScopes ?? [])]);
+  let retainedLogin = false;
+  for (const source of ordered) {
+    const scopes = new Set([source.scope, ...(source.retentionScopes ?? []), ...(source.scope === "contact.credentials" ? loginScopes : [])]);
+    const retained = exceptions.filter(exception => scopes.has(exception.scope));
+    if (retained.length) {
+      // Each original hold must reach opaque-source keepers. A later short
+      // hold must never replace an older continuing hold for the same scope.
+      for (const hold of retained) await source.retain?.(tx, request.contactId, { requestId: hold.dataRequestId, exceptionId: hold.id, service: ctx });
+      const unheld = await source.eraseUnheld?.(tx, request.contactId, { requestId: request.id, service: ctx });
+      const pendingJobs = unheld?.pendingJobs?.length ? [...new Set(z.array(z.uuid()).parse(unheld.pendingJobs))] : [];
+      const exception = retained[0]!;
+      if (source.scope === "contact.credentials") retainedLogin = true;
+      outcomes.push({
+        scope: source.scope,
+        outcome: "retained",
+        ...(unheld ? { affected: unheld.affected } : {}),
+        ...(pendingJobs.length ? { pendingJobs } : {}),
+        exceptionId: exception.id,
+        retentionRequestId: exception.dataRequestId,
+        reason: exception.reason,
+        legalBasis: exception.legalBasis,
+        expiresAt: retained.some(hold => !hold.expiresAt) ? null : new Date(Math.max(...retained.map(hold => hold.expiresAt!.getTime()))),
+        retentionExceptions: retained.map(hold => ({ id: hold.id, dataRequestId: hold.dataRequestId, reason: hold.reason, legalBasis: hold.legalBasis, expiresAt: hold.expiresAt })),
+      });
+      continue;
+    }
+    const result = await source.erase(tx, request.contactId, {
+      requestId: request.id,
+      service: ctx,
+    });
+    outcomes.push({
+      scope: source.scope,
+      outcome: result.pendingJobs?.length ? "pending" : "erased",
+      affected: result.affected,
+      ...(result.pendingJobs?.length ? { pendingJobs: z.array(z.uuid()).parse(result.pendingJobs) } : {}),
+    });
+  }
+  const [contact] = await tx
+    .update(contacts)
+    .set({
+      ...(retainedLogin ? {} : { userId: null }),
+      name: "Erased contact",
+      email: null,
+      phone: null,
+      orgId: null,
+      source: "privacy-erasure",
+      tags: [],
+      customFields: {},
+      lifecycleStage: "lead",
+      preferredLocale: null,
+      timezone: null,
+      country: null,
+      ownerNotes: null,
+    })
+    .where(eq(contacts.id, request.contactId))
+    .returning();
+  if (!contact) throw new ServiceError("not_found", "That contact no longer exists.");
+  await tx.insert(consentRecords).values(
+    MARKETING_CHANNELS.map((channel) => ({
+      contactId: contact.id,
+      purpose: "marketing" as const,
+      channel,
+      state: "withdrawn" as const,
+      method: "system" as const,
+      evidence: { reason: "privacy_erasure", dataRequestId: request.id },
+      actor: "system:privacy-erasure",
+      occurredAt: now,
+    })),
+  );
+  return { contact, outcomes, pending: outcomes.some(hasPendingErasureWork), partiallyCompleted: exceptions.length > 0 };
+}
+
+const erasureReceipt = z.object({
+  format: z.literal("freeholder.erasure-receipt"),
+  outcomes: z.array(z.object({ scope: z.string(), outcome: z.string(),
+    pendingJobs: z.array(z.uuid()).optional(), completedJobs: z.array(z.uuid()).optional() }).passthrough()),
+}).passthrough();
+
+function hasPendingErasureWork(outcome: { outcome?: unknown; pendingJobs?: unknown }): boolean {
+  return outcome.outcome === "pending" || Array.isArray(outcome.pendingJobs) && outcome.pendingJobs.length > 0;
+}
+
+function pendingErasureReceipt(body: unknown): boolean {
+  const receipt = erasureReceipt.safeParse(body);
+  return receipt.success && receipt.data.outcomes.some(hasPendingErasureWork);
+}
+
+async function erasureWasApplied(tx: Tx, requestId: string): Promise<boolean> {
+  const [row] = await tx.select({ id: auditLog.id }).from(auditLog).where(and(
+    eq(auditLog.action, "contacts.fulfillDataRequest"), eq(auditLog.subjectType, "dataRequest"), eq(auditLog.subjectId, requestId),
+  )).limit(1);
+  return Boolean(row);
+}
+
+async function refusePendingErasure(tx: Tx, requestId: string): Promise<void> {
+  // Holds now belong to the subject across requests. Keep the same identity
+  // -> request lock order as fulfilment before changing any request's holds.
+  await lockContactIdentity(tx);
+  await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`privacy:${requestId}`}))`);
+  const [artifact] = await tx.select({ body: dataRequestArtifacts.body }).from(dataRequestArtifacts)
+    .where(eq(dataRequestArtifacts.dataRequestId, requestId)).limit(1);
+  if (artifact && pendingErasureReceipt(artifact.body)) {
+    throw new ServiceError("conflict", "Erasure has started and its provider jobs must finish or be repaired.");
+  }
+  const [request] = await tx.select().from(dataRequests).where(eq(dataRequests.id, requestId)).limit(1);
+  if (request?.kind === "erasure" && request.status === "in_progress" &&
+      (request.verificationMethod === "identity verified before erasure" || await erasureWasApplied(tx, requestId))) {
+    throw new ServiceError("conflict", "The applied erasure receipt needs recovery. Reconcile its original provider jobs before changing this request.");
+  }
+}
+
+/** Provider workers acknowledge only their own durable task, never a whole request. */
+export const completeErasureJob = defineService({
+  name: "privacy.completeErasureJob", summary: "Acknowledge one completed provider erasure job.",
+  kind: "mutation", permission: "system", external: false, pluginAccess: "manage",
+  input: z.object({ requestId: z.uuid(), scope: z.string(), jobId: z.uuid() }), output: okResult,
+  handler: async (input, ctx) => {
+    if (ctx.actor.kind === "plugin") {
+      const own = `plugins.${ctx.actor.name}`;
+      if (input.scope !== own && !input.scope.startsWith(`${own}.`)) throw new ServiceError("permission", "A plugin can acknowledge only its own provider erasure scope.");
+    }
+    await ctx.tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`privacy:${input.requestId}`}))`);
+    const [request] = await ctx.tx.select().from(dataRequests).where(eq(dataRequests.id, input.requestId)).limit(1);
+    const [artifact] = await ctx.tx.select().from(dataRequestArtifacts).where(eq(dataRequestArtifacts.dataRequestId, input.requestId)).limit(1);
+    if (!request || request.kind !== "erasure" || !artifact) throw new ServiceError("not_found", "No pending erasure receipt exists.");
+    const receipt = erasureReceipt.parse(artifact.body);
+    const outcome = receipt.outcomes.find(item => item.scope === input.scope);
+    if (!outcome || !outcome.pendingJobs?.includes(input.jobId)) return { ok: true };
+    if (request.status !== "in_progress") throw new ServiceError("conflict", "This erasure request is no longer in progress.");
+    // A selectively retained scope needs its actual acknowledgement to
+    // distinguish a completed replay from missing pending-job history.
+    if (outcome.outcome === "retained") outcome.completedJobs = [...new Set([...(outcome.completedJobs ?? []), input.jobId])];
+    outcome.pendingJobs = outcome.pendingJobs.filter(id => id !== input.jobId);
+    if (!outcome.pendingJobs.length) {
+      if (outcome.outcome !== "retained") outcome.outcome = "erased";
+      delete outcome.pendingJobs;
+    }
+    const pending = receipt.outcomes.some(hasPendingErasureWork);
+    const status = pending ? "in_progress" : receipt.outcomes.some(item => item.outcome === "retained") ? "partially_completed" : "completed";
+    await saveArtifact(ctx.tx, request, { ...receipt, status, generatedAt: new Date().toISOString(),
+      note: pending ? "Registered provider erasure work remains pending." : "Registered erasure work completed; any documented retention exceptions remain listed." });
+    if (!pending) {
+      await ctx.tx.update(dataRequests).set({ status, fulfilledAt: new Date(),
+        resolution: status === "partially_completed" ? "Completed with documented legal-retention exceptions." : "Request completed." }).where(eq(dataRequests.id, request.id));
+      await ctx.emitTimeline({ contactId: request.contactId, eventType: "contact.dataRequestCompleted", subjectType: "dataRequest", subjectId: request.id, payload: { kind: request.kind, status } });
+      ctx.queueEvent("contact.dataRequestCompleted", { contactId: request.contactId, dataRequestId: request.id, kind: request.kind, status });
+    }
+    ctx.setSubject("dataRequest", request.id);
+    return { ok: true };
+  },
+});
+
+/** A new positive source fact reopens its original receipt; it never invents missing history. */
+export const reopenErasureJob = defineService({
+  name: "privacy.reopenErasureJob", summary: "Reopen an original erasure scope after new source evidence, or require recovery of its original receipt.",
+  kind: "mutation", permission: "system", external: false,
+  input: z.object({ requestId: z.uuid(), scope: z.string().min(1).max(200), jobName: z.string().min(1).max(200), jobData: z.record(z.string(), z.unknown()), idempotencyKey: z.string().min(1).max(500) }),
+  output: z.object({ jobId: z.uuid().nullable(), recoveryRequired: z.boolean(), changed: z.boolean() }),
+  auditInputFields: ["requestId", "scope"], auditWhen: (output: { jobId: string | null; recoveryRequired: boolean; changed: boolean }) => output.changed,
+  handler: async (input, ctx) => {
+    await ctx.tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`privacy:${input.requestId}`}))`);
+    const [request] = await ctx.tx.select().from(dataRequests).where(eq(dataRequests.id, input.requestId)).for("update");
+    if (!request || request.kind !== "erasure") throw new ServiceError("not_found", "Restore the original erasure request before reconciling its late provider evidence.");
+    const source = privacySourceRegistry.find(source => source.scope === input.scope);
+    if (!source) throw new ServiceError("conflict", "The original erasure source is not registered.");
+    const [artifact] = await ctx.tx.select().from(dataRequestArtifacts).where(eq(dataRequestArtifacts.dataRequestId, request.id)).for("update");
+    const parsed = erasureReceipt.safeParse(artifact?.body);
+    const receipt = parsed.success ? parsed.data : null;
+    const outcome = receipt?.outcomes.find(item => item.scope === input.scope);
+    ctx.setSubject("dataRequest", request.id);
+    if (!artifact || !receipt || !outcome || !erasureArtifactIsIntact(artifact)) {
+      const resolution = "New source evidence requires recovery of the exact original erasure receipt before completion.";
+      const changed = request.status !== "in_progress" || request.fulfilledAt !== null || request.resolution !== resolution;
+      if (changed) await ctx.tx.update(dataRequests).set({ status: "in_progress", fulfilledAt: null, resolution }).where(eq(dataRequests.id, request.id));
+      // No fabricated replacement artifact, scope, absence proof or completion.
+      return { jobId: null, recoveryRequired: true, changed };
+    }
+    const retained = outcome.outcome === "retained";
+    if (retained && !source.eraseUnheld) return { jobId: null, recoveryRequired: false, changed: false };
+    if (!retained && outcome.outcome !== "erased" && outcome.outcome !== "pending") throw new ServiceError("conflict", "The original erasure outcome needs recovery before it can be reopened.");
+    const idempotencyKey = `reopen-erasure:${request.id}:${input.scope}:${input.idempotencyKey}`;
+    const [claim] = await ctx.tx.select({ jobId: jobIdempotencyKeys.jobId }).from(jobIdempotencyKeys).where(and(eq(jobIdempotencyKeys.jobName, input.jobName), eq(jobIdempotencyKeys.idempotencyKey, idempotencyKey))).limit(1);
+    if (claim && outcome.pendingJobs?.includes(claim.jobId)) return { jobId: claim.jobId, recoveryRequired: false, changed: false };
+    if (retained && claim) {
+      if (outcome.completedJobs?.includes(claim.jobId)) return { jobId: claim.jobId, recoveryRequired: false, changed: false };
+      throw new ServiceError("conflict", "Restore the original selective-erasure job acknowledgement before replaying this source evidence.");
+    }
+    const originalJobId = claim?.jobId ?? randomUUID();
+    const job = await enqueueJob(ctx.tx, input.jobName, { ...input.jobData, requestId: request.id, originalJobId }, { id: originalJobId, idempotencyKey });
+    if (!retained) outcome.outcome = "pending";
+    outcome.pendingJobs = [...new Set([...(outcome.pendingJobs ?? []), job.id])];
+    await saveArtifact(ctx.tx, request, { ...receipt, status: "in_progress", generatedAt: new Date().toISOString(), note: "New original-source evidence reopened its erasure work; documented retention exceptions remain unchanged." });
+    await ctx.tx.update(dataRequests).set({ status: "in_progress", fulfilledAt: null, resolution: "Waiting for registered source erasure jobs after new original evidence." }).where(eq(dataRequests.id, request.id));
+    await ctx.emitTimeline({ contactId: request.contactId, eventType: "contact.dataRequestErasurePending", subjectType: "dataRequest", subjectId: request.id, payload: { kind: "erasure", status: "in_progress", scope: input.scope } });
+    ctx.queueEvent("contact.dataRequestErasurePending", { contactId: request.contactId, dataRequestId: request.id, kind: "erasure", status: "in_progress" });
+    return { jobId: job.id, recoveryRequired: false, changed: true };
+  },
+});
+
+export const fulfillDataRequest = defineService({
+  name: "contacts.fulfillDataRequest",
+  summary: "Fulfill a verified access, export, correction, or erasure request.",
+  kind: "mutation",
+  permission: "scoped",
+  stepUp: true,
+  input: z.object({
+    id: z.string().uuid(),
+    confirmation: z.string().max(20).optional(),
+  }),
+  output: z.object({
+    request: dataRequestRow,
+    artifact: artifactRow,
+  }),
+  handler: async (input, ctx) => {
+    // Serialize identity changes before reading a profile or its request.
+    await lockContactIdentity(ctx.tx);
+    await ctx.tx.execute(
+      sql`select pg_advisory_xact_lock(hashtext(${`privacy:${input.id}`}))`,
+    );
+    const [request] = await ctx.tx
+      .select()
+      .from(dataRequests)
+      .where(eq(dataRequests.id, input.id))
+      .limit(1);
+    if (!request) throw new ServiceError("not_found", "That privacy request is not here.");
+    if (request.status !== "verified" && request.status !== "in_progress") {
+      throw new ServiceError(
+        "conflict",
+        "Verify this request before fulfilling it, or leave a completed request unchanged.",
+      );
+    }
+    const contact = await requireContact(ctx.tx, request.contactId);
+    let artifactBody: unknown;
+    let status: "completed" | "partially_completed" | "in_progress" = "completed";
+    let eventPayload: Record<string, unknown> = { kind: request.kind };
+    if (request.kind === "access" || request.kind === "export") {
+      artifactBody = await portableExport(ctx.tx, request, contact);
+    } else if (request.kind === "correction") {
+      const details = requestDetails.parse(request.details);
+      if (details.kind !== "correction") {
+        throw new ServiceError("conflict", "The correction details are incomplete.");
+      }
+      const updated = await ctx.call(updateContact, {
+        id: contact.id,
+        ...details.changes,
+      });
+      artifactBody = {
+        format: "freeholder.correction-receipt",
+        version: 1,
+        generatedAt: new Date().toISOString(),
+        requestId: request.id,
+        contactId: contact.id,
+        correctedFields: Object.keys(details.changes),
+        profile: updated,
+      };
+      eventPayload = {
+        ...eventPayload,
+        correctedFields: Object.keys(details.changes),
+      };
+    } else {
+      if (input.confirmation !== "ERASE") {
+        throw new ServiceError(
+          "validation",
+          'Type "ERASE" to confirm this irreversible privacy operation.',
+        );
+      }
+      const [existingArtifact] = await ctx.tx.select().from(dataRequestArtifacts)
+        .where(eq(dataRequestArtifacts.dataRequestId, request.id)).limit(1);
+      if (existingArtifact && pendingErasureReceipt(existingArtifact.body)) {
+        return { request, artifact: existingArtifact };
+      }
+      if (request.status === "in_progress" &&
+          (request.verificationMethod === "identity verified before erasure" || await erasureWasApplied(ctx.tx, request.id))) {
+        throw new ServiceError("conflict", "The applied erasure receipt needs recovery. Reconcile its original provider jobs before completing this request.");
+      }
+      const [other] = await ctx.tx.select({ id: dataRequests.id }).from(dataRequests).where(and(
+        eq(dataRequests.contactId, request.contactId), eq(dataRequests.kind, "erasure"),
+        eq(dataRequests.status, "in_progress"), ne(dataRequests.id, request.id),
+      )).limit(1);
+      if (other) throw new ServiceError("conflict", "Another erasure for this contact is still being handled. Finish its original work before fulfilling another request.");
+      const result = await eraseContact(ctx, request);
+      status = result.pending ? "in_progress" : result.partiallyCompleted ? "partially_completed" : "completed";
+      artifactBody = {
+        format: "freeholder.erasure-receipt",
+        version: 1,
+        generatedAt: new Date().toISOString(),
+        requestId: request.id,
+        contactId: result.contact.id,
+        status,
+        outcomes: result.outcomes,
+        note:
+          status === "in_progress"
+            ? "Local erasure is applied; registered provider jobs must confirm their remaining work."
+            : status === "partially_completed"
+            ? "Named data scopes were retained only for the documented legal reasons shown above."
+            : "Personal fields and registered module data were erased or anonymized.",
+      };
+      await ctx.emitTimeline({
+        contactId: request.contactId,
+        eventType: "contact.dataErased",
+        subjectType: "dataRequest",
+        subjectId: request.id,
+        payload: { status },
+      });
+      ctx.queueEvent("contact.dataErased", {
+        contactId: request.contactId,
+        dataRequestId: request.id,
+        status,
+      });
+      eventPayload = { ...eventPayload, status };
+    }
+    const artifact = await saveArtifact(ctx.tx, request, artifactBody);
+    const resolution =
+      status === "in_progress"
+        ? "Waiting for registered provider erasure jobs."
+        : status === "partially_completed"
+        ? "Completed with documented legal-retention exceptions."
+        : "Request completed.";
+    const [completed] = await ctx.tx
+      .update(dataRequests)
+      .set({ status, resolution, fulfilledAt: status === "in_progress" ? null : new Date() })
+      .where(
+        and(
+          eq(dataRequests.id, request.id),
+          inArray(dataRequests.status, ["verified", "in_progress"]),
+        ),
+      )
+      .returning();
+    if (!completed) {
+      throw new ServiceError("conflict", "That request changed while it was being fulfilled.");
+    }
+    ctx.setSubject("dataRequest", completed.id);
+    await ctx.emitTimeline({
+      contactId: completed.contactId,
+      eventType: status === "in_progress" ? "contact.dataRequestErasurePending" : "contact.dataRequestCompleted",
+      subjectType: "dataRequest",
+      subjectId: completed.id,
+      payload: eventPayload,
+    });
+    ctx.queueEvent(status === "in_progress" ? "contact.dataRequestErasurePending" : "contact.dataRequestCompleted", {
+      contactId: completed.contactId,
+      dataRequestId: completed.id,
+      kind: completed.kind,
+      status: completed.status,
+    });
+    return { request: completed, artifact };
+  },
+});
+
+export const denyDataRequest = defineService({
+  name: "contacts.denyDataRequest",
+  summary: "Close a privacy request with a documented reason.",
+  kind: "mutation",
+  permission: "scoped",
+  input: z.object({
+    id: z.string().uuid(),
+    resolution: z.string().trim().min(1).max(4_000),
+  }),
+  output: dataRequestRow,
+  handler: async (input, ctx) => {
+    await refusePendingErasure(ctx.tx, input.id);
+    const [request] = await ctx.tx
+      .update(dataRequests)
+      .set({
+        status: "denied",
+        resolution: input.resolution,
+        fulfilledAt: new Date(),
+      })
+      .where(
+        and(
+          eq(dataRequests.id, input.id),
+          inArray(dataRequests.status, [...openRequestStatuses]),
+        ),
+      )
+      .returning();
+    if (!request) throw new ServiceError("conflict", "That request is already closed.");
+    ctx.setSubject("dataRequest", request.id);
+    await ctx.emitTimeline({
+      contactId: request.contactId,
+      eventType: "contact.dataRequestCompleted",
+      subjectType: "dataRequest",
+      subjectId: request.id,
+      payload: { kind: request.kind, status: "denied" },
+    });
+    ctx.queueEvent("contact.dataRequestCompleted", {
+      contactId: request.contactId,
+      dataRequestId: request.id,
+      kind: request.kind,
+      status: "denied",
+    });
+    return request;
+  },
+});
+
+async function artifactById(tx: Tx, id: string) {
+  const [row] = await tx
+    .select({ artifact: dataRequestArtifacts, request: dataRequests })
+    .from(dataRequestArtifacts)
+    .innerJoin(dataRequests, eq(dataRequests.id, dataRequestArtifacts.dataRequestId))
+    .where(eq(dataRequestArtifacts.id, id))
+    .limit(1);
+  if (!row) throw new ServiceError("not_found", "That privacy artifact is not here.");
+  if (row.artifact.expiresAt <= new Date()) {
+    throw new ServiceError("not_found", "That privacy artifact has expired.");
+  }
+  return row;
+}
+
+async function markArtifactDownloaded(tx: Tx, id: string) {
+  const [artifact] = await tx
+    .update(dataRequestArtifacts)
+    .set({ lastDownloadedAt: new Date() })
+    .where(eq(dataRequestArtifacts.id, id))
+    .returning();
+  return artifact!;
+}
+
+function downloadableArtifact(artifact: typeof dataRequestArtifacts.$inferSelect) {
+  const content = canonicalJson(artifact.body);
+  return {
+    id: artifact.id,
+    filename: artifact.filename,
+    mime: artifact.mime,
+    sha256: artifact.sha256,
+    expiresAt: artifact.expiresAt,
+    content,
+  };
+}
+
+export const downloadDataRequestArtifact = defineService({
+  name: "contacts.downloadDataRequestArtifact",
+  summary: "Read and audit one protected privacy artifact.",
+  kind: "mutation",
+  permission: "scoped",
+  input: z.object({ id: z.string().uuid() }),
+  output: downloadableArtifactResult,
+  handler: async (input, ctx) => {
+    const row = await artifactById(ctx.tx, input.id);
+    const artifact = await markArtifactDownloaded(ctx.tx, row.artifact.id);
+    ctx.setSubject("dataRequest", row.request.id);
+    return downloadableArtifact(artifact);
+  },
+});
+
+export const downloadMyDataRequestArtifact = defineService({
+  name: "privacy.downloadMyDataRequestArtifact",
+  summary: "Download a protected privacy artifact belonging to the signed-in customer.",
+  kind: "mutation",
+  permission: "authenticated",
+  input: z.object({ id: z.string().uuid() }),
+  output: downloadableArtifactResult,
+  handler: async (input, ctx) => {
+    const contact = await personalContact(ctx.tx, ctx.actor);
+    const row = await artifactById(ctx.tx, input.id);
+    if (row.request.contactId !== contact.id) {
+      throw new ServiceError("not_found", "That privacy artifact is not here.");
+    }
+    const artifact = await markArtifactDownloaded(ctx.tx, row.artifact.id);
+    ctx.setSubject("dataRequest", row.request.id);
+    return downloadableArtifact(artifact);
+  },
+});
+
+export async function pruneExpiredPrivacyArtifacts(): Promise<number> {
+  const rows = await db()
+    .delete(dataRequestArtifacts)
+    .where(and(lt(dataRequestArtifacts.expiresAt, new Date()), sql`not exists (select 1 from ${dataRequests} where ${dataRequests.id} = ${dataRequestArtifacts.dataRequestId} and ${dataRequests.kind} = 'erasure' and ${dataRequests.status} = 'in_progress')`))
+    .returning({ id: dataRequestArtifacts.id });
+  return rows.length;
+}
+
+const privacyPointerState = z.array(
+  z.object({ id: z.string().uuid(), contactId: z.string().uuid() }),
+);
+
+registerContactReference({
+  table: "consent_records",
+  repoint: (tx, duplicateId, survivingId) =>
+    tx
+      .update(consentRecords)
+      .set({ contactId: survivingId })
+      .where(eq(consentRecords.contactId, duplicateId)),
+  captureForUndo: async (tx, duplicateId, survivingId) => ({
+    state: await tx
+      .select({ id: consentRecords.id, contactId: consentRecords.contactId })
+      .from(consentRecords)
+      .where(inArray(consentRecords.contactId, [duplicateId, survivingId])),
+    undoable: true,
+  }),
+  restoreAfterUndo: async (tx, beforeState, afterState, duplicateId) => {
+    const before = privacyPointerState.parse(beforeState);
+    const after = privacyPointerState.parse(afterState);
+    const current = after.length
+      ? await tx
+          .select({ id: consentRecords.id, contactId: consentRecords.contactId })
+          .from(consentRecords)
+          .where(inArray(consentRecords.id, after.map((row) => row.id)))
+      : [];
+    const byId = new Map(current.map((row) => [row.id, row.contactId]));
+    if (
+      current.length !== after.length ||
+      after.some((row) => byId.get(row.id) !== row.contactId)
+    ) {
+      throw new ServiceError(
+        "conflict",
+        "Consent evidence changed after this merge. Leave the merge in place or restore the evidence first.",
+      );
+    }
+    const moved = before.filter((row) => row.contactId === duplicateId);
+    if (moved.length) {
+      await tx
+        .update(consentRecords)
+        .set({ contactId: duplicateId })
+        .where(inArray(consentRecords.id, moved.map((row) => row.id)));
+    }
+  },
+});
+
+registerContactReference({
+  table: "data_requests",
+  repoint: (tx, duplicateId, survivingId) =>
+    tx
+      .update(dataRequests)
+      .set({ contactId: survivingId })
+      .where(eq(dataRequests.contactId, duplicateId)),
+  captureForUndo: async (tx, duplicateId, survivingId) => ({
+    state: await tx
+      .select({ id: dataRequests.id, contactId: dataRequests.contactId })
+      .from(dataRequests)
+      .where(inArray(dataRequests.contactId, [duplicateId, survivingId])),
+    undoable: true,
+  }),
+  restoreAfterUndo: async (tx, beforeState, afterState, duplicateId) => {
+    const before = privacyPointerState.parse(beforeState);
+    const after = privacyPointerState.parse(afterState);
+    const current = after.length
+      ? await tx
+          .select({ id: dataRequests.id, contactId: dataRequests.contactId })
+          .from(dataRequests)
+          .where(inArray(dataRequests.id, after.map((row) => row.id)))
+      : [];
+    const byId = new Map(current.map((row) => [row.id, row.contactId]));
+    if (
+      current.length !== after.length ||
+      after.some((row) => byId.get(row.id) !== row.contactId)
+    ) {
+      throw new ServiceError(
+        "conflict",
+        "A privacy request changed after this merge. Leave the merge in place or restore the request first.",
+      );
+    }
+    const moved = before.filter((row) => row.contactId === duplicateId);
+    if (moved.length) {
+      await tx
+        .update(dataRequests)
+        .set({ contactId: duplicateId })
+        .where(inArray(dataRequests.id, moved.map((row) => row.id)));
+    }
+  },
+});
+
+export default [
+  recordConsent,
+  getConsentPreferences,
+  canContact,
+  getMyPrivacyProfile,
+  setMyMarketingPreference,
+  createDataRequest,
+  createMyDataRequest,
+  listDataRequests,
+  getDataRequest,
+  listMyDataRequests,
+  verifyDataRequest,
+  startDataRequest,
+  addRetentionException,
+  removeRetentionException,
+  cancelMyDataRequest,
+  fulfillDataRequest,
+  completeErasureJob,
+  reopenErasureJob,
+  denyDataRequest,
+  downloadDataRequestArtifact,
+  downloadMyDataRequestArtifact,
+];
+
+registerSearchSource({
+  kind: "privacyRequest", module: "contacts", readService: "contacts.getDataRequest", tables: ["data_requests"],
+  search: async ({ tx, pattern, limit }) => {
+    // Search by the request reference, never the sensitive correction/erasure body.
+    const rows = await tx.select({ id: dataRequests.id, contactId: dataRequests.contactId })
+      .from(dataRequests).where(matchesIlike(sql`${dataRequests.id}::text`, pattern))
+      .orderBy(asc(dataRequests.responseDueAt), asc(dataRequests.id)).limit(limit);
+    return rows.map(item => ({ kind: "privacyRequest", id: item.id, title: item.id,
+      href: `/admin/contacts/privacy/${item.id}`, snippet: null, contactId: item.contactId, module: "contacts" }));
+  },
+});

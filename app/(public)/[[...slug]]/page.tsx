@@ -1,0 +1,731 @@
+// Copyright (C) 2026 Tony Aly
+// SPDX-License-Identifier: Apache-2.0
+// The public surface — one route for every page on the site (MASTER.md §32).
+//
+// This file is the answer to a question the module contract left open: how does
+// a module contribute a public page when Next's router is file-system based?
+// It does not. §32 already decided — "structure is data; code is vocabulary" —
+// so there is one route, it resolves a path to a row, and it renders that row's
+// block tree. A new page is an INSERT. A new *kind* of block is code.
+//
+// Consequences worth knowing:
+//   - Publishing is live on the next request. There is no build step between
+//     an owner and their site, which is §32's stated requirement.
+//   - The SEO contract holds by construction: metadata comes from the same row
+//     as the content, and blocks contribute their own JSON-LD (§5).
+//   - A path with no published page is a real 404, not a soft one — §5 wants
+//     "clean structural 404s", and a 200 saying "not found" is neither.
+import type { Metadata } from "next";
+import { cookies, headers } from "next/headers";
+import { notFound, permanentRedirect, redirect } from "next/navigation";
+import { ArrowRight } from "@phosphor-icons/react/dist/ssr";
+import { setupState } from "@/core/settings/service";
+import { collectPageJsonLd } from "@/modules/cms/blocks/registry";
+import { renderBlocks } from "@/modules/cms/render";
+import { decodeFormReturn, FORM_RETURN_COOKIE } from "@/core/http/public-form-return";
+import type { BlockNode } from "@/modules/cms/blocks/types";
+import { resolveRedirect } from "@/core/seo/service";
+import {
+  articleJsonLd,
+  breadcrumbJsonLd,
+  breadcrumbTrailJsonLd,
+  collectionPageJsonLd,
+  creativeWorkJsonLd,
+  eventJsonLd,
+  humanizeSegment,
+  organizationJsonLd,
+  productJsonLd,
+  serializeJsonLd,
+  serviceJsonLd,
+  websiteJsonLd,
+} from "@/core/seo/jsonld";
+import { kindFromSlug } from "@/core/seo/classify";
+import {
+  composeDescription,
+  composeDocumentTitle,
+  isFilterQuery,
+  ogImagePath,
+} from "@/core/seo/meta";
+import { siteOrigin } from "@/core/seo/origin";
+import { localBusinessJsonLd } from "@/core/locations/jsonld";
+import { currentLocation } from "@/core/locations/read";
+import { getLocation } from "@/core/locations/service";
+import { getLocale, getT, requestedLocale } from "../../i18n";
+import { alternatesFor, localePath, translatedLocales } from "./alternates";
+import { recordPageView } from "./pageview";
+import { currentBusiness } from "@/core/settings/read";
+import { blogArchiveAt, blogSettingsCached, postMetaFor, publishedPage } from "@/modules/cms/read";
+import { archiveBlocks, archiveEyebrow, PostByline, PostFooter, type BlogArchive, type PostMeta } from "./blog-parts";
+import { assignmentsFor } from "@/modules/cms/experiments";
+import { ANON_HEADER, SESSION_HEADER } from "@/modules/analytics/visitor";
+import { SESSION_COOKIE } from "@/core/auth/sessions";
+import { actorFromToken } from "@/core/http/actor";
+import { recordExperimentImpressions } from "@/modules/analytics/service";
+import { localizeCustomerHref } from "@/core/i18n/customer";
+import {
+  CSP_NONCE_HEADER,
+  THIRD_PARTY_CREATIVE_CONSENT_COOKIE,
+  parseThirdPartyCreativeConsent,
+} from "@/core/http/csp";
+import { targetFor } from "@/modules/share/service";
+import { ShareBar } from "../ShareBar";
+import { ReaderComments } from "./ReaderComments";
+
+export const dynamic = "force-dynamic";
+
+const ANONYMOUS = { kind: "anonymous" } as const;
+
+type Params = { slug?: string[] };
+
+/** "" for the home page; "services/weddings" for a nested one. */
+function pathOf(slug: string[] | undefined): string {
+  return (slug ?? []).join("/");
+}
+
+/**
+ * The path to resolve, once a locale prefix has been accounted for.
+ *
+ * The proxy strips anything shaped like a language tag, because the edge
+ * cannot ask which locales this instance publishes. If it turns out not to be
+ * one, the segment was never a prefix — `/de/about` on a site with no German
+ * is a page called `de/about`, and it resolves as one.
+ */
+async function pathFor(slug: string[] | undefined): Promise<string> {
+  const path = pathOf(slug);
+  const [asked, business] = await Promise.all([
+    requestedLocale(),
+    currentBusiness(),
+  ]);
+  if (!asked) return path;
+  if (business?.enabledLocales.includes(asked)) return path;
+  return path === "" ? asked : `${asked}/${path}`;
+}
+
+/** A page's own address in a given locale (§4.9's URL strategy). */
+function canonicalFor(
+  origin: string,
+  slug: string,
+  locale: string,
+  business: { defaultLocale: string } | null,
+): string {
+  return `${origin}${localePath(slug, locale, business?.defaultLocale ?? locale)}`;
+}
+
+export async function generateMetadata({
+  params,
+  searchParams,
+}: {
+  params: Promise<Params>;
+  searchParams: Promise<Record<string, string | string[] | undefined>>;
+}): Promise<Metadata> {
+  const { slug } = await params;
+  const query = await searchParams;
+  const locale = await getLocale();
+  const [page, business] = await Promise.all([
+    publishedPage(await pathFor(slug), locale),
+    currentBusiness(),
+  ]);
+  if (!page) {
+    const archive = await blogArchiveAt(await pathFor(slug));
+    if (archive) return archiveMetadata(archive, business?.name, isFilterQuery(query));
+    // The 404 still needs a document title: an empty <title> is the first
+    // thing a screen reader announces (WCAG 2.4.2).
+    const t = await getT();
+    return {
+      title: composeDocumentTitle(t("notFound.title"), business?.name, false),
+      robots: { index: false, follow: true },
+    };
+  }
+
+  // §5 per-page requirements: a unique title and description on every page,
+  // "with sane auto-generated defaults" — the stored override wins, and the
+  // fallback is built from what the page already knows rather than left blank.
+  const seo = (page.seo ?? {}) as {
+    title?: string;
+    description?: string;
+    ogImage?: string;
+    preserveTitle?: boolean;
+    preserveDescription?: boolean;
+    noindex?: boolean;
+    nofollow?: boolean;
+    canonical?: string;
+    ogTitle?: string;
+    ogDescription?: string;
+  };
+  const siteName = business?.name;
+  const title = composeDocumentTitle(
+    seo.title ?? page.title,
+    siteName,
+    page.slug === "",
+    seo.preserveTitle === true,
+  );
+  const description = composeDescription(
+    seo.description ?? business?.tagline ?? undefined,
+    seo.preserveDescription === true,
+  );
+
+  // §5 wants the canonical *absolute*, and absolute means configured rather
+  // than taken from the request — see core/seo/origin.ts.
+  const origin = siteOrigin();
+
+  // §5: "every localized page emits full hreflang alternates + x-default".
+  // Only the locales that actually have a reviewed translation are advertised
+  // — telling a search engine a French version exists when it does not is how
+  // a site ends up with duplicate-content problems in two languages.
+  const alternates = await alternatesFor(page.id, page.slug, origin, business);
+
+  // A prefixed URL for a page with no translation serves the site's own
+  // language — so it is not a separate page, and saying otherwise is how one
+  // article becomes two competing search results. The canonical names the
+  // version that is actually the article.
+  const translated = business ? await translatedLocales(page.id, business) : [];
+  const servedLocale =
+    locale === business?.defaultLocale || translated.includes(locale)
+      ? locale
+      : (business?.defaultLocale ?? locale);
+
+  const canonical = seo.canonical ? new URL(seo.canonical, origin).href : canonicalFor(origin, page.slug, servedLocale, business);
+
+  // §34: the `ShareTarget` is "canonical URL + auto-generated OG image", so
+  // the social card is the share target's when the owner has written one. It
+  // deliberately does not touch `title` or the meta description: a search
+  // result is read by somebody already looking and a shared card by somebody
+  // who was not, and collapsing the two would make improving one quietly
+  // worsen the other.
+  const share = await targetFor
+    .call({ path: page.slug, locale: servedLocale }, ANONYMOUS)
+    .catch(() => null);
+  const socialTitle = share?.socialTitle ?? seo.ogTitle ?? title;
+  const socialDescription = share?.socialDescription ?? seo.ogDescription ?? description;
+  const ogImage =
+    share?.imageUrl ?? seo.ogImage ?? `${origin}${ogImagePath(page.slug)}`;
+  const filtered = isFilterQuery(query);
+  // C2.27: a post is an article to Open Graph, with its dates, author,
+  // section and tags, so a shared link reads as one.
+  const post = await postMetaFor(page.slug);
+
+  return {
+    title,
+    description,
+    robots: filtered || seo.noindex || seo.nofollow ? { index: !(filtered || seo.noindex), follow: !seo.nofollow } : undefined,
+    alternates: {
+      canonical,
+      ...(alternates ? { languages: alternates } : {}),
+    },
+    openGraph: post
+      ? {
+          title: socialTitle,
+          description: socialDescription,
+          type: "article",
+          url: canonical,
+          siteName: siteName ?? undefined,
+          images: [{ url: ogImage, width: 1200, height: 630, alt: socialTitle }],
+          ...(post.publishedAt ? { publishedTime: post.publishedAt.toISOString() } : {}),
+          ...(post.modifiedAt ? { modifiedTime: post.modifiedAt.toISOString() } : {}),
+          ...(post.author ? { authors: [`${origin}/${post.author.path}`] } : {}),
+          ...(post.categories[0] ? { section: post.categories[0].name } : {}),
+          ...(post.tags.length ? { tags: post.tags.map((tag) => tag.name) } : {}),
+        }
+      : {
+          title: socialTitle,
+          description: socialDescription,
+          type: "website",
+          url: canonical,
+          siteName: siteName ?? undefined,
+          images: [{ url: ogImage, width: 1200, height: 630, alt: socialTitle }],
+        },
+    twitter: {
+      card: "summary_large_image",
+      title: socialTitle,
+      description: socialDescription,
+      images: [ogImage],
+    },
+  };
+}
+
+export default async function PublicPage({
+  params,
+  searchParams,
+}: {
+  params: Promise<Params>;
+  searchParams: Promise<Record<string, string | string[] | undefined>>;
+}) {
+  const [{ slug }, query, requestHeaders] = await Promise.all([
+    params,
+    searchParams,
+    headers(),
+  ]);
+  const nonce = requestHeaders.get(CSP_NONCE_HEADER) ?? undefined;
+  const path = await pathFor(slug);
+
+  const [locale, t] = await Promise.all([getLocale(), getT()]);
+  const [page, business] = await Promise.all([
+    publishedPage(path, locale),
+    currentBusiness(),
+  ]);
+
+  // An instance nobody has set up yet has no pages, and answering 404 at the
+  // root would be a true statement that helps nobody — the owner's next step
+  // is the wizard. Only the root gets this; every other path is a real 404,
+  // because a missing /about is missing however new the site is.
+  if (!page && path === "") {
+    const state = await setupState.call({}, ANONYMOUS);
+    if (!state.completed) return <NotSetUpYet t={t} />;
+  }
+
+  // §5: "slugs never silently break". Before answering 404, ask whether this
+  // address used to be a page — a link somebody shared two years ago should
+  // still land somewhere, and a permanent redirect tells a crawler to carry
+  // the standing of the old address over to the new one.
+  //
+  // The wire status is 308, not the 301 §5 names: a server component cannot
+  // choose its status code, and Next's permanent redirect is 308. What §5
+  // actually asks for — permanent versus temporary, told to the crawler — is
+  // intact, and search engines treat 308 as 301's equal. The redirect *row*
+  // still records 301/302, so serving a literal 301 later is a change here and
+  // nowhere else.
+  // C2.27: a category, tag or author archive answers at its own path.
+  const archive = page ? null : await blogArchiveAt(path);
+  if (archive) {
+    return renderArchive({ archive, path, locale, t, business, query, nonce });
+  }
+  if (!page) {
+    const moved = await resolveRedirect.call({ path, locale }, ANONYMOUS);
+    if (moved) {
+      const destination = moved.toPath === "" ? "/" : `/${moved.toPath}`;
+      const localized = business
+        ? localizeCustomerHref(destination, locale, business)
+        : destination;
+      if (moved.status === "301") permanentRedirect(localized);
+      redirect(localized);
+    }
+  }
+  if (!page) notFound();
+
+  // §4.7's first-party analytics, recorded by the platform rather than by a
+  // script in the visitor's browser. Nothing to block, nothing to consent to
+  // loading, and it works with JavaScript switched off — the numbers describe
+  // the traffic that actually arrived rather than the subset that ran a tag.
+  await recordPageView(path === "" ? "/" : `/${path}`, locale, query);
+
+  const blocks = page.blocks as BlockNode[];
+  const visitorId = requestHeaders.get(ANON_HEADER);
+  const experimentAssignments = assignmentsFor(blocks, visitorId);
+  if (visitorId && Object.keys(experimentAssignments).length > 0) {
+    await recordExperimentImpressions.call(
+      {
+        anonId: visitorId,
+        sessionId: requestHeaders.get(SESSION_HEADER) ?? visitorId,
+        path: path === "" ? "/" : `/${path}`,
+        locale,
+        assignments: experimentAssignments,
+      },
+      ANONYMOUS,
+    ).catch(() => undefined);
+  }
+  const cookieJar = await cookies();
+  const actor = await actorFromToken(cookieJar.get(SESSION_COOKIE)?.value);
+  const post = await postMetaFor(page.slug);
+  const renderContext = {
+    locale,
+    t,
+    business: business ? {
+          name: business.name,
+          tagline: business.tagline,
+          defaultLocale: business.defaultLocale,
+          enabledLocales: business.enabledLocales,
+        } : null,
+    path: path === "" ? "/" : `/${path}`,
+    visitorId,
+    actor,
+    experimentAssignments,
+    thirdPartyConsent: parseThirdPartyCreativeConsent(
+      cookieJar.get(THIRD_PARTY_CREATIVE_CONSENT_COOKIE)?.value,
+    ),
+    cspNonce: nonce,
+    localizeHref: business
+      ? (href: string) => localizeCustomerHref(href, locale, business)
+      : undefined,
+    // Blocks whose state survives a page load read it from here — see the
+    // form block, which confirms a submission by re-rendering rather than by
+    // holding the result in client state. Repeated parameters stay arrays:
+    // the product-grid block's facet codec reads several values for one
+    // name, while a block asking "was this form just sent?" compares against
+    // a string, and a comparison with an array is simply false.
+    query: { ...query },
+    formReturn: decodeFormReturn(cookieJar.get(FORM_RETURN_COOKIE)?.value),
+  };
+  const localize = (href: string) => (business ? localizeCustomerHref(href, locale, business) : href);
+  // A post's byline sits under its title: render the leading H1 on its own,
+  // then the byline, then the rest of the body.
+  const titled = post && blocks[0]?.type === "heading" && blocks[0].props.level === 1;
+  const rendered = titled
+    ? [
+        ...(await renderBlocks([blocks[0]!], renderContext)),
+        <PostByline key="post-byline" meta={post} t={t} locale={locale} href={localize} />,
+        ...(await renderBlocks(blocks.slice(1), renderContext)),
+      ]
+    : [
+        ...(post ? [<PostByline key="post-byline" meta={post} t={t} locale={locale} href={localize} />] : []),
+        ...(await renderBlocks(blocks, renderContext)),
+      ];
+
+  // Structured data comes from two places, and neither is a setting an owner
+  // has to find: the page's own identity (§5 — WebSite and the business on the
+  // home page, a breadcrumb trail everywhere else), and the blocks themselves,
+  // where an FAQ block is what puts FAQPage in the markup.
+  const origin = siteOrigin();
+  const facts = business
+    ? {
+        name: business.name,
+        tagline: business.tagline,
+        schemaType: business.schemaType,
+        baseCurrency: business.baseCurrency,
+      }
+    : null;
+
+  // §4.10: "Each location emits LocalBusiness JSON-LD with geo, hours,
+  // priceRange, sameAs." The home page carries the primary location's, because
+  // for a single-location business the home page *is* the business's page —
+  // and a business with no locations emits nothing extra rather than an
+  // Organization pretending to be somewhere.
+  const localBusiness =
+    facts && path === "" ? await homeLocalBusiness(origin, facts.schemaType) : null;
+
+  const jsonLd = [
+    ...(facts && path === ""
+      ? [
+          websiteJsonLd(origin, facts),
+          localBusiness ?? organizationJsonLd(origin, facts),
+        ]
+      : []),
+    ...(post
+      ? postJsonLd({ origin, path, title: page.title, seo: page.seo, post, publisher: facts?.name ?? null, t })
+      : []),
+    ...(path !== "" && !post
+      ? [
+          breadcrumbJsonLd(origin, path, (segmentPath) =>
+            segmentPath === ""
+              ? (facts?.name ?? t("home.brand"))
+              : segmentPath === path
+                ? page.title
+                : humanizeSegment(segmentPath.split("/").pop() ?? segmentPath),
+          ),
+        ].filter((entry) => entry !== undefined)
+      : []),
+    ...(post ? [] : await entityJsonLd({
+      origin,
+      path,
+      title: page.title,
+      description: (page.seo as { description?: string } | null)?.description
+        ?? facts?.tagline
+        ?? null,
+      providerName: facts?.name ?? null,
+      updatedAt: page.updatedAt,
+    })),
+    ...await collectPageJsonLd(blocks),
+  ];
+
+  return (
+    <>
+      {jsonLd.map((entry, i) => (
+        <script
+          key={i}
+          nonce={nonce}
+          type="application/ld+json"
+          dangerouslySetInnerHTML={{ __html: serializeJsonLd(entry) }}
+        />
+      ))}
+      <article className="grid gap-8">
+        {rendered}
+        {post ? <PostFooter meta={post} t={t} href={localize} /> : null}
+        {post ? <ReaderComments pageValue={typeof query.commentPage === "string" ? query.commentPage : undefined} pageId={page.id} enabled={post.commentsEnabled} returnTo={localize(`/${path}`)} result={typeof query.comment === "string" ? query.comment : undefined} locale={locale} t={t} /> : null}
+      </article>
+      {/*
+        §34: sharing is "a property of every entity with a public face", so it
+        is rendered by the one public route rather than added per page. The
+        component returns nothing for an entity whose sharing the owner has
+        switched off.
+      */}
+      <ShareBar
+        path={path}
+        locale={locale}
+        title={page.title}
+        siteName={business?.name ?? null}
+        sharedRef={typeof query.shared === "string" ? query.shared : undefined}
+      />
+    </>
+  );
+}
+
+/** Title, description, canonical and robots for a blog archive (C2.27). */
+function archiveMetadata(archive: BlogArchive, siteName: string | undefined, filtered: boolean): Metadata {
+  const origin = siteOrigin();
+  const canonical = `${origin}/${archive.path}`;
+  const title = composeDocumentTitle(archive.seo.title ?? archive.name, siteName, false);
+  const description = composeDescription(archive.seo.description ?? archive.description ?? undefined);
+  return {
+    title,
+    description,
+    robots: archive.seo.noindex || filtered ? { index: false, follow: true } : undefined,
+    alternates: { canonical },
+    openGraph: { title, description, type: "website", url: canonical, siteName },
+    twitter: { card: "summary", title, description },
+  };
+}
+
+async function renderArchive(input: {
+  archive: BlogArchive;
+  path: string;
+  locale: string;
+  t: Awaited<ReturnType<typeof getT>>;
+  business: Awaited<ReturnType<typeof currentBusiness>>;
+  query: Record<string, string | string[] | undefined>;
+  nonce: string | undefined;
+}) {
+  const { archive, path, locale, t, business, query, nonce } = input;
+  await recordPageView(`/${path}`, locale, query);
+  const settings = await blogSettingsCached();
+  const cookieJar = await cookies();
+  const actor = await actorFromToken(cookieJar.get(SESSION_COOKIE)?.value);
+  const rendered = await renderBlocks(archiveBlocks(archive, settings.postsPerPage), {
+    locale,
+    t,
+    business: business
+      ? { name: business.name, tagline: business.tagline, defaultLocale: business.defaultLocale, enabledLocales: business.enabledLocales }
+      : null,
+    path: `/${path}`,
+    actor,
+    query: { ...query },
+    cspNonce: nonce,
+    localizeHref: business ? (href: string) => localizeCustomerHref(href, locale, business) : undefined,
+  });
+  const origin = siteOrigin();
+  const blog = await publishedPage("blog", locale);
+  const jsonLd = [
+    collectionPageJsonLd({
+      name: archive.name,
+      url: `${origin}/${archive.path}`,
+      description: archive.seo.description ?? archive.description,
+    }),
+    breadcrumbTrailJsonLd([
+      { name: business?.name ?? t("home.brand"), item: `${origin}/` },
+      ...(blog ? [{ name: blog.title, item: `${origin}/blog` }] : []),
+      ...archive.trail.map((step) => ({ name: step.name, item: `${origin}/${step.path}` })),
+      { name: archive.name, item: `${origin}/${archive.path}` },
+    ]),
+  ].filter((entry) => entry !== undefined);
+  return (
+    <>
+      {jsonLd.map((entry, i) => (
+        <script key={i} nonce={nonce} type="application/ld+json" dangerouslySetInnerHTML={{ __html: serializeJsonLd(entry) }} />
+      ))}
+      <p className="text-sm font-semibold uppercase tracking-wide text-ink-muted">{archiveEyebrow(archive, t)}</p>
+      <div className="grid gap-8">{rendered}</div>
+    </>
+  );
+}
+
+/** BlogPosting and its breadcrumb: Home › Blog › primary category › post. */
+function postJsonLd(input: {
+  origin: string;
+  path: string;
+  title: string;
+  seo: unknown;
+  post: PostMeta;
+  publisher: string | null;
+  t: Awaited<ReturnType<typeof getT>>;
+}) {
+  const { origin, path, post } = input;
+  const seo = (input.seo ?? {}) as { title?: string; description?: string; ogImage?: string };
+  const url = `${origin}/${path}`;
+  const primary = post.categories[0];
+  return [
+    articleJsonLd({
+      type: "BlogPosting",
+      headline: input.title,
+      url,
+      description: seo.description ?? null,
+      datePublished: post.publishedAt,
+      dateModified: post.modifiedAt ?? post.publishedAt ?? undefined,
+      authorName: post.author?.name ?? input.publisher,
+      authorUrl: post.author ? `${origin}/${post.author.path}` : null,
+      section: primary?.name ?? null,
+      keywords: post.tags.map((tag) => tag.name),
+      image: seo.ogImage ?? null,
+      publisherName: input.publisher,
+    }),
+    breadcrumbTrailJsonLd([
+      { name: input.publisher ?? input.t("home.brand"), item: `${origin}/` },
+      { name: input.t("blog.title"), item: `${origin}/blog` },
+      ...(primary ? [{ name: primary.name, item: `${origin}/${primary.path}` }] : []),
+      { name: input.title, item: url },
+    ]),
+  ].filter((entry) => entry !== undefined);
+}
+
+/**
+ * Page-type structured data beyond the site/business/breadcrumb.
+ *
+ * Service, article, product and event pages emit the matching schema.org type
+ * so a crawler does not have to guess from the URL.
+ */
+async function entityJsonLd(input: {
+  origin: string;
+  path: string;
+  title: string;
+  description: string | null;
+  providerName: string | null;
+  updatedAt?: Date;
+}): Promise<ReturnType<typeof serviceJsonLd>[]> {
+  const kind = kindFromSlug(input.path);
+  const url = input.path === "" ? `${input.origin}/` : `${input.origin}/${input.path}`;
+  const leaf = input.path.split("/").filter(Boolean)[1];
+  if (kind === "service") {
+    return [
+      serviceJsonLd({
+        name: input.title,
+        url,
+        description: input.description,
+        providerName: input.providerName,
+      }),
+    ];
+  }
+  if (kind === "article" || kind === "newsletter") {
+    return [
+      articleJsonLd({
+        headline: input.title,
+        url,
+        description: input.description,
+        dateModified: input.updatedAt,
+        authorName: input.providerName,
+      }),
+    ];
+  }
+  if (kind === "product" && leaf) {
+    const { resolveVisibleProduct } = await import("@/modules/catalog/service");
+    const product = await resolveVisibleProduct.call({ slug: leaf }, ANONYMOUS);
+    if (!product) return [];
+    // The offer comes from the same purchase projection the buy panel
+    // quotes, so the structured price can never disagree with the page.
+    // A product with no published price still gets no offer.
+    const { purchaseOptions } = await import("@/modules/catalog/service");
+    const { minorToDecimal } = await import("@/adapters/payments/currency");
+    const [purchase] = await purchaseOptions
+      .call({ slugs: [leaf] }, ANONYMOUS)
+      .catch(() => [] as Awaited<ReturnType<typeof purchaseOptions.call>>);
+    const priced = purchase?.priceFromMinor != null && purchase.currency ? purchase : null;
+    return [
+      productJsonLd({
+        name: product.name,
+        url,
+        description: product.seo.description ?? product.subtitle ?? input.description,
+        sku: product.slug,
+        brand: product.brand,
+        ...(priced
+          ? {
+              price: minorToDecimal(priced.priceFromMinor!, priced.currency!),
+              priceCurrency: priced.currency!,
+              availability: priced.variants.some((variant) => variant.available) ? "InStock" : "OutOfStock",
+            }
+          : {}),
+      }),
+    ];
+  }
+  if (kind === "event" && leaf) {
+    const { resolvePublicEvent } = await import("@/modules/events/service");
+    const event = await resolvePublicEvent.call({ slug: leaf }, ANONYMOUS);
+    if (!event) return [];
+    const first = event.sessions[0];
+    return [
+      eventJsonLd({
+        name: event.name,
+        url,
+        description: event.summary ?? input.description,
+        startDate: first?.startsAt.toISOString(),
+        endDate: first?.endsAt.toISOString(),
+        eventStatus: event.status === "cancelled" ? "EventCancelled" : "EventScheduled",
+        venueName: event.venueName,
+        venueAddress: event.venueAddress,
+        remainingAttendeeCapacity: first?.remaining,
+      }),
+    ];
+  }
+  if (kind === "project" && leaf) {
+    const { resolvePublicProject } = await import("@/modules/projects/portfolio-service");
+    const result = await resolvePublicProject.call({ slug: leaf }, ANONYMOUS);
+    if (!result) return [];
+    const absolute = (value: string) =>
+      value.startsWith("/") ? `${input.origin}${value}` : value;
+    return [
+      creativeWorkJsonLd({
+        name: result.project.title,
+        url,
+        description: result.project.summary ?? input.description,
+        dateCreated: result.project.occurredOn,
+        images: result.images.map((image) => ({
+          url: absolute(image.src),
+          caption: image.altText,
+        })),
+        services: result.services.map((service) => ({
+          name: service.name,
+          url: `${input.origin}/products/${service.slug}`,
+        })),
+      }),
+    ];
+  }
+  if (kind === "collection") {
+    return [collectionPageJsonLd({ name: input.title, url, description: input.description })];
+  }
+  return [];
+}
+
+/**
+ * The primary location as LocalBusiness, or null when there is none.
+ *
+ * It supersedes `organizationJsonLd` rather than joining it: two objects both
+ * claiming to be the business, one with an address and one without, is a
+ * crawler's ambiguity to resolve rather than a fact. The location's own
+ * `schemaType` wins when it has one — see core/locations/schema.ts.
+ */
+async function homeLocalBusiness(
+  origin: string,
+  businessSchemaType: string,
+): Promise<Record<string, unknown> | null> {
+  const primary = await currentLocation();
+  if (!primary) return null;
+  const full = await getLocation.call({ id: primary.id }, ANONYMOUS);
+  if (!full) return null;
+  return localBusinessJsonLd({
+    location: full,
+    hours: full.hours,
+    serviceArea: full.serviceArea,
+    businessSchemaType,
+    url: `${origin}/`,
+  });
+}
+
+/**
+ * The only screen in this file that is markup rather than blocks, and the only
+ * one that can be: it is shown when there is no business yet, so there is
+ * nothing to have authored it.
+ */
+function NotSetUpYet({ t }: { t: Awaited<ReturnType<typeof getT>> }) {
+  return (
+    <div className="grid gap-5">
+      <h1 className="text-3xl font-bold tracking-tight text-balance">
+        {t("home.ready.title")}
+      </h1>
+      <p className="max-w-prose text-ink-muted">{t("home.ready.intro")}</p>
+      <div>
+        <a
+          href="/setup"
+          className="inline-flex items-center gap-2 rounded-md bg-accent px-4 py-2 text-sm font-semibold text-on-accent shadow-press"
+        >
+          {t("home.ready.cta")}
+          <ArrowRight size={15} weight="bold" />
+        </a>
+      </div>
+    </div>
+  );
+}

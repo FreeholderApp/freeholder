@@ -1,0 +1,268 @@
+// Copyright (C) 2026 Tony Aly
+// SPDX-License-Identifier: Apache-2.0
+// What a form field is, and how a submission is checked against one.
+//
+// The same idea as the block registry (§32): the *kinds* of field are code and
+// the fields themselves are data. An owner adding a question writes a row; the
+// validator that accepts their visitors' answers is derived from it, so the
+// two can never disagree.
+//
+// Deliberately a small set. Every field kind here maps to an input a browser
+// renders natively, with a keyboard that suits it on a phone. `file` (C3.38)
+// is the one that needs more than the browser: the file goes through the
+// media upload API first, and the answer is the private asset it became.
+import { z } from "zod";
+import { MEDIA_LIMITS } from "@/core/media/validation";
+
+export const FIELD_KINDS = [
+  "text",
+  "email",
+  "tel",
+  "multiline",
+  "select",
+  "checkbox",
+  "number",
+  "file",
+] as const;
+
+export type FieldKind = (typeof FIELD_KINDS)[number];
+
+/** The media kinds a file field may ask for (C3.38). Video is not offered. */
+export const FILE_FIELD_KINDS = ["audio", "doc", "image"] as const;
+export type FileFieldKind = (typeof FILE_FIELD_KINDS)[number];
+
+const MB = 1024 * 1024;
+
+/** The largest `maxMb` a file field accepting these kinds may set. */
+export function fileFieldCeilingMb(accept: readonly FileFieldKind[]): number {
+  return Math.min(...accept.map((kind) => Math.floor(MEDIA_LIMITS[kind] / MB)));
+}
+
+/** A file field's accepted kinds, as a list whether it was written as one or many. */
+export function acceptedKinds(field: Pick<FormField, "accept">): FileFieldKind[] {
+  const accept = field.accept;
+  if (!accept) return [];
+  return Array.isArray(accept) ? [...new Set(accept)] : [accept];
+}
+
+/** A file field's size limit in bytes: its own `maxMb`, or the media ceiling. */
+export function fileFieldMaxBytes(field: Pick<FormField, "accept" | "maxMb">): number {
+  const ceiling = fileFieldCeilingMb(acceptedKinds(field));
+  return Math.min(field.maxMb ?? ceiling, ceiling) * MB;
+}
+
+/**
+ * What a file field stores as its answer: the private asset and the facts an
+ * owner needs to recognise it, never a URL (C3.38).
+ */
+export interface FileAnswer {
+  assetId: string;
+  filename: string;
+  bytes: number;
+  mime: string;
+}
+
+export function isFileAnswer(value: unknown): value is FileAnswer {
+  return Boolean(
+    value &&
+      typeof value === "object" &&
+      typeof (value as FileAnswer).assetId === "string" &&
+      typeof (value as FileAnswer).filename === "string",
+  );
+}
+
+export const fieldSchema = z.object({
+  /** Stable key the answer is stored under. Never shown to a visitor. */
+  key: z
+    .string()
+    .min(1)
+    .max(40)
+    .regex(/^[a-z][a-z0-9_]*$/, "Use lower-case letters, digits and underscores."),
+  label: z.string().min(1).max(120),
+  kind: z.enum(FIELD_KINDS),
+  required: z.boolean().default(false),
+  placeholder: z.string().max(120).optional(),
+  help: z.string().max(300).optional(),
+  /** For `select`. Ignored by every other kind. */
+  options: z.array(z.string().min(1).max(120)).optional(),
+  maxLength: z.number().int().positive().max(5000).optional(),
+  /** For `file`: one media kind, or a list of them. */
+  accept: z
+    .union([z.enum(FILE_FIELD_KINDS), z.array(z.enum(FILE_FIELD_KINDS)).min(1).max(3)])
+    .optional(),
+  /** For `file`: at most the media limit of every accepted kind. */
+  maxMb: z.number().int().positive().optional(),
+});
+
+export type FormField = z.output<typeof fieldSchema>;
+/**
+ * A field as it is *written* — `required` has a default, so seed data and
+ * imports need not restate it. The output type is what everything downstream
+ * reads.
+ */
+export type FormFieldInput = z.input<typeof fieldSchema>;
+
+/**
+ * The field list, checked for the mistakes that only show up at submit time.
+ *
+ * Duplicate keys are the interesting one: two fields called `name` render
+ * fine, and then one silently overwrites the other in the stored answer.
+ */
+export const fieldsSchema = z
+  .array(fieldSchema)
+  .max(50)
+  .superRefine((fields, ctx) => {
+    const seen = new Set<string>();
+    for (const field of fields) {
+      if (seen.has(field.key)) {
+        ctx.addIssue({
+          code: "custom",
+          message: `Two fields share the key "${field.key}"; the second would overwrite the first.`,
+        });
+      }
+      seen.add(field.key);
+      if (field.kind === "select" && (field.options ?? []).length === 0) {
+        ctx.addIssue({
+          code: "custom",
+          message: `The field "${field.key}" is a dropdown with no options.`,
+        });
+      }
+      if (field.kind === "file") {
+        const accept = acceptedKinds(field);
+        if (accept.length === 0) {
+          ctx.addIssue({
+            code: "custom",
+            message: `The file field "${field.key}" needs the kinds of file it accepts: audio, document or image.`,
+          });
+        } else if (field.maxMb !== undefined && field.maxMb > fileFieldCeilingMb(accept)) {
+          ctx.addIssue({
+            code: "custom",
+            message: `The file field "${field.key}" allows at most ${fileFieldCeilingMb(accept)} MB for ${accept.join(", ")} files.`,
+          });
+        }
+      } else if (field.accept !== undefined || field.maxMb !== undefined) {
+        ctx.addIssue({
+          code: "custom",
+          message: `Only a file field takes accepted kinds and a size limit; "${field.key}" is not one.`,
+        });
+      }
+    }
+  });
+
+/** One field's answer, as a schema. Built at submit time from the definition. */
+function answerSchema(field: FormField): z.ZodType {
+  const optional = <T extends z.ZodType>(schema: T) =>
+    field.required ? schema : schema.optional();
+
+  switch (field.kind) {
+    case "email":
+      // Trimmed and lowercased here so the spine sees the same address
+      // whatever a visitor's keyboard capitalised (§4.1: one contact per
+      // email address).
+      return optional(
+        z
+          .string()
+          .trim()
+          .toLowerCase()
+          .pipe(z.string().email(`${field.label} does not look like an email address.`)),
+      );
+    case "number":
+      return optional(z.coerce.number({ message: `${field.label} must be a number.` }));
+    case "checkbox":
+      // An unchecked box sends nothing at all, so absence is false — and a
+      // required checkbox is a consent box, which must be *true*.
+      return field.required
+        ? z.literal(true, { message: `${field.label} is required.` })
+        : z.boolean().default(false);
+    case "select":
+      return optional(
+        z.enum((field.options ?? []) as [string, ...string[]], {
+          message: `Choose one of the options for ${field.label}.`,
+        }),
+      );
+    case "file": {
+      // The answer as posted is the id of an asset the browser uploaded; the
+      // service turns it into a FileAnswer after checking whose it is. An
+      // empty value is no file, so an optional field may be left alone.
+      const id = z
+        .string({ message: `${field.label} is required.` })
+        .trim()
+        .uuid(`Upload ${field.label} again; the file did not arrive.`);
+      return z.preprocess(
+        (value) => (value === "" || value === null ? undefined : value),
+        field.required ? id : id.optional(),
+      );
+    }
+    default: {
+      let schema = z.string().trim().max(field.maxLength ?? 2000);
+      if (field.required) schema = schema.min(1, `${field.label} is required.`);
+      return field.required ? schema : schema.optional();
+    }
+  }
+}
+
+/**
+ * A Zod object that accepts exactly what this form asked for.
+ *
+ * Unknown keys are stripped rather than rejected: a bot posting extra fields
+ * is not worth a 400, and a form edited between render and submit should not
+ * lose the answer somebody typed.
+ */
+export function submissionSchema(fields: FormField[]): z.ZodType {
+  return z.object(
+    Object.fromEntries(fields.map((field) => [field.key, answerSchema(field)])),
+  );
+}
+
+/** The email a submission identifies the visitor by, if it asked for one. */
+export function emailFrom(
+  fields: FormField[],
+  data: Record<string, unknown>,
+): string | undefined {
+  const field = fields.find((f) => f.kind === "email");
+  const value = field ? data[field.key] : undefined;
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+/**
+ * A display name for the contact, from whatever the form happens to ask.
+ *
+ * Falls back to the email's local part rather than "Unknown": a contact list
+ * full of "Unknown" is a contact list nobody opens.
+ */
+export function nameFrom(
+  fields: FormField[],
+  data: Record<string, unknown>,
+  email?: string,
+): string {
+  const named = fields.find(
+    (f) => f.kind === "text" && /^(name|full_name|first_name)$/.test(f.key),
+  );
+  const value = named ? data[named.key] : undefined;
+  if (typeof value === "string" && value.trim()) return value.trim();
+
+  const anyText = fields.find((f) => f.kind === "text");
+  const fallback = anyText ? data[anyText.key] : undefined;
+  if (typeof fallback === "string" && fallback.trim()) return fallback.trim();
+
+  return email ? (email.split("@")[0] ?? email) : "Form submission";
+}
+
+/**
+ * The words the person actually typed (C7.08).
+ *
+ * The longest text answer, because that is what a message field is: a contact
+ * form's "how can we help" box is always the longest thing on it, and picking
+ * by label would break the moment somebody renames it.
+ */
+export function messageFrom(fields: FormField[], data: Record<string, unknown>): string {
+  let longest = "";
+  for (const field of fields) {
+    if (field.kind !== "multiline" && field.kind !== "text") continue;
+    const value = data[field.key];
+    if (typeof value === "string" && value.trim().length > longest.length) {
+      longest = value.trim();
+    }
+  }
+  return longest;
+}

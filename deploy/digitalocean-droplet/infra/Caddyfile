@@ -1,0 +1,24 @@
+# Copyright (C) 2026 Tony Aly
+# SPDX-License-Identifier: Apache-2.0
+# Automatic TLS from Let's Encrypt. Caddy needs the domain to already resolve
+# to this droplet before it can be issued a certificate.
+{$FREEHOLDER_DOMAIN} {
+	encode zstd gzip
+	# C11.10: Next's image optimizer is off (images.unoptimized); refuse its
+	# endpoint at the edge too, so a regression in either layer alone cannot
+	# expose it (GHSA-2464-fhr4-w9xw). Caddy path matching ignores case.
+	@nextImage path /_next/image /_next/image/*
+	respond @nextImage 404
+	# C11.10: the connecting address, overwritten on every request so a
+	# client cannot supply its own. The app trusts it only because
+	# TRUSTED_CLIENT_IP_HEADER names it and the app port is not published.
+	# {client_ip} is the connecting address unless a global trusted_proxies
+	# option names a fronting proxy, so it is correct for a direct droplet.
+	reverse_proxy app:3000 {
+		header_up X-Freeholder-Client-Ip {client_ip}
+	}
+}
+
+www.{$FREEHOLDER_PRIMARY_DOMAIN} {
+	redir https://{$FREEHOLDER_PRIMARY_DOMAIN}{uri} 308
+}

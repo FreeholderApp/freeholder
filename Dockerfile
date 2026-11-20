@@ -1,0 +1,57 @@
+# Copyright (C) 2026 Tony Aly
+# SPDX-License-Identifier: Apache-2.0
+# One image, every target (§18: no target-specific forks of application logic).
+#
+# Three stages so the thing that ships carries neither the package manager nor
+# the build toolchain: deps installs, build compiles, runtime holds the
+# standalone output and nothing else.
+
+FROM node:22.23.4-bookworm-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d AS deps
+WORKDIR /app
+RUN corepack enable
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY packages ./packages
+# --frozen-lockfile: an image that quietly resolves different versions than CI
+# tested is not the artifact anybody reviewed.
+RUN pnpm install --frozen-lockfile
+
+FROM node:22.23.4-bookworm-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d AS build
+WORKDIR /app
+RUN corepack enable
+COPY --from=deps /app/node_modules ./node_modules
+COPY --from=deps /app/packages ./packages
+COPY . .
+# The build must not need secrets: env.ts validates lazily so `next build`
+# succeeds with no database attached (§14).
+RUN pnpm build
+
+FROM node:22.23.4-bookworm-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d AS runtime
+LABEL io.freeholder.storage.quota.version="1" \
+    io.freeholder.storage.quota.proxy_max_bytes="26214400" \
+    io.freeholder.storage.quota.unknown="reserved" \
+    io.freeholder.deployment.admission.version="1" \
+    io.freeholder.deployment.admission.operator="scripts/deployment-admission.mjs"
+WORKDIR /app
+ENV NODE_ENV=production \
+    NEXT_MANUAL_SIG_HANDLE=true \
+    PORT=3000 \
+    HOSTNAME=0.0.0.0
+# Never root: a web process that is compromised should not also own the disk.
+RUN groupadd --system --gid 1001 freeholder \
+ && useradd --system --uid 1001 --gid freeholder freeholder
+COPY --from=build --chown=freeholder:freeholder /app/.next/standalone ./
+COPY --from=build --chown=freeholder:freeholder /app/.next/static ./.next/static
+COPY --from=build --chown=freeholder:freeholder /app/public ./public
+# Migrations travel with the image so a release can never be newer than the
+# schema it expects.
+COPY --from=build --chown=freeholder:freeholder /app/db ./db
+# The way back in when nobody can sign in. Needs only node:crypto, which is
+# why it can live in an image whose node_modules holds four packages.
+COPY --from=build --chown=freeholder:freeholder /app/scripts/owner-password.mjs ./scripts/owner-password.mjs
+COPY --from=build --chown=freeholder:freeholder /app/scripts/deployment-admission.mjs ./scripts/deployment-admission.mjs
+# C3.44: the docker-selfhost media volume mounts here. Docker copies this
+# directory's ownership into a new named volume, so the app can write to it.
+RUN mkdir -p /var/lib/freeholder/media && chown -R freeholder:freeholder /var/lib/freeholder
+USER freeholder
+EXPOSE 3000
+CMD ["node", "server.js"]

@@ -1,0 +1,176 @@
+// Copyright (C) 2026 Tony Aly
+// SPDX-License-Identifier: Apache-2.0
+// Installing the demo at boot, when the deploy asked for it.
+//
+// §3 promises "a fresh deploy is instantly explorable", C1.24 makes that
+// concrete for a contributor's first `pnpm dev`, and §15.2's SEO gate needs a
+// site to crawl inside a container it did not build. All three want the same
+// thing: a process that arrives populated, without a second command and
+// without an endpoint that could ever be reached from outside.
+//
+// An environment variable rather than a route, because a route that installs a
+// demo business is a route somebody eventually hits on a real instance. This
+// cannot be triggered by a request at all — it is read once, at startup, by
+// the process that owns the database.
+import { env } from "@/core/env";
+import { runAsSeed, ServiceError } from "@/core/service";
+
+export type DemoSeedOutcome =
+  | { status: "skipped"; reason: "disabled" | "development-not-pristine" }
+  | { status: "already-populated"; busy?: Record<string, Record<string, number>> }
+  | {
+      status: "installed";
+      business: string;
+      pages: string[];
+      assets: number;
+      busy?: Record<string, Record<string, number>>;
+    };
+
+/**
+ * Whether this process should install the demo, and whether that request was
+ * implicit. Kept pure so the default/override contract is testable without a
+ * database.
+ */
+export function demoSeedMode(
+  environment: Pick<ReturnType<typeof env>, "NODE_ENV" | "FREEHOLDER_SEED_DEMO">,
+): "disabled" | "development" | "requested" {
+  if (environment.FREEHOLDER_SEED_DEMO === "0") return "disabled";
+  if (environment.FREEHOLDER_SEED_DEMO === "1" || environment.FREEHOLDER_SEED_DEMO === "busy") {
+    return "requested";
+  }
+  return environment.NODE_ENV === "development" ? "development" : "disabled";
+}
+
+/**
+ * Whether the installed demo also gets six months of sample business.
+ *
+ * The public playground always does — an evaluator opening an empty CRM
+ * learns nothing — and anyone else asks with `FREEHOLDER_SEED_DEMO=busy`.
+ * Plain development stays on the quick site-only demo.
+ */
+export function demoSeedBusy(
+  environment: Pick<ReturnType<typeof env>, "FREEHOLDER_SEED_DEMO" | "FREEHOLDER_PLAYGROUND">,
+): boolean {
+  if (environment.FREEHOLDER_SEED_DEMO === "0") return false;
+  return environment.FREEHOLDER_SEED_DEMO === "busy" || environment.FREEHOLDER_PLAYGROUND === "1";
+}
+
+/**
+ * Install the demo when explicitly requested, or on a pristine development
+ * database when the switch is unset.
+ *
+ * An expected restart is harmless: the existing pages make the installer
+ * decline before it writes. Every other failure is fatal. Serving a setup
+ * placeholder after an operator explicitly requested a complete demo hides
+ * the fault until somebody visits `/`; C1.24 requires the startup contract to
+ * be true, not merely attempted.
+ */
+export async function seedDemoIfRequested(): Promise<DemoSeedOutcome> {
+  const environment = env();
+  const mode = demoSeedMode(environment);
+  if (mode === "disabled") return { status: "skipped", reason: "disabled" };
+
+  // Development's default must never reinterpret an in-progress real setup as
+  // an empty demo just because its first page has not been created yet. The
+  // explicit switch retains its documented "no pages" contract; the implicit
+  // convenience applies only to a database that has neither owner nor profile.
+  if (mode === "development") {
+    const { setupState } = await import("@/core/settings/service");
+    const state = await setupState.call({}, { kind: "anonymous" });
+    if (state.hasOwner || state.hasBusiness) {
+      console.log(
+        "[freeholder] demo not installed: development database is not pristine",
+      );
+      return { status: "skipped", reason: "development-not-pristine" };
+    }
+  }
+
+  const installBusy = async () => {
+    const started = Date.now();
+    const { installBusyDemo } = await import("./busy");
+    const busy = await runAsSeed(() => installBusyDemo.call({}, { kind: "system" }));
+    const contacts = busy.counts.crm?.contacts ?? 0;
+    console.log(
+      `[freeholder] busy demo installed: ${contacts} contacts in ${Date.now() - started} ms`,
+    );
+    return busy.counts;
+  };
+
+  // Both installs run as seeding (`runAsSeed`): their audit rows read
+  // `system:seed`, so the owner's default feed starts with the business the
+  // demo depicts rather than the platform building it.
+  try {
+    const { installDemo } = await import("./service");
+    const result = await runAsSeed(() => installDemo.call({ publish: true }, { kind: "system" }));
+    console.log(
+      `[freeholder] demo installed: ${result.business}, ${result.pages.length} pages, ${result.assets} images`,
+    );
+    if (!demoSeedBusy(environment)) return { status: "installed", ...result };
+    return { status: "installed", ...result, busy: await installBusy() };
+  } catch (error) {
+    // A restart of a seeded process is not a fault. Match both the typed code
+    // and this installer's precise refusal so an unrelated conflict — for
+    // example a half-populated form slug — still stops an incomplete demo.
+    if (
+      error instanceof ServiceError &&
+      error.code === "conflict" &&
+      error.message.includes("already has pages")
+    ) {
+      console.log(`[freeholder] demo not installed: ${error.message}`);
+      // The busy layer is its own transaction after the plain demo. A boot
+      // that died between the two (a timeout, a restart) comes back here, so
+      // the missing half is finished now — but only on the demo business,
+      // never on somebody's real site that happens to ask for it.
+      if (demoSeedBusy(environment)) {
+        const { busyDemoPending } = await import("./busy");
+        if (await busyDemoPending()) {
+          // Normally the baseline is recorded after this whole function, so
+          // it already includes the busy rows. If a baseline exists anyway,
+          // the busy rows are seed too: add them to it, so they are not
+          // charged to visitors' caps.
+          const { extendPlaygroundBaseline } = await import("@/core/demo/playground");
+          const busy = await extendPlaygroundBaseline(installBusy);
+          return { status: "already-populated", busy };
+        }
+      }
+      return { status: "already-populated" };
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[freeholder] demo installation failed: ${message}`);
+    throw error;
+  }
+}
+
+export type LaunchSeedOutcome =
+  | { status: "skipped" }
+  | { status: "already-populated" }
+  | { status: "installed"; business: string; pages: string[]; callRequest: boolean; brandApplied: boolean };
+
+/**
+ * Install the launch spec named by FREEHOLDER_LAUNCH_SPEC (C3.35), once, into
+ * an empty site. A restart of an installed site is not a fault; an invalid
+ * spec or any other failure is, for the same reason as the demo: an operator
+ * who asked for a launched site must not get a setup placeholder instead.
+ */
+export async function seedLaunchIfRequested(): Promise<LaunchSeedOutcome> {
+  const path = env().FREEHOLDER_LAUNCH_SPEC;
+  if (!path) return { status: "skipped" };
+  const { installLaunch, readLaunchSpec } = await import("./launch");
+  const spec = await readLaunchSpec(path);
+  const started = Date.now();
+  try {
+    const result = await runAsSeed(() => installLaunch.call(spec, { kind: "system" }));
+    console.log(
+      `[freeholder] launch spec installed: ${result.pages.length} pages, call requests ${result.callRequest ? "on" : "off"}, in ${Date.now() - started} ms`,
+    );
+    return { status: "installed", business: result.business, pages: result.pages, callRequest: result.callRequest, brandApplied: result.brandApplied };
+  } catch (error) {
+    if (error instanceof ServiceError && error.code === "conflict" && error.message.includes("already has pages")) {
+      console.log("[freeholder] launch spec not installed: the site already has pages");
+      return { status: "already-populated" };
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[freeholder] launch spec installation failed: ${message}`);
+    throw error;
+  }
+}

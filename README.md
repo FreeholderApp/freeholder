@@ -1,0 +1,132 @@
+# Freeholder
+
+**The open-source operating system for a one-person business.**
+
+Stop renting your business. Creators and small businesses today duct-tape
+together a website builder, a booking tool, a gallery host, a CRM, an
+invoicing app, an email platform, and a social scheduler — each one a
+subscription, each one owning a silo of the same customer. Freeholder
+replaces the stack with one self-hosted platform where a contact is **one
+record**: their bookings, orders, quotes, gallery access, messages, and email
+history all hang off one CRM timeline.
+
+> **Status: 0.2.0-beta.6, in active development; no stable release is published.**
+> This is not a release candidate. The implemented platform is undergoing
+> final release acceptance. Independent
+> security review, real provider settlement, specification reconciliation and
+> the owner-signed completion gate remain open. The public playground is available
+> for exploration. Verified scope and remaining work live in
+> [`MASTER.md` §43](MASTER.md#43-product-completion-plan--the-live-checklist).
+
+## Try Freeholder
+
+- [Explore the live demo](https://demo.freeholder.ai/) and its shared, hourly
+  resetting playground. Use fictional data.
+- [Get started from the source](GETTING_STARTED.md) with a maintained Docker or
+  cloud deployment recipe. Beta packages are published to npm under the `next`
+  tag (`npx create-freeholder@next my-business`) and recorded in
+  [GitHub releases](https://github.com/CampDenman/freeholder/releases). No
+  stable release is available yet.
+- [Read the contributor guide](CONTRIBUTING.md) to help improve the project.
+- [Build a member site with an AI builder](deploy/members-vibe-coding.md):
+  demo community, the member services, and prompts for Replit, Lovable and
+  coding agents.
+- [Launch with a coding agent](deploy/agent-launch.md): prepare private
+  configuration for Replit, complete owner setup with a passkey, then connect
+  your assistant at `/admin/connect`. Lovable connects to a hosted Freeholder
+  backend; fresh launches on both platforms still await account acceptance.
+
+## Product-complete target
+
+This is the intended finished surface, not a claim that every item below is
+already implemented. `MASTER.md` §43 is authoritative about current status.
+
+- **Website + CMS** — pages, blog, portfolio, SEO-as-architecture (schema.org,
+  sitemaps, OG images) baked in
+- **Link in bio** — the one link for every social profile as a page on your
+  own site: ordered buttons that can be hidden or scheduled, smart links to
+  your own products, bookings, events, galleries, pages and newsletter, social
+  icons, and per-link clicks from first-party analytics
+- **Unified CRM spine** — contacts, organizations, canonical tags, typed custom
+  fields, relationships, lifecycle history, explainable duplicate review with
+  conflict-safe merge undo, consent/privacy-rights workflows, and one shared
+  timeline that every module writes to
+- **Commerce** — products, digital downloads, services, coupons, gift cards;
+  Stripe by default, PayPal as an option
+- **Quotes → contracts → invoices** — negotiate line items with logged-in
+  prospects, e-sign, deposits, payment plans
+- **Booking & scheduling** — availability, buffers, deposits, reschedule
+  policies, 2-way Google/Outlook calendar sync
+- **Client galleries** — password/PIN galleries, proofing and selects,
+  download tiers, watermarks, print sales
+- **Client portal** — one login for a customer's quotes, invoices, bookings,
+  galleries, files, and messages
+- **International customer surfaces** — the default locale stays unprefixed,
+  other locales use stable path prefixes, and a signed-in customer's Contact
+  preference drives portal chrome, transactional templates, notification
+  wrappers, digests, dates, and internal links. Header/footer variants remain
+  editable CMS data rather than hardcoded layout markup. English, French and
+  Spanish catalogs are exhaustively ICU-checked; an internal expanded
+  pseudo-locale and script-derived document direction keep layouts ready for
+  longer translations and RTL catalogs.
+- **Email** — transactional via the owner's Google/Outlook account, bulk via
+  a provider adapter; broadcasts and simple automations
+- **Notification inbox** — a personal in-app attention queue with immediate
+  email or scheduled digests, preference controls, replay-safe deduplication,
+  and one-time escalation for unread critical work. SMS and push remain
+  explicit disabled adapters until their carrier/compliance checkpoints.
+- **First-party analytics** — configurable privacy-first, explicit-opt-in or
+  disabled collection; bounded retention, reversible traffic-quality review,
+  Core Web Vitals, campaign attribution and anonymized aggregate export, plus
+  the full funnel (visit → lead → quote → paid) joined to the CRM
+- **Full admin** — CRUD everything, toggle modules, seed/demo mode
+- **Operational control** — retained background-work history, sanitized run
+  detail, dead-letter recovery, lease-overdue warnings, and audited controls
+- **MCP server** — the owner's AI assistant connects with a named, scoped
+  key and can do only what that key allows. The `/admin/connect` presets
+  cover the website (read content, edit and publish pages, inspect health
+  and updates) and always expire. Broader scopes, such as the CRM, invoicing
+  or design, are granted per area under API keys in Settings
+- **Auth** — email + password, TOTP, passkeys/security keys, recovery codes,
+  mandatory 2FA for privileged roles, and fresh verification for critical
+  work; personal session/device controls and privacy-limited suspicious-login
+  notices are included. Customers use 15-minute one-use magic links that prove
+  and link the existing Contact instead of creating a second identity
+
+Deployment recipes currently cover Replit, DigitalOcean App Platform,
+DigitalOcean Droplets, Railway, Render and Docker Compose. The architecture is
+single-tenant by design (one deploy = one business): one toggleable monolith,
+Postgres and durable object storage.
+
+## Licensing
+
+Freeholder-authored code and packages are licensed under **Apache-2.0**. See
+[`LICENSING.md`](LICENSING.md) for the plain-English policy and [`LICENSE`](LICENSE)
+for the authoritative terms. Bundled third-party assets retain their own
+license notices.
+
+## Ownership and authorship
+
+Freeholder was created, originally authored, and is owned and maintained by
+**Tony Aly** ([tonyaly.com](https://tonyaly.com),
+`tony@paradisemodern.com`), who makes it available to the world as open-source
+software. The repository is hosted under the `CampDenman` GitHub organization;
+that is where the code lives, not a separate author or rights holder.
+
+Contributions are welcome under the DCO — see
+[`CONTRIBUTING.md`](CONTRIBUTING.md). The DCO rather than a CLA is deliberate:
+contributors keep their own copyright and contribute under Apache-2.0 without
+assigning it to the project.
+
+## Repository layout
+
+```
+app/            Next.js App Router — public site, portal, admin, API (Apache-2.0)
+src/            core spine, feature modules, adapters, MCP server (Apache-2.0)
+packages/       pre-release distributable packages (@freeholder/sdk, …)
+MASTER.md       sole product specification, status, and completion plan
+```
+
+The core application lives at the repository root — one monolith, not a
+monorepo. `packages/` exists only for artifacts people install outside this
+repo. The full layout is specified in `MASTER.md` §10.

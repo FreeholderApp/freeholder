@@ -1,0 +1,308 @@
+// Copyright (C) 2026 Tony Aly
+// SPDX-License-Identifier: Apache-2.0
+import { describe, expect, it } from "vitest";
+import {
+  catalogChain,
+  DEFAULT_LOCALE,
+  formatDateTime,
+  formatDateTimeRange,
+  formatDateTimeShort,
+  formatMoney,
+  t,
+  zoneLabel,
+} from "@/core/i18n";
+import {
+  localizeCustomerHref,
+  localePath,
+  resolveEnabledLocale,
+} from "@/core/i18n/customer";
+
+describe("zoneLabel()", () => {
+  it("names a zone the way a visitor says it, for the instant shown (2026-10-23 demo audit)", () => {
+    const summer = new Date("2026-07-01T18:00:00Z");
+    const winter = new Date("2026-12-01T18:00:00Z");
+    // The generic name, so the label is right whether or not the runtime's tz
+    // data has British Columbia's 2026 permanent UTC-7: ICU 78.3 calls a
+    // Vancouver December "Pacific Daylight Time", and its generic name there
+    // carries ICU's own "(Canada)", which the city replaces.
+    for (const at of [summer, winter]) {
+      expect(zoneLabel("America/Vancouver", "en", at)).toBe("Pacific Time (Vancouver)");
+      expect(zoneLabel("America/Los_Angeles", "en", at)).toBe("Pacific Time (Los Angeles)");
+      expect(zoneLabel("Europe/Berlin", "en", at)).toBe("Central European Time (Berlin)");
+    }
+    expect(zoneLabel("America/Vancouver", "fr", summer)).not.toContain("America/");
+    // An Etc/ id is an offset, not a place: no "(GMT+5)" beside "GMT-05:00".
+    expect(zoneLabel("Etc/GMT+5", "en", summer)).toBe("GMT-05:00");
+    expect(zoneLabel("Etc/UTC", "en", summer)).toBe("Coordinated Universal Time");
+    expect(zoneLabel("UTC", "en", summer)).toBe("Coordinated Universal Time");
+    // An id the runtime does not know is shown as given rather than thrown.
+    expect(zoneLabel("Not/AZone", "en", summer)).toBe("Not/AZone");
+  });
+});
+
+describe("t()", () => {
+  it("formats ICU plurals, including the zero case", () => {
+    expect(t("en", "contacts.count", { count: 0 })).toBe("No contacts yet");
+    expect(t("en", "contacts.count", { count: 1 })).toBe("1 contact");
+    expect(t("en", "contacts.count", { count: 7 })).toBe("7 contacts");
+  });
+
+  it("returns the key itself when the string is missing", () => {
+    expect(t("en", "nope.not.a.key")).toBe("nope.not.a.key");
+  });
+
+  describe("the shipped translations actually format", () => {
+    // A catalog can be complete (the i18n gate proves that) and still be
+    // broken at render time, because ICU treats an apostrophe as an escape
+    // character. French is full of them — "n'a", "l'instant", "d'e-mail" —
+    // and a mis-parsed one silently swallows the rest of the message.
+    it("renders French apostrophes literally rather than as ICU quoting", () => {
+      expect(t("fr", "common.somethingWentWrong")).toBe(
+        "Une erreur s'est produite. Réessayez.",
+      );
+      expect(t("fr", "contacts.merge.noEmail")).toBe("pas d'e-mail");
+      expect(t("fr", "admin.settings.intro")).toContain(
+        "L'identité de cette entreprise",
+      );
+    });
+
+    it("pluralizes in French and Spanish", () => {
+      expect(t("fr", "contacts.count", { count: 0 })).toBe("Aucun contact");
+      expect(t("fr", "contacts.count", { count: 1 })).toBe("1 contact");
+      expect(t("fr", "contacts.count", { count: 7 })).toBe("7 contacts");
+
+      expect(t("es", "contacts.count", { count: 0 })).toBe(
+        "Aún no hay contactos",
+      );
+      expect(t("es", "contacts.count", { count: 1 })).toBe("1 contacto");
+      expect(t("es", "contacts.count", { count: 7 })).toBe("7 contactos");
+    });
+
+    it("pluralizes in Arabic and keeps placeholders verbatim", () => {
+      // Arabic selects `one` for 1 and falls through to `other` for 7;
+      // the =0 branch stays an explicit sentence rather than a count.
+      expect(t("ar", "contacts.count", { count: 0 })).toBe(
+        "لا جهات اتصال بعد",
+      );
+      expect(t("ar", "contacts.count", { count: 1 })).toBe("1 جهة اتصال");
+      expect(t("ar", "contacts.count", { count: 7 })).toBe("7 جهات اتصال");
+      expect(t("ar-EG", "setup.done.title", { name: "Aurora" })).toBe(
+        "Aurora جاهز",
+      );
+    });
+
+    it("interpolates placeholders in every shipped locale", () => {
+      expect(t("es", "setup.done.title", { name: "Aurora" })).toBe(
+        "Aurora está listo",
+      );
+      expect(t("fr", "contacts.merge.noResults", { query: "Grace" })).toBe(
+        "Personne d'autre ne correspond à « Grace ».",
+      );
+      expect(t("es", "contacts.paging", { from: 1, to: 25, total: 60 })).toBe(
+        "1–25 de 60",
+      );
+    });
+
+    it("falls back along the language chain, not straight to English", () => {
+      // A Québécois owner reaches the French catalog before English is
+      // considered at all — a missing region must not undo the language.
+      expect(t("fr-CA", "auth.login.title")).toBe("Connexion");
+      expect(t("es-MX", "admin.nav.settings")).toBe("Ajustes");
+    });
+  });
+
+  it("serves a regional locale from the base catalog", () => {
+    expect(t("en-GB", "common.save")).toBe("Save");
+  });
+});
+
+describe("catalogChain()", () => {
+  it("narrows a regional tag toward the language before the default", () => {
+    // The bug this guards: fr-CA jumping straight to English and silently
+    // discarding a perfectly good French catalog (§4.9).
+    expect(catalogChain("fr-CA")).toEqual(["fr-CA", "fr", DEFAULT_LOCALE]);
+    expect(catalogChain("zh-Hant-TW")).toEqual([
+      "zh-Hant-TW",
+      "zh-Hant",
+      "zh",
+      DEFAULT_LOCALE,
+    ]);
+  });
+
+  it("does not repeat the default locale", () => {
+    expect(catalogChain("en")).toEqual(["en"]);
+    expect(catalogChain("en-GB")).toEqual(["en-GB", "en"]);
+  });
+});
+
+describe("customer locale policy", () => {
+  const policy = { defaultLocale: "en", enabledLocales: ["en", "fr", "es-MX"] };
+
+  it("honours an enabled preference, including a related regional tag", () => {
+    expect(resolveEnabledLocale("fr", policy)).toBe("fr");
+    expect(resolveEnabledLocale("es", policy)).toBe("es-MX");
+    expect(resolveEnabledLocale("de", policy)).toBe("en");
+  });
+
+  it("uses an unprefixed default and a prefix for every other locale", () => {
+    expect(localePath("services/photo", "en", "en")).toBe("/services/photo");
+    expect(localePath("services/photo", "fr", "en")).toBe("/fr/services/photo");
+    expect(localePath("", "fr", "en")).toBe("/fr");
+  });
+
+  it("keeps public and portal links in the selected locale without touching internals", () => {
+    expect(localizeCustomerHref("/about?from=home#team", "fr", policy))
+      .toBe("/fr/about?from=home#team");
+    expect(localizeCustomerHref("/es-MX/portal/privacy", "fr", policy))
+      .toBe("/fr/portal/privacy");
+    expect(localizeCustomerHref("/admin/settings", "fr", policy))
+      .toBe("/admin/settings");
+    expect(localizeCustomerHref("mailto:hello@example.test", "fr", policy))
+      .toBe("mailto:hello@example.test");
+  });
+
+  it("formats localized notification select and plural messages", () => {
+    expect(t("fr", "notifications.event.mail.body", { type: "complaint" }))
+      .toContain("Une plainte");
+    expect(t("es", "notifications.digest.subject", { count: 2 }))
+      .toBe("2 notificaciones de Freeholder");
+  });
+});
+
+describe("formatMoney()", () => {
+  it("respects each currency's minor unit", () => {
+    // 1000 minor units is $10.00, ¥1000 and 1.000 KWD — not "10" of each.
+    expect(formatMoney(1000, "USD", "en-US")).toBe("$10.00");
+    expect(formatMoney(1000, "JPY", "en-US")).toContain("1,000");
+    expect(formatMoney(1000, "KWD", "en-US")).toContain("1.000");
+    expect(formatMoney(1000, "BHD", "en-US")).toContain("1.000");
+  });
+
+  it("pads amounts smaller than one unit", () => {
+    expect(formatMoney(5, "USD", "en-US")).toBe("$0.05");
+    expect(formatMoney(0, "USD", "en-US")).toBe("$0.00");
+    expect(formatMoney(1, "JPY", "en-US")).toContain("1");
+  });
+
+  it("handles negative amounts (refunds, credits)", () => {
+    expect(formatMoney(-1050, "USD", "en-US")).toBe("-$10.50");
+  });
+
+  it("keeps the last cent that division would lose", () => {
+    // These are the amounts where `cents / 100` is demonstrably wrong:
+    // 9007199254740991 formats as …409.90 via division, …409.91 exactly.
+    expect(formatMoney(Number.MAX_SAFE_INTEGER, "USD", "en-US")).toBe(
+      "$90,071,992,547,409.91",
+    );
+    expect(formatMoney(8999999999999999, "USD", "en-US")).toBe(
+      "$89,999,999,999,999.99",
+    );
+  });
+
+  it("refuses non-integer input", () => {
+    expect(() => formatMoney(10.5, "USD")).toThrow(/integer minor units/);
+  });
+});
+
+describe("short zone names in event times", () => {
+  // ICU 78.3 with tz 2026e calls a December in Vancouver "PDT", Edmonton
+  // "MDT" and Winnipeg "CDT"; tz 2026a said PST/MST/CST. The North American
+  // generic abbreviations (PT/MT/CT) are right under both.
+  const summer = [new Date("2026-07-01T18:00:00Z"), new Date("2026-07-01T20:00:00Z")] as const;
+  const winter = [new Date("2026-12-01T18:00:00Z"), new Date("2026-12-01T20:00:00Z")] as const;
+  // What the formatter printed before generic abbreviations: ICU's short name.
+  const asBefore = (start: Date, end: Date, timeZone: string, locale: string) =>
+    new Intl.DateTimeFormat(locale, {
+      weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit",
+      timeZoneName: "short", timeZone,
+    }).formatRange(start, end);
+  const shortBefore = (at: Date, timeZone: string, locale: string) =>
+    new Intl.DateTimeFormat(locale, {
+      weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit",
+      timeZoneName: "short", timeZone,
+    }).format(at);
+
+  it("names Pacific zones PT in summer and winter, Vancouver included", () => {
+    for (const [start, end] of [summer, winter]) {
+      for (const zone of ["America/Vancouver", "America/Los_Angeles"]) {
+        const range = formatDateTimeRange(start, end, zone, "en-US");
+        expect(range).toMatch(/ PT$/);
+        expect(range).not.toMatch(/\(|PDT|PST|MST/);
+        expect(formatDateTimeShort(start, zone, "en-US")).toMatch(/ PT$/);
+      }
+    }
+    // The times themselves still follow each zone's own rules.
+    expect(formatDateTimeRange(...winter, "America/Los_Angeles", "en-US")).toMatch(/10:00\sAM\s*[–-]\s*12:00\sPM PT$/);
+    expect(formatDateTimeRange(...summer, "America/Vancouver", "en-US")).toMatch(/11:00\sAM\s*[–-]\s*1:00\sPM PT$/);
+  });
+
+  it("names Edmonton MT and Winnipeg CT, never a daylight abbreviation in winter", () => {
+    for (const [start, end] of [summer, winter]) {
+      expect(formatDateTimeRange(start, end, "America/Edmonton", "en-US")).toMatch(/ MT$/);
+      expect(formatDateTimeRange(start, end, "America/Winnipeg", "en-US")).toMatch(/ CT$/);
+    }
+  });
+
+  it("keeps every other short name exactly as before, byte for byte", () => {
+    // Byte for byte: V8's format() writes a plain space before AM/PM where its
+    // parts keep U+202F, so nothing may be rebuilt from parts unless swapped.
+    const unchanged = ["Europe/Berlin", "UTC", "America/Sao_Paulo", "America/Adak", "Pacific/Honolulu"];
+    for (const [start, end] of [summer, winter]) {
+      for (const locale of ["en-US", "en-GB", "fr"]) {
+        for (const zone of unchanged) {
+          expect(formatDateTimeRange(start, end, zone, locale)).toBe(asBefore(start, end, zone, locale));
+          expect(formatDateTimeShort(start, zone, locale)).toBe(shortBefore(start, zone, locale));
+        }
+      }
+      expect(formatDateTimeRange(start, end, "Europe/Berlin", "en-US")).not.toMatch(/Germany/);
+      expect(formatDateTimeRange(start, end, "Europe/Berlin", "fr")).not.toMatch(/Allemagne/);
+    }
+    expect(formatDateTimeRange(...summer, "Europe/Berlin", "en-GB")).toMatch(/\sCEST$/);
+    expect(formatDateTimeRange(...winter, "Europe/Berlin", "en-GB")).toMatch(/\sCET$/);
+    expect(formatDateTimeRange(...winter, "Europe/Berlin", "en-US")).toMatch(/\sGMT\+1$/);
+    // A spelled-out American generic ("São Paulo Time") keeps the offset too.
+    expect(formatDateTimeRange(...winter, "America/Sao_Paulo", "en-US")).toBe(asBefore(...winter, "America/Sao_Paulo", "en-US"));
+  });
+
+  it("swaps only the zone name, keeping format()'s own spacing", () => {
+    // A zone whose rules did not change, so the abbreviation it replaces is
+    // known under every tz data version.
+    expect(formatDateTimeShort(winter[0], "America/Los_Angeles", "en-US"))
+      .toBe(shortBefore(winter[0], "America/Los_Angeles", "en-US").replace(/PST$/, "PT"));
+    expect(formatDateTimeRange(...summer, "America/New_York", "en-US"))
+      .toBe(asBefore(...summer, "America/New_York", "en-US").replace(/EDT$/, "ET"));
+  });
+
+  it("reads an alias the same as the zone it names", () => {
+    for (const [alias, zone] of [["US/Pacific", "America/Los_Angeles"], ["Canada/Pacific", "America/Vancouver"], ["Canada/Mountain", "America/Edmonton"]]) {
+      for (const [start, end] of [summer, winter]) {
+        expect(formatDateTimeRange(start, end, alias!, "en-US")).toBe(formatDateTimeRange(start, end, zone!, "en-US"));
+        expect(formatDateTimeShort(start, alias!, "en-US")).toBe(formatDateTimeShort(start, zone!, "en-US"));
+      }
+    }
+    expect(formatDateTimeShort(winter[0], "Canada/Pacific", "en-US")).toMatch(/ PT$/);
+  });
+
+  it("swaps only the listed generic names", () => {
+    // ICU's generic name for Adak is "HAT", which few readers know.
+    expect(formatDateTimeShort(winter[0], "America/Adak", "en-US")).not.toMatch(/HAT/);
+    expect(formatDateTimeShort(summer[0], "America/Anchorage", "en-US")).toMatch(/ AKT$/);
+    expect(formatDateTimeShort(summer[0], "America/Halifax", "en-US")).toMatch(/ AT$/);
+  });
+
+  it("falls back to the short name where there is no generic one", () => {
+    expect(formatDateTimeShort(summer[0], "UTC", "en-US")).toMatch(/ UTC$/);
+    expect(formatDateTimeShort(summer[0], "Etc/GMT+5", "en-US")).toMatch(/ GMT-5$/);
+  });
+});
+
+describe("formatDateTime()", () => {
+  it("renders one instant in different business timezones", () => {
+    const utc = new Date("2026-07-26T02:30:00Z");
+    const vancouver = formatDateTime(utc, "America/Vancouver", "en-US");
+    const paris = formatDateTime(utc, "Europe/Paris", "en-US");
+    expect(vancouver).toContain("Jul 25");
+    expect(paris).toContain("Jul 26");
+    expect(vancouver).not.toBe(paris);
+  });
+});

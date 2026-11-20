@@ -1,0 +1,434 @@
+// Copyright (C) 2026 Tony Aly
+// SPDX-License-Identifier: Apache-2.0
+// Business identity (MASTER.md §4.8, §13). One deploy is one business, and the
+// database is what enforces that — not a convention anyone has to remember.
+import { afterAll, beforeEach, describe, expect, it } from "vitest";
+import { sql } from "drizzle-orm";
+import { db } from "@/core/db";
+import { businessProfile } from "@/core/settings/schema";
+import { auditLog } from "@/core/events/schema";
+import {
+  completeSetup,
+  finishSetupAsOwner,
+  getBusiness,
+  getModuleConfig,
+  listModules,
+  saveSetupBusiness,
+  setModuleConfig,
+  patchBusiness,
+  setModuleEnabled,
+  setupState,
+  updateBusiness,
+} from "@/core/settings/service";
+import { registerOwner } from "@/core/auth/service";
+import { createSetupLocation } from "@/core/locations/service";
+import {
+  ANONYMOUS,
+  closeDb,
+  failure,
+  hasDatabase,
+  OWNER,
+  STAFF,
+  truncateSpine,
+} from "../helpers/spine";
+
+const A_BUSINESS = {
+  name: "Aurora Coast Photography",
+  country: "CA",
+  baseCurrency: "CAD",
+  timezone: "America/Vancouver",
+  defaultLocale: "en",
+  enabledLocales: ["en", "fr-CA"],
+  schemaType: "Photographer",
+};
+
+describe.runIf(hasDatabase)("business settings", () => {
+  beforeEach(truncateSpine);
+  afterAll(closeDb);
+
+  describe("the profile is a singleton", () => {
+    it("refuses a second row at the database level", async () => {
+      await updateBusiness.call(A_BUSINESS, OWNER);
+      // Single-tenant (§2 principle 1) enforced by a check constraint, so no
+      // amount of clever calling produces a second business.
+      await expect(
+        db().execute(sql`
+          insert into business_profile (id, name, country, base_currency, timezone)
+          values (2, 'Second Business', 'US', 'USD', 'UTC')
+        `),
+      ).rejects.toThrow();
+      const rows = await db().select().from(businessProfile);
+      expect(rows).toHaveLength(1);
+    });
+
+    it("updates in place rather than accumulating rows", async () => {
+      await updateBusiness.call(A_BUSINESS, OWNER);
+      await updateBusiness.call(
+        { ...A_BUSINESS, name: "Aurora Coast Studio" },
+        OWNER,
+      );
+      const rows = await db().select().from(businessProfile);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.name).toBe("Aurora Coast Studio");
+    });
+  });
+
+  describe("validation the database backs up", () => {
+    it("normalises country and currency to upper case", async () => {
+      const profile = await updateBusiness.call(
+        { ...A_BUSINESS, country: "ca", baseCurrency: "cad" },
+        OWNER,
+      );
+      expect(profile.country).toBe("CA");
+      expect(profile.baseCurrency).toBe("CAD");
+    });
+
+    it("rejects a country that is not two letters", async () => {
+      const error = await failure(
+        updateBusiness.call({ ...A_BUSINESS, country: "CAN" }, OWNER),
+      );
+      expect(error.code).toBe("validation");
+    });
+
+    it("rejects a time zone the site cannot count in (§4.9)", async () => {
+      // Every local day and month is worked out with Intl, so a zone it does
+      // not know would leave reports and charts with nothing to count in.
+      const error = await failure(
+        updateBusiness.call({ ...A_BUSINESS, timezone: "Mars/Olympus_Mons" }, OWNER),
+      );
+      expect(error.code).toBe("validation");
+      await updateBusiness.call(A_BUSINESS, OWNER);
+      expect(
+        (await failure(patchBusiness.call({ timezone: "Mars/Olympus_Mons" }, OWNER))).code,
+      ).toBe("validation");
+    });
+
+    it("rejects a malformed locale", async () => {
+      const error = await failure(
+        updateBusiness.call({ ...A_BUSINESS, defaultLocale: "english" }, OWNER),
+      );
+      expect(error.code).toBe("validation");
+      expect(error.message).toContain("BCP-47");
+    });
+
+    it("requires at least one enabled locale", async () => {
+      const error = await failure(
+        updateBusiness.call({ ...A_BUSINESS, enabledLocales: [] }, OWNER),
+      );
+      expect(error.code).toBe("validation");
+    });
+  });
+
+  describe("permissions", () => {
+    it("lets anyone read the profile — public pages render from it", async () => {
+      await updateBusiness.call(A_BUSINESS, OWNER);
+      const profile = await getBusiness.call({}, ANONYMOUS);
+      expect(profile?.name).toBe("Aurora Coast Photography");
+    });
+
+    it("answers null before there is a business", async () => {
+      expect(await getBusiness.call({}, ANONYMOUS)).toBeNull();
+    });
+
+    it("refuses writes from a settings viewer", async () => {
+      const error = await failure(
+        updateBusiness.call(A_BUSINESS, {
+          ...STAFF,
+          grants: [{ module: "settings", access: "view" }],
+        }),
+      );
+      expect(error.code).toBe("permission");
+    });
+  });
+
+  describe("patchBusiness", () => {
+    it("changes one field without restating the rest", async () => {
+      await updateBusiness.call(A_BUSINESS, OWNER);
+      const patched = await patchBusiness.call({ tagline: "Coastal light" }, OWNER);
+      expect(patched.tagline).toBe("Coastal light");
+      expect(patched.country).toBe("CA");
+    });
+
+    it("refuses an empty patch", async () => {
+      await updateBusiness.call(A_BUSINESS, OWNER);
+      const error = await failure(patchBusiness.call({}, OWNER));
+      expect(error.code).toBe("validation");
+    });
+
+    it("does not resupply defaults for fields it was not given", async () => {
+      // `.partial()` keeps `.default()`, so patching from the creation schema
+      // would silently reset locale, units and week start every time somebody
+      // edited a tagline. The patch schema is built without defaults for this.
+      await updateBusiness.call(
+        {
+          ...A_BUSINESS,
+          units: "imperial",
+          firstDayOfWeek: 0,
+          schemaType: "Photographer",
+        },
+        OWNER,
+      );
+      const patched = await patchBusiness.call({ tagline: "Coastal light" }, OWNER);
+      expect(patched.units).toBe("imperial");
+      expect(patched.firstDayOfWeek).toBe(0);
+      expect(patched.schemaType).toBe("Photographer");
+      expect(patched.enabledLocales).toEqual(["en", "fr-CA"]);
+    });
+
+    it("says so plainly when there is no profile yet", async () => {
+      const error = await failure(patchBusiness.call({ tagline: "x" }, OWNER));
+      expect(error.code).toBe("not_found");
+      expect(error.message).toMatch(/complete setup first/i);
+    });
+  });
+
+  describe("setup state and locking", () => {
+    it("lets only the unverified owner finish first boot, then locks every setup write", async () => {
+      const registered = await registerOwner.call(
+        { email: "owner@example.test", password: "a-long-enough-password" },
+        ANONYMOUS,
+      );
+      const firstBootOwner = {
+        ...OWNER,
+        userId: registered.userId,
+        security: {
+          twoFactorRequired: true,
+          twoFactorEnrolled: false,
+          twoFactorVerified: false,
+          stepUpValid: false,
+        },
+      };
+
+      // The ordinary admin path remains protected by mandatory 2FA.
+      expect((await failure(updateBusiness.call(A_BUSINESS, firstBootOwner))).code).toBe(
+        "permission",
+      );
+
+      await expect(saveSetupBusiness.call(A_BUSINESS, firstBootOwner)).resolves.toMatchObject({
+        name: A_BUSINESS.name,
+      });
+      await expect(
+        createSetupLocation.call(
+          {
+            name: "Aurora Coast Studio",
+            slug: "courtenay",
+            street: "210 Fifth Street",
+            city: "Courtenay",
+            region: "BC",
+            postalCode: "V9N 1A1",
+            country: "CA",
+          },
+          firstBootOwner,
+        ),
+      ).resolves.toMatchObject({ slug: "courtenay", isPrimary: true });
+
+      expect((await failure(saveSetupBusiness.call(A_BUSINESS, STAFF))).code).toBe(
+        "permission",
+      );
+      await finishSetupAsOwner.call({}, firstBootOwner);
+      expect(await setupState.call({}, ANONYMOUS)).toMatchObject({ completed: true });
+      const completionAudits = (await db()
+        .select({ action: auditLog.action, actor: auditLog.actor })
+        .from(auditLog))
+        .filter((row) => row.action === "settings.finishSetupAsOwner");
+      expect(completionAudits).toEqual([
+        {
+          action: "settings.finishSetupAsOwner",
+          actor: `user:${registered.userId}`,
+        },
+      ]);
+
+      expect(
+        (await failure(saveSetupBusiness.call(A_BUSINESS, firstBootOwner))).code,
+      ).toBe("conflict");
+      expect(
+        (
+          await failure(
+            createSetupLocation.call(
+              { name: "Late", slug: "late", country: "CA" },
+              firstBootOwner,
+            ),
+          )
+        ).code,
+      ).toBe("conflict");
+    });
+
+    it("reports what first boot still needs", async () => {
+      expect(await setupState.call({}, ANONYMOUS)).toEqual({
+        hasOwner: false,
+        hasBusiness: false,
+        completed: false,
+      });
+
+      await registerOwner.call(
+        { email: "owner@example.test", password: "a-long-enough-password" },
+        ANONYMOUS,
+      );
+      expect(await setupState.call({}, ANONYMOUS)).toMatchObject({
+        hasOwner: true,
+        hasBusiness: false,
+      });
+
+      await updateBusiness.call(A_BUSINESS, OWNER);
+      expect(await setupState.call({}, ANONYMOUS)).toMatchObject({
+        hasBusiness: true,
+        completed: false,
+      });
+
+      await completeSetup.call({}, OWNER);
+      expect(await setupState.call({}, ANONYMOUS)).toMatchObject({
+        completed: true,
+      });
+    });
+
+    it("locks itself, so the wizard cannot be replayed", async () => {
+      // §13: locked after completion. Replaying it against a live business is
+      // how a public demo gets reset by a passer-by.
+      await updateBusiness.call(A_BUSINESS, OWNER);
+      await completeSetup.call({}, OWNER);
+      const error = await failure(completeSetup.call({}, OWNER));
+      expect(error.code).toBe("conflict");
+    });
+
+    it("will not complete before there is anything to complete", async () => {
+      const error = await failure(completeSetup.call({}, OWNER));
+      expect(error.code).toBe("not_found");
+    });
+
+    it("leaks nothing about the owner", async () => {
+      await registerOwner.call(
+        { email: "secret@example.test", password: "a-long-enough-password" },
+        ANONYMOUS,
+      );
+      const state = await setupState.call({}, ANONYMOUS);
+      expect(JSON.stringify(state)).not.toContain("secret@example.test");
+    });
+  });
+
+  describe("the audit trail records non-uuid subjects", () => {
+    it("audits a settings change, whose subject is not a uuid", async () => {
+      // audit_log.subject_id was typed uuid, which asserted that every subject
+      // in the system is one. A module name is not, and a singleton profile id
+      // is not, so auditing either was impossible until the column became text.
+      await updateBusiness.call(A_BUSINESS, OWNER);
+      await setModuleEnabled.call({ module: "galleries", enabled: false }, OWNER);
+
+      const rows = await db().select().from(auditLog).orderBy(auditLog.at);
+      expect(rows.map((r) => [r.action, r.subjectType, r.subjectId])).toEqual([
+        ["settings.updateBusiness", "business_profile", "1"],
+        ["settings.setModuleEnabled", "module_settings", "galleries"],
+      ]);
+    });
+  });
+
+  describe("module toggles", () => {
+    it("records a toggle and reads it back", async () => {
+      await setModuleEnabled.call({ module: "galleries", enabled: false }, OWNER);
+      const modules = await listModules.call({}, STAFF);
+      expect(modules).toEqual([
+        expect.objectContaining({ module: "galleries", enabled: false }),
+      ]);
+    });
+
+    it("flips an existing toggle instead of duplicating it", async () => {
+      await setModuleEnabled.call({ module: "booking", enabled: false }, OWNER);
+      await setModuleEnabled.call({ module: "booking", enabled: true }, OWNER);
+      const modules = await listModules.call({}, STAFF);
+      expect(modules).toHaveLength(1);
+      expect(modules[0]!.enabled).toBe(true);
+    });
+
+    it("refuses to switch core off", async () => {
+      // Core carries auth. Turning it off would lock the owner out of their
+      // own instance with no way back in.
+      const error = await failure(
+        setModuleEnabled.call({ module: "core", enabled: false }, OWNER),
+      );
+      expect(error.code).toBe("validation");
+      expect(await listModules.call({}, STAFF)).toHaveLength(0);
+    });
+
+    it("requires settings manage to write and lets a viewer read", async () => {
+      const viewer = {
+        ...STAFF,
+        grants: [{ module: "settings", access: "view" as const }],
+      };
+      const error = await failure(
+        setModuleEnabled.call({ module: "cms", enabled: false }, viewer),
+      );
+      expect(error.code).toBe("permission");
+      await expect(listModules.call({}, viewer)).resolves.toEqual([]);
+    });
+  });
+});
+
+describe.runIf(hasDatabase)("a module's own settings (§11 settingsSchema)", () => {
+  beforeEach(async () => {
+    await truncateSpine();
+  });
+
+  it("applies the schema's defaults to an instance that never configured it", async () => {
+    // The interesting case is not reading a stored value; it is a module
+    // adding a setting later, and every existing instance getting its default
+    // without a migration.
+    const config = await getModuleConfig.call({ module: "analytics" }, ANONYMOUS);
+    expect(config).toEqual({
+      includeBots: false,
+      consentPolicy: "privacy_first",
+      retentionDays: 180,
+    });
+  });
+
+  it("stores what the owner chose", async () => {
+    await setModuleConfig.call(
+      { module: "analytics", config: { includeBots: true } },
+      OWNER,
+    );
+    expect(await getModuleConfig.call({ module: "analytics" }, ANONYMOUS)).toEqual(
+      {
+        includeBots: true,
+        consentPolicy: "privacy_first",
+        retentionDays: 180,
+      },
+    );
+  });
+
+  it("validates against the schema the module itself declared", async () => {
+    // Core cannot know what a valid analytics setting looks like — the
+    // manifest does, and that is the whole point of settingsSchema.
+    const error = await failure(
+      setModuleConfig.call(
+        { module: "analytics", config: { includeBots: "yes please" } },
+        OWNER,
+      ),
+    );
+    expect(error.code).toBe("validation");
+    expect((await failure(setModuleConfig.call(
+      {
+        module: "analytics",
+        config: { consentPolicy: "sometimes", retentionDays: 29 },
+      },
+      OWNER,
+    ))).code).toBe("validation");
+  });
+
+  it("refuses a module that is not installed", async () => {
+    const error = await failure(
+      setModuleConfig.call({ module: "invented", config: {} }, OWNER),
+    );
+    expect(error.code).toBe("not_found");
+  });
+
+  it("requires settings manage rather than a role name", async () => {
+    const error = await failure(
+      setModuleConfig.call(
+        { module: "analytics", config: { includeBots: true } },
+        {
+          ...STAFF,
+          grants: [{ module: "settings", access: "view" }],
+        },
+      ),
+    );
+    expect(error.code).toBe("permission");
+  });
+});

@@ -1,0 +1,44 @@
+# Copyright (C) 2026 Tony Aly
+# SPDX-License-Identifier: Apache-2.0
+name: docker-selfhost
+schema: freeholder-deploy-recipe/v1
+tier: 1
+maintainers: ["@tonyaly"]
+freeholder_min_version: "0.0.0"
+provides:
+  database: compose-postgres
+  storage: volume-or-s3
+  jobs: web-process
+  cron: compose-backup-service
+estimated_monthly_cost_usd: { min: 0, typical: 20 }
+limits:
+  - "One server: media on the compose volume cannot be shared by a second app server; use S3 to scale out"
+  - "Copy the backups volume off the server; a backup on the same disk does not survive losing it"
+  - "MinIO is the local-dev profile only"
+artifacts:
+  - deploy/docker-selfhost/infra/compose.yml
+  - deploy/docker-selfhost/infra/compose.https.yml
+  - deploy/docker-selfhost/infra/Caddyfile.https
+  - deploy/docker-selfhost/infra/backup.sh
+  - deploy/docker-selfhost/selfhost.sh
+required_environment:
+  - POSTGRES_PASSWORD
+  - BOOTSTRAP_SECRET
+  - SESSION_SECRET
+  - CREDENTIAL_KEY
+  - APP_URL
+  - FREEHOLDER_STORAGE
+operations:
+  install: "docker compose --env-file deploy/docker-selfhost/.env -f deploy/docker-selfhost/infra/compose.yml up -d"
+  install-https: "docker compose --env-file deploy/docker-selfhost/.env -f deploy/docker-selfhost/infra/compose.https.yml up -d"
+  verify: "deploy/docker-selfhost/selfhost.sh check"
+  backup: "docker compose --env-file deploy/docker-selfhost/.env -f deploy/docker-selfhost/infra/compose.yml exec -T db pg_dump --format=custom --no-owner --no-privileges -U freeholder freeholder > freeholder.dump"
+  restore: "docker compose --env-file deploy/docker-selfhost/.env -f deploy/docker-selfhost/infra/compose.yml exec -T db pg_restore --no-owner --no-privileges -U freeholder -d freeholder < freeholder.dump"
+  migrate-in: "docker compose --env-file deploy/docker-selfhost/.env -f deploy/docker-selfhost/infra/compose.yml exec -T db pg_restore --no-owner --no-privileges -U freeholder -d freeholder < freeholder.dump && pnpm media:transfer -- --manifest ownership-export/media-manifest.json"
+  migrate-out: "docker compose --env-file deploy/docker-selfhost/.env -f deploy/docker-selfhost/infra/compose.yml exec -T db pg_dump --format=custom --no-owner --no-privileges -U freeholder freeholder > freeholder.dump && pnpm ownership:export -- --output ownership-export && pnpm media:transfer -- --manifest ownership-export/media-manifest.json"
+  update: "docker compose --env-file deploy/docker-selfhost/.env -f deploy/docker-selfhost/infra/compose.yml pull && docker compose --env-file deploy/docker-selfhost/.env -f deploy/docker-selfhost/infra/compose.yml up -d"
+  rollback: "FREEHOLDER_IMAGE=${PREVIOUS_FREEHOLDER_IMAGE:?set previous immutable image digest} docker compose --env-file deploy/docker-selfhost/.env -f deploy/docker-selfhost/infra/compose.yml up -d"
+update:
+  strategy: image-swap
+  rollback: compose pull the previous tag
+tested_on: "2026-11-06"

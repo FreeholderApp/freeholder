@@ -1,0 +1,262 @@
+// Copyright (C) 2026 Tony Aly
+// SPDX-License-Identifier: Apache-2.0
+// The boot sequence (MASTER.md §11): load manifests → topo-sort by requires →
+// register jobs → register services in the registry → subscribe listeners.
+//
+// Migrations remain deliberately absent: they are global (one db/migrations
+// folder, run before boot or by the test globalSetup), not per-module. Routes
+// are App Router files, while the HTTP/MCP registries derive from services.
+import { requireProductionEnv } from "@/core/env";
+import { subscribe, type BusHandler } from "@/core/events";
+import { sortModules, type ModuleManifest } from "@/core/module";
+import { isolatePlugins, bootableManifests, isolatePluginLoad } from "@/core/plugins/isolate";
+import { isPluginManifest } from "@/core/plugin";
+import { bindPluginBlock, bindPluginService, disablePluginAtBoot, pluginBlockOwner, pluginFailedAtBoot, pluginServiceOwner, registerPluginExecution, resetPluginExecutionsForTests } from "@/core/plugins/context";
+import { pluginJob, pluginListener, resetPluginRuntimeForTests } from "@/core/plugins/runtime";
+import { registerService, type Service } from "@/core/service";
+import { installAbuseRecorder } from "@/core/media/abuse-evidence";
+import { registerDeclaredEvents } from "@/core/events/catalogue";
+import {
+  registerOnboardingModule,
+  resetOnboardingRegistryForTests,
+  validateOnboardingRegistry,
+} from "@/core/onboarding/registry";
+
+/**
+ * Record a disable and say so on stderr.
+ *
+ * Logged here rather than at the call sites so a disable can never be silent:
+ * the instance that swallowed one took a diagnostic job to find.
+ */
+function recordDisabled(report: BootReport, module: string, reason: string): void {
+  disablePluginAtBoot(module);
+  report.disabled.push({ module, reason });
+  console.error(`[freeholder] plugin disabled: ${module}: ${reason}`);
+}
+export interface BootReport {
+  /** Modules in the order they were wired. */
+  modules: string[];
+  /** Every service name now reachable through the registry. */
+  services: string[];
+  /** Block types contributed by modules, beyond cms's own vocabulary. */
+  blocks: string[];
+  /** Background jobs mounted from every module (§11). */
+  jobs: string[];
+  guidance: string[];
+  demoScenarios: string[];
+  demoFixtures: string[];
+  /**
+   * Plugins that were installed but could not be wired, and why.
+   *
+   * A disable used to be recorded only as a decoration on the module name, so
+   * `modules.length` counted it and readiness answered ok. A third party
+   * deploying Freeholder hit exactly that: the new instance could not reach the
+   * database, its plugin was disabled, nothing was logged, `/api/health`
+   * returned ok, and App Platform promoted the broken instance over the healthy
+   * one. The site went live missing 36 routes.
+   *
+   * So a disable is its own fact, countable and separate from the module list.
+   */
+  disabled: Array<{ module: string; reason: string }>;
+  listeners: Array<{ event: string; module: string; handler: string }>;
+}
+
+/**
+ * Exported so a test can compare what `defineService` produced against what
+ * boot registered. That comparison exists because thirteen services once
+ * shipped unregistered — see tests/core/registry-completeness.test.ts.
+ */
+export function isService(value: unknown): value is Service {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as Service).call === "function" &&
+    typeof (value as Service).def?.name === "string"
+  );
+}
+
+async function wireManifest(
+  manifest: ModuleManifest,
+  report: BootReport,
+): Promise<void> {
+  const plugin = isPluginManifest(manifest) ? registerPluginExecution({ name: manifest.name, version: manifest.version, permissions: manifest.permissions }) : undefined;
+  if (manifest.blocks) {
+    const loaded = await manifest.blocks();
+    const exported = loaded.default;
+    if (!Array.isArray(exported)) {
+      throw new Error(
+        `module "${manifest.name}" declares blocks, but its blocks module has no default export array. Export them as \`export default [ ... ]\`.`,
+      );
+    }
+    const { getBlock, registerBlock } = await import("@/modules/cms/blocks/registry");
+    for (const block of exported) {
+      if (plugin) {
+        const definition = block as Parameters<typeof registerBlock>[0];
+        const existing = getBlock(definition.type);
+        if (existing && pluginBlockOwner(existing)?.name !== plugin.name) throw new Error("A plugin cannot claim another module's block.");
+        bindPluginBlock(definition, plugin);
+      }
+      registerBlock(block as Parameters<typeof registerBlock>[0]);
+      report.blocks.push((block as { type: string }).type);
+    }
+  }
+
+  if (manifest.jobs) {
+    const loaded = await manifest.jobs();
+    const exported = loaded.default;
+    if (!Array.isArray(exported)) {
+      throw new Error(
+        `module "${manifest.name}" declares jobs, but its jobs module has no default export array.`,
+      );
+    }
+    const { registerJob } = await import("@/core/jobs");
+    for (const job of exported) {
+      const definition = job as Parameters<typeof registerJob>[0];
+      registerJob(plugin ? pluginJob(plugin, definition) : definition);
+      report.jobs.push((job as { name: string }).name);
+    }
+  }
+
+  let loadedServices: Record<string, unknown> | undefined;
+  if (manifest.services) {
+    loadedServices = await manifest.services();
+    const exported = loadedServices.default;
+    if (!Array.isArray(exported)) {
+      throw new Error(
+        `module "${manifest.name}" declares services, but its services module has no default export array. Export the services as \`export default [ ... ]\`.`,
+      );
+    }
+    for (const service of exported) {
+      if (!isService(service)) {
+        throw new Error(
+          `module "${manifest.name}" exports something that is not a service. Every entry must come from defineService().`,
+        );
+      }
+      if (plugin) {
+        const { listServices } = await import("@/core/service");
+        const existing = listServices().get(service.def.name);
+        if (existing && pluginServiceOwner(existing.def)?.name !== plugin.name) throw new Error("A plugin cannot claim another module's service.");
+        bindPluginService(service.def, plugin);
+      }
+      registerService(service);
+      report.services.push(service.def.name);
+    }
+  }
+
+  // What this module says it emits, so an automation trigger can be chosen
+  // from a real menu rather than typed (§4.17, C9.01). Recorded even for a
+  // module with no listeners: emitting and listening are independent.
+  registerDeclaredEvents(manifest.name, manifest.events?.emits ?? []);
+
+  for (const [event, handlerName] of Object.entries(
+    manifest.events?.listens ?? {},
+  )) {
+    const handler = loadedServices?.[handlerName];
+    if (typeof handler !== "function") {
+      throw new Error(
+        `module "${manifest.name}" listens for "${event}" with "${handlerName}", but its services module exports no such function.`,
+      );
+    }
+    subscribe(
+      event,
+      `${manifest.name}:${event}:${handlerName}`,
+      plugin ? pluginListener(plugin, handler as BusHandler) : handler as (payload: unknown) => void | Promise<void>,
+      plugin,
+    );
+    report.listeners.push({
+      event,
+      module: manifest.name,
+      handler: handlerName,
+    });
+  }
+
+  if (manifest.onboarding) {
+    const loaded = await manifest.onboarding();
+    const contribution = registerOnboardingModule(manifest.name, loaded.default);
+    report.guidance.push(
+      ...contribution.guidance.map((flow) => `${flow.key}@${flow.version}`),
+    );
+    report.demoScenarios.push(
+      ...contribution.scenarios.map((scenario) => `${scenario.key}@${scenario.version}`),
+    );
+    report.demoFixtures.push(
+      ...contribution.fixtures.map((fixture) => `${fixture.key}@${fixture.version}`),
+    );
+  }
+}
+
+export async function boot(
+  manifests: ModuleManifest[],
+): Promise<BootReport> {
+  requireProductionEnv();
+  // C12.30: matches are recorded whichever modules are installed.
+  installAbuseRecorder();
+
+  const report: BootReport = {
+    modules: [],
+    services: [],
+    listeners: [],
+    blocks: [],
+    jobs: [],
+    guidance: [],
+    demoScenarios: [],
+    demoFixtures: [],
+    disabled: [],
+  };
+
+  const installed = manifests.map((manifest) => manifest.name);
+  const isolated = isolatePlugins(manifests, installed);
+  for (const failed of isolated.filter((entry) => entry.error)) {
+    report.modules.push(`${failed.manifest.name} (disabled: ${failed.error})`);
+    recordDisabled(report, failed.manifest.name, failed.error ?? "unknown");
+  }
+  for (const manifest of sortModules(bootableManifests(isolated))) {
+    const failedDependency = manifest.requires?.find(pluginFailedAtBoot);
+    if (failedDependency) {
+      const reason = `Required plugin "${failedDependency}" failed to load.`;
+      if (!isPluginManifest(manifest)) throw new Error(reason);
+      report.modules.push(`${manifest.name} (disabled: ${reason})`);
+      recordDisabled(report, manifest.name, reason);
+      continue;
+    }
+    const wired = await isolatePluginLoad(manifest.name, () =>
+      wireManifest(manifest, report),
+    );
+    if (!wired.ok) {
+      if (isPluginManifest(manifest)) {
+        report.modules.push(`${manifest.name} (disabled: ${wired.error})`);
+        recordDisabled(report, manifest.name, wired.error);
+        continue;
+      }
+      throw new Error(wired.error);
+    }
+    report.modules.push(manifest.name);
+  }
+
+  validateOnboardingRegistry({
+    installedModules: report.modules,
+    registeredServices: report.services,
+  });
+
+  return report;
+}
+
+let booted: Promise<BootReport> | undefined;
+
+/**
+ * Boot at most once per process. The dev server re-imports modules on change
+ * and serverless runtimes may invoke an entry point repeatedly; registering a
+ * service twice is an error, so the guard belongs here rather than in every
+ * caller's head.
+ */
+export function bootOnce(manifests: ModuleManifest[]): Promise<BootReport> {
+  booted ??= boot(manifests);
+  return booted;
+}
+
+export function resetBootForTests(): void {
+  booted = undefined;
+  resetOnboardingRegistryForTests();
+  resetPluginExecutionsForTests();
+  resetPluginRuntimeForTests();
+}

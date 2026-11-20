@@ -1,0 +1,101 @@
+// Copyright (C) 2026 Tony Aly
+// SPDX-License-Identifier: Apache-2.0
+// Thin shell only (MASTER.md §32): site chrome is data (Sections), rendered
+// here once the cms module lands. No hardcoded site structure in this file.
+//
+// It owns three things that must be true of every page. The token stylesheet,
+// because §32 requires design tokens to be emitted as CSS custom properties at
+// request time so an owner's brand is a settings save rather than a rebuild.
+// And the theme attribute, stamped server-side from the visitor's cookie —
+// which is what makes light and dark a platform standard rather than a
+// per-screen decision, and what stops a dark-themed site flashing white while
+// JavaScript loads.
+//
+// And the document's language. It said `lang="en"` unconditionally until the
+// French pages arrived — which a validator passes, an axe rule passes, and a
+// screen reader reads aloud in the wrong accent. §4.9's locale has to reach
+// the element that declares it.
+import type { Metadata } from "next";
+import type { ReactNode } from "react";
+import { currentBusiness } from "@/core/settings/read";
+import { headers } from "next/headers";
+import { themeStylesheet } from "@/core/design/tokens";
+import { currentDesign } from "@/core/design/read";
+import { CSP_NONCE_HEADER } from "@/core/http/csp";
+import { PATH_HEADER } from "@/core/http/headers";
+import { themeAttribute } from "@/core/design/theme";
+import { readThemePreference } from "./theme";
+import { getLocale, getT } from "./i18n";
+import { env } from "@/core/env";
+import { localeDirection } from "@/core/i18n";
+import "./globals.css";
+
+/**
+ * The fallback document title. Routes set their own; this is what a route
+ * that forgot (or a framework 404) shows instead of an empty <title>.
+ */
+export async function generateMetadata(): Promise<Metadata> {
+  const [business, t] = await Promise.all([currentBusiness(), getT()]);
+  return { title: business?.name ?? t("common.appName") };
+}
+
+export default async function RootLayout({
+  children,
+}: {
+  children: ReactNode;
+}) {
+  const [theme, locale, requestHeaders, design] = await Promise.all([
+    readThemePreference().then(themeAttribute),
+    getLocale(),
+    headers(),
+    currentDesign(),
+  ]);
+  const nonce = requestHeaders.get(CSP_NONCE_HEADER) ?? undefined;
+  const t = await getT();
+  const playground = env().FREEHOLDER_PLAYGROUND === "1";
+  const playgroundUrl = env().FREEHOLDER_PLAYGROUND_URL;
+  const path = requestHeaders.get(PATH_HEADER) ?? "";
+  const insideAdmin = /^\/admin(?:\/|$)/.test(path);
+  // The editor's preview frame shows the page as visitors will see it; the
+  // demo banner belongs to the window around it, not inside the page.
+  const showPlaygroundBanner = playground && !/^\/preview(?:\/|$)/.test(path);
+
+  return (
+    <html lang={locale} dir={localeDirection(locale)} data-theme={theme}>
+      <head>
+        <style
+          nonce={nonce}
+          dangerouslySetInnerHTML={{
+            __html: themeStylesheet(design.theme, design.extras),
+          }}
+        />
+      </head>
+      <body className="bg-paper font-sans text-ink antialiased">
+        {showPlaygroundBanner ? (
+          // The banner is written after the page so the page's skip link
+          // stays the first keyboard stop (WCAG 2.4.1); `order-first` still
+          // paints it at the top. Inside the admin the visitor has already
+          // entered, so the link offers the public site instead.
+          <div className="flex min-h-svh flex-col">
+            <div className="flex-1">{children}</div>
+            <aside className="order-first border-b border-rule bg-surface px-6 py-3 text-center text-sm">
+              {t("playground.banner")}{" "}
+              {insideAdmin ? (
+                <a className="text-accent underline" href="/">{t("playground.viewSite")}</a>
+              ) : (
+                <a className="text-accent underline" href="/playground">{t("playground.enter")}</a>
+              )}
+            </aside>
+          </div>
+        ) : (
+          <>
+            {playgroundUrl && !playground ? <aside className="border-b border-rule bg-surface px-6 py-3 text-center text-sm">
+              <a className="font-semibold text-accent underline" href={playgroundUrl}>{t("playground.try")}</a>
+            </aside> : null}
+            {children}
+          </>
+        )}
+      </body>
+    </html>
+  );
+}

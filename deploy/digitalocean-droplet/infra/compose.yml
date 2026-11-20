@@ -1,0 +1,68 @@
+# Copyright (C) 2026 Tony Aly
+# SPDX-License-Identifier: Apache-2.0
+# One droplet: Caddy terminates TLS, the app serves, Postgres persists.
+# Media is NOT here — §18 mandates object storage, so the archive lives in
+# Spaces and a destroyed droplet is a rebuild, not a data-loss event.
+name: freeholder
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data      # certificates; losing this re-issues them
+      - caddy-config:/config
+    # `{$FREEHOLDER_DOMAIN}` in the Caddyfile is *Caddy's* substitution, not
+    # compose's, so it reads this container's environment — and without this
+    # block it read an empty string. An empty site address leaves a bare `{`,
+    # which Caddy parses as a global options block, so the first directive
+    # inside fails with "unrecognized global option: encode" and the container
+    # never starts. The stack looked healthy because app and db were up.
+    #
+    # `:?` rather than a default: a reverse proxy whose hostname is a guess
+    # would request a certificate for the wrong name, and being told at
+    # `compose up` beats discovering it in Let's Encrypt's rate limits.
+    environment:
+      FREEHOLDER_DOMAIN: ${FREEHOLDER_DOMAIN:?set FREEHOLDER_DOMAIN in .env — Caddy needs the hostname it should request a certificate for}
+      FREEHOLDER_PRIMARY_DOMAIN: ${FREEHOLDER_PRIMARY_DOMAIN:-${FREEHOLDER_DOMAIN:?set FREEHOLDER_DOMAIN in .env}}
+    depends_on: [app]
+
+  app:
+    image: ${FREEHOLDER_IMAGE:-ghcr.io/campdenman/freeholder:edge}
+    restart: unless-stopped
+    # Beside compose.yml, per the README's layout. `../.env` would resolve
+    # to /opt/.env and silently start the app with no configuration.
+    env_file: [.env]
+    environment:
+      DATABASE_URL: postgres://freeholder:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/freeholder
+      # Caddy overwrites this header with the connecting address, and the app
+      # port is not published, so rate limits can tell visitors apart (C11.10).
+      TRUSTED_CLIENT_IP_HEADER: x-freeholder-client-ip
+    depends_on:
+      db: { condition: service_healthy }
+    # Not published to the host: Caddy is the only way in.
+    expose: ["3000"]
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: freeholder
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: freeholder
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    # The app waits for this rather than crash-looping on a cold start.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U freeholder -d freeholder"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    expose: ["5432"]
+
+volumes:
+  db-data:
+  caddy-data:
+  caddy-config:

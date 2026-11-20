@@ -1,0 +1,223 @@
+// Copyright (C) 2026 Tony Aly
+// SPDX-License-Identifier: Apache-2.0
+"use client";
+import { useActionState } from "react";
+import { CheckCircle, WarningCircle } from "@phosphor-icons/react/dist/ssr";
+import {
+  Button,
+  Callout,
+  Card,
+  CardBody,
+  CardFooter,
+  CardHeader,
+  Field,
+  Input,
+  Select,
+} from "@/ui/primitives";
+import { saveServiceAreaAction, type ActionState } from "../../actions";
+
+export interface ServiceAreaValues {
+  kind: "none" | "radius" | "regions" | "postal_codes";
+  centerLatitude: string;
+  centerLongitude: string;
+  radiusKm: string;
+  regions: string;
+  postalCodes: string;
+  deliveryWeekdays: number[];
+  deliveryOpens: string;
+  deliveryCloses: string;
+}
+
+export interface ServiceAreaFormLabels {
+  cardTitle: string;
+  intro: string;
+  kind: string;
+  none: string;
+  radius: string;
+  regions: string;
+  postalCodes: string;
+  postalCodeList: string;
+  postalCodeHint: string;
+  centerLatitude: string;
+  centerLongitude: string;
+  radiusKm: string;
+  radiusHint: string;
+  regionList: string;
+  regionHint: string;
+  submit: string;
+  pending: string;
+  saved: string;
+  deliveryDays: string;
+  deliveryOpens: string;
+  deliveryCloses: string;
+  deliveryHint: string;
+  /** The seven weekday names in the reader's language, Sunday first. */
+  deliveryDayNames: string[];
+}
+
+/**
+ * Where the business will travel to (§4.10).
+ *
+ * Both shapes are always on screen rather than hidden behind the choice: this
+ * form is saved rarely and read once, and a field that appears only after a
+ * select changes is a field an owner does not know exists. The action reads
+ * whichever set matches the chosen kind.
+ */
+export function ServiceAreaForm({
+  locationId,
+  values,
+  labels,
+}: {
+  locationId: string;
+  values: ServiceAreaValues;
+  labels: ServiceAreaFormLabels;
+}) {
+  const [state, action, pending] = useActionState<ActionState, FormData>(
+    saveServiceAreaAction,
+    {},
+  );
+
+  return (
+    <form action={action}>
+      <Card>
+        <CardHeader title={labels.cardTitle} />
+        <CardBody>
+          {state.error ? (
+            <Callout tone="danger" icon={<WarningCircle size={17} weight="fill" />}>
+              {state.error}
+            </Callout>
+          ) : null}
+          {state.saved ? (
+            <Callout tone="success" icon={<CheckCircle size={17} weight="fill" />}>
+              {labels.saved}
+            </Callout>
+          ) : null}
+          <p className="max-w-prose text-sm text-ink-muted">{labels.intro}</p>
+
+          <input type="hidden" name="locationId" value={locationId} />
+
+          <Field label={labels.kind} htmlFor="kind">
+            <Select id="kind" name="kind" defaultValue={values.kind}>
+              <option value="none">{labels.none}</option>
+              <option value="radius">{labels.radius}</option>
+              <option value="regions">{labels.regions}</option>
+              <option value="postal_codes">{labels.postalCodes}</option>
+            </Select>
+          </Field>
+
+          <div className="grid gap-5 sm:grid-cols-3">
+            <Field label={labels.centerLatitude} htmlFor="centerLatitude">
+              <Input
+                id="centerLatitude"
+                name="centerLatitude"
+                inputMode="decimal"
+                defaultValue={values.centerLatitude}
+              />
+            </Field>
+            <Field label={labels.centerLongitude} htmlFor="centerLongitude">
+              <Input
+                id="centerLongitude"
+                name="centerLongitude"
+                inputMode="decimal"
+                defaultValue={values.centerLongitude}
+              />
+            </Field>
+            <Field
+              label={labels.radiusKm}
+              htmlFor="radiusKm"
+              hint={labels.radiusHint}
+            >
+              <Input
+                id="radiusKm"
+                name="radiusKm"
+                inputMode="decimal"
+                defaultValue={values.radiusKm}
+              />
+            </Field>
+          </div>
+
+          <Field
+            label={labels.regionList}
+            htmlFor="regions"
+            hint={labels.regionHint}
+          >
+            <Input id="regions" name="regions" defaultValue={values.regions} />
+          </Field>
+
+          {/*
+            The only shape a delivery form can actually check. A radius and a
+            region describe coverage to a reader; neither answers "do you come
+            to L4C 2K1?" without a geocoder, and answering it by guessing is
+            the invented coverage §4.18 forbids.
+          */}
+          <Field
+            label={labels.postalCodeList}
+            htmlFor="postalCodes"
+            hint={labels.postalCodeHint}
+          >
+            <Input
+              id="postalCodes"
+              name="postalCodes"
+              defaultValue={values.postalCodes}
+            />
+          </Field>
+
+          {/*
+            The weekly window when this area receives deliveries. Optional,
+            and saved as a whole: tick days, set both times. An area without a
+            window answers "do we come there" only — the coverage check never
+            invents a "when" the owner did not name.
+          */}
+          <fieldset className="grid gap-3">
+            <legend className="text-sm font-medium text-ink">
+              {labels.deliveryDays}
+            </legend>
+            <p className="max-w-prose text-xs text-ink-muted">
+              {labels.deliveryHint}
+            </p>
+            <div className="flex flex-wrap gap-3">
+              {labels.deliveryDayNames.map((name, weekday) => (
+                <label
+                  key={weekday}
+                  className="flex items-center gap-1.5 text-sm text-ink"
+                >
+                  <input
+                    type="checkbox"
+                    name="deliveryDays"
+                    value={weekday}
+                    defaultChecked={values.deliveryWeekdays.includes(weekday)}
+                    className="rounded-sm border-rule-strong bg-field"
+                  />
+                  {name}
+                </label>
+              ))}
+            </div>
+            <div className="grid gap-5 sm:grid-cols-2">
+              <Field label={labels.deliveryOpens} htmlFor="deliveryOpens">
+                <Input
+                  id="deliveryOpens"
+                  name="deliveryOpens"
+                  type="time"
+                  defaultValue={values.deliveryOpens}
+                />
+              </Field>
+              <Field label={labels.deliveryCloses} htmlFor="deliveryCloses">
+                <Input
+                  id="deliveryCloses"
+                  name="deliveryCloses"
+                  type="time"
+                  defaultValue={values.deliveryCloses}
+                />
+              </Field>
+            </div>
+          </fieldset>
+        </CardBody>
+        <CardFooter>
+          <Button type="submit" disabled={pending}>
+            {pending ? labels.pending : labels.submit}
+          </Button>
+        </CardFooter>
+      </Card>
+    </form>
+  );
+}

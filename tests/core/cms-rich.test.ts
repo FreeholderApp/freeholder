@@ -1,0 +1,144 @@
+// Copyright (C) 2026 Tony Aly
+// SPDX-License-Identifier: Apache-2.0
+// Typed rich text never stores HTML soup (C2.05).
+
+import { describe, expect, it } from "vitest";
+import {
+  fromEditorMarkup,
+  fromPlainString,
+  looksLikeHtml,
+  parseRichDoc,
+  safeRichHref,
+  RichValidationError,
+  toEditorMarkup,
+  toPlainText,
+} from "@/modules/cms/blocks/rich";
+import { parseBlockTree } from "@/modules/cms/blocks/registry";
+import { sanitizeOwnerHtml } from "@/modules/cms/blocks/html";
+import {
+  duplicateNodes,
+  filterPalette,
+  moveSiblings,
+  readClipboard,
+  removeNodes,
+  writeClipboard,
+} from "@/modules/cms/blocks/edit";
+import type { BlockNode } from "@/modules/cms/blocks/types";
+
+describe("typed rich text", () => {
+  it("turns a leftover plain string into paragraphs", () => {
+    const doc = parseRichDoc("Hello\n\nThere");
+    expect(doc).toEqual([
+      { type: "paragraph", children: [{ type: "text", text: "Hello" }] },
+      { type: "paragraph", children: [{ type: "text", text: "There" }] },
+    ]);
+    expect(toPlainText(doc)).toBe("Hello\n\nThere");
+  });
+
+  it("refuses HTML soup on the write path", () => {
+    expect(looksLikeHtml("<p>Hi</p>")).toBe(true);
+    expect(() => parseRichDoc("<p>Hi</p>")).toThrow(RichValidationError);
+    expect(() => fromEditorMarkup("<strong>nope</strong>")).toThrow(RichValidationError);
+    const lenient = parseRichDoc("<p>Hi</p>", "lenient");
+    expect(lenient[0]).toMatchObject({ type: "paragraph" });
+    expect(toPlainText(lenient)).toContain("<p>Hi</p>");
+  });
+
+  it("round-trips emphasis, links, code and lists through editor markup", () => {
+    const doc = fromEditorMarkup(
+      "A **bold** and *italic* and `code` and [site](/about).\n\n- One\n- Two\n\n1. First\n2. Second",
+    );
+    expect(doc[0]).toMatchObject({ type: "paragraph" });
+    expect(doc[1]).toMatchObject({ type: "bulletList" });
+    expect(doc[2]).toMatchObject({ type: "orderedList" });
+    expect(toPlainText(doc)).toContain("bold");
+    expect(toEditorMarkup(doc)).toContain("**bold**");
+    expect(toEditorMarkup(doc)).toContain("[site](/about)");
+  });
+
+  it("accepts web, mail and relative links but rejects executable URL schemes", () => {
+    for (const allowed of ["/about", "#section", "https://example.com", "mailto:hi@example.com", "tel:+12505550123"]) {
+      expect(safeRichHref(allowed)).toBe(allowed);
+    }
+    for (const blocked of ["javascript:alert(1)", "JaVaScRiPt:alert(1)", "data:text/html,hello", "vbscript:msgbox(1)", "java\nscript:alert(1)"]) {
+      expect(safeRichHref(blocked)).toBeUndefined();
+      expect(() => parseRichDoc([{ type: "paragraph", children: [{ type: "link", href: blocked, children: [{ type: "text", text: "go" }] }] }])).toThrow();
+    }
+  });
+
+  it("coerces a text block's leftover string body on write", () => {
+    const [node] = parseBlockTree(
+      [{ id: "t", type: "text", props: { body: "Plain copy." } }],
+      "page",
+    );
+    expect(node!.props.body).toEqual(fromPlainString("Plain copy."));
+  });
+
+  it("refuses a text block whose body is HTML", () => {
+    expect(() =>
+      parseBlockTree(
+        [{ id: "t", type: "text", props: { body: "<script>alert(1)</script>" } }],
+        "page",
+      ),
+    ).toThrow(/HTML/);
+  });
+});
+
+describe("owner HTML", () => {
+  it("strips executable markup and browser-decoded unsafe URLs", () => {
+    const cleaned = sanitizeOwnerHtml(
+      `<p onclick="steal()">Hi</p><script>alert(1)</script>` +
+      `<a href="javascript:alert(1)">x</a>` +
+      `<a href="jav&#x61;script:alert(2)">y</a>` +
+      `<a href="data:text/html,<script>alert(3)</script>">z</a>`,
+    );
+    expect(cleaned).not.toContain("script");
+    expect(cleaned).not.toContain("onclick");
+    expect(cleaned).not.toContain("javascript:");
+    expect(cleaned).not.toContain("data:");
+    expect(cleaned).toContain("<p>");
+    expect(cleaned).toContain("Hi");
+  });
+
+  it("keeps safe links while encoding their attribute values", () => {
+    expect(sanitizeOwnerHtml(`<a href="/about?a=1&amp;b=2">About</a>`)).toBe(
+      `<a href="/about?a=1&amp;b=2">About</a>`,
+    );
+    expect(sanitizeOwnerHtml(`<a href="mailto:hello@example.com">Mail</a>`)).toContain(
+      `href="mailto:hello@example.com"`,
+    );
+  });
+});
+
+describe("editor operations", () => {
+  const tree = (): BlockNode[] => [
+    { id: "a", type: "heading", props: { text: "A" } },
+    { id: "b", type: "heading", props: { text: "B" } },
+    { id: "c", type: "heading", props: { text: "C" } },
+  ];
+
+  it("duplicates, removes and moves selected siblings", () => {
+    const copied = duplicateNodes(tree(), new Set(["b"]));
+    expect(copied.map((node) => node.props.text)).toEqual(["A", "B", "B", "C"]);
+    expect(copied[2]!.id).not.toBe("b");
+
+    expect(removeNodes(tree(), new Set(["b"])).map((node) => node.id)).toEqual(["a", "c"]);
+    expect(moveSiblings(tree(), new Set(["b"]), -1).map((node) => node.id)).toEqual([
+      "b",
+      "a",
+      "c",
+    ]);
+  });
+
+  it("filters the slash palette and round-trips a clipboard payload", () => {
+    const palette = [
+      { type: "heading", label: "Heading" },
+      { type: "text", label: "Text" },
+      { type: "video", label: "Video" },
+    ];
+    expect(filterPalette(palette, "/he").map((entry) => entry.type)).toEqual(["heading"]);
+    const raw = writeClipboard(tree());
+    expect(readClipboard(raw)?.map((node) => node.id)).toEqual(["a", "b", "c"]);
+    expect(readClipboard("not json")).toBeUndefined();
+  });
+});
